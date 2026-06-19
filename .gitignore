@@ -1,0 +1,19 @@
+# Python virtual environments
+torcs-env/
+venv/
+.env/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs / models
+ppo_driver/logs/
+ppo_driver/models/
+*.log
+
+# OS / editor
+.DS_Store
+.vscode/
