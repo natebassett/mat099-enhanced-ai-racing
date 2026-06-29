@@ -6,7 +6,7 @@
   <section name="Header">
     <attstr name="name" val="Practice"/>
     <attstr name="description" val="Practice"/>
-    <attnum name="priority" val="100"/>
+    <attnum name="priority" val="1"/>
     <attstr name="menu image" val="data/img/splash-practice.png"/>
     <attstr name="run image" val="data/img/splash-run-practice.png"/>
   </section>

@@ -20,6 +20,9 @@ from gym_torcs import TorcsEnv  # type: ignore[import]
 class TorcsRunner:
     OFF_TRACK_SHUTDOWN_DELAY = 3.0
     STARTUP_DELAY = 8.0
+    MENU_KEY_DELAY = 1.0
+    SERVER_PORT = 3001
+    SERVER_START_TIMEOUT = 15.0
 
     def __init__(self):
         self.env: Optional[TorcsEnv] = None
@@ -64,6 +67,7 @@ class TorcsRunner:
         if sys.platform != "win32" or self.torcs_process is None:
             return
 
+        process = self.torcs_process
         user32 = ctypes.windll.user32
         window_handles = []
         enum_windows_callback = ctypes.WINFUNCTYPE(
@@ -81,7 +85,7 @@ class TorcsRunner:
             user32.GetClassNameW(window_handle, class_name, len(class_name))
 
             if (
-                process_id.value == self.torcs_process.pid
+                process_id.value == process.pid
                 and user32.IsWindowVisible(window_handle)
                 and class_name.value != "ConsoleWindowClass"
             ):
@@ -95,17 +99,121 @@ class TorcsRunner:
         if not window_handles:
             raise RuntimeError("TORCS started, but its graphical window was not found")
 
-        # This is the Windows equivalent of gym_torcs/autostart.sh. It moves
-        # through TORCS's menus and starts the configured SCR practice race.
-        wm_key_down = 0x0100
-        wm_key_up = 0x0101
         vk_return = 0x0D
-        vk_up = 0x26
+        key_event_type = 1
+        key_up_flag = 0x0002
 
-        for key in (vk_return, vk_return, vk_up, vk_up, vk_return, vk_return):
-            user32.PostMessageW(window_handles[0], wm_key_down, key, 0)
-            user32.PostMessageW(window_handles[0], wm_key_up, key, 0)
-            time.sleep(0.25)
+        class KeyboardInput(ctypes.Structure):
+            _fields_ = (
+                ("virtual_key", wintypes.WORD),
+                ("scan_code", wintypes.WORD),
+                ("flags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("extra_info", wintypes.WPARAM),
+            )
+
+        class MouseInput(ctypes.Structure):
+            _fields_ = (
+                ("x", wintypes.LONG),
+                ("y", wintypes.LONG),
+                ("mouse_data", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("extra_info", wintypes.WPARAM),
+            )
+
+        class HardwareInput(ctypes.Structure):
+            _fields_ = (
+                ("message", wintypes.DWORD),
+                ("parameter_low", wintypes.WORD),
+                ("parameter_high", wintypes.WORD),
+            )
+
+        class InputValue(ctypes.Union):
+            _fields_ = (
+                ("keyboard", KeyboardInput),
+                ("mouse", MouseInput),
+                ("hardware", HardwareInput),
+            )
+
+        class Input(ctypes.Structure):
+            _fields_ = (
+                ("input_type", wintypes.DWORD),
+                ("value", InputValue),
+            )
+
+        def send_key(key, flags=0):
+            value = InputValue()
+            value.keyboard = KeyboardInput(key, 0, flags, 0, 0)
+            input_event = Input(key_event_type, value)
+            sent = user32.SendInput(1, ctypes.byref(input_event), ctypes.sizeof(Input))
+            if sent != 1:
+                raise RuntimeError("Windows could not send input to TORCS")
+
+        window_handle = window_handles[0]
+        target_thread = user32.GetWindowThreadProcessId(window_handle, None)
+        current_thread = ctypes.windll.kernel32.GetCurrentThreadId()
+        attached = bool(user32.AttachThreadInput(current_thread, target_thread, True))
+
+        try:
+            user32.ShowWindow(window_handle, 9)
+            user32.BringWindowToTop(window_handle)
+            user32.SetForegroundWindow(window_handle)
+            user32.SetFocus(window_handle)
+        finally:
+            if attached:
+                user32.AttachThreadInput(current_thread, target_thread, False)
+
+        time.sleep(0.5)
+
+        # Practice is first in the race list, producing a stable novice flow:
+        # Main menu -> Race -> Practice -> New Race.
+        for _ in range(3):
+            send_key(vk_return)
+            send_key(vk_return, key_up_flag)
+            time.sleep(self.MENU_KEY_DELAY)
+
+        deadline = time.monotonic() + self.SERVER_START_TIMEOUT
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError("TORCS closed before the SCR race started")
+            if self._server_is_listening(process.pid):
+                print("TORCS Practice race started automatically.")
+                return
+            time.sleep(0.5)
+
+        raise RuntimeError("TORCS opened, but automatic Practice startup failed")
+
+    def _server_is_listening(self, process_id):
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        try:
+            result = subprocess.run(
+                ["netstat", "-ano", "-p", "UDP"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2,
+                creationflags=creation_flags,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+        expected_process_id = str(process_id)
+        port_suffix = f":{self.SERVER_PORT}"
+
+        for line in result.stdout.splitlines():
+            columns = line.split()
+            if len(columns) >= 3:
+                local_address = columns[1]
+                owner_process_id = columns[-1]
+                if (
+                    local_address.endswith(port_suffix)
+                    and owner_process_id == expected_process_id
+                ):
+                    return True
+
+        return False
 
     def shutdown(self):
         process = self.torcs_process
