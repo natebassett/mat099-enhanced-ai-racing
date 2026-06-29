@@ -9,7 +9,7 @@ def print_results(results):
     print("==============================")
 
     print(f"Steps       : {results['steps']}")
-    print(f"Reward      : {results['reward']:.2f}")
+    print(f"Total Score : {results['reward']:.2f}")
     print(f"Max Speed   : {results['max_speed']:.2f}")
     print(f"Avg Speed   : {results['avg_speed']:.2f}")
     print(f"Off Track   : {results['off_track']}")
