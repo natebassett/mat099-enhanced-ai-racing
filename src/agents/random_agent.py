@@ -1,23 +1,29 @@
-# src/main/agents/random_agent.py
-
 import random
+import secrets
 
 
 class RandomAgent:
+    name = "Random Agent"
+    agent_type = "random"
+    version = "1.0"
+
     def __init__(self, seed=None):
-        if seed is not None:
-            random.seed(seed)
+        self.seed = seed if seed is not None else secrets.randbits(32)
+        self._random = random.Random(self.seed)
 
-    def act(self, observation):
-        steering = random.uniform(-0.4, 0.4)
-        throttle = random.uniform(0.3, 0.7)
+    @property
+    def config(self):
+        return {
+            "steering_range": [-0.4, 0.4],
+            "throttle_range": [0.3, 0.7],
+        }
 
-        brake = 0.0
-        if random.random() < 0.05:
-            brake = random.uniform(0.1, 0.4)
-            throttle = 0.0
+    def act(self, _observation):
+        steering = self._random.uniform(-0.4, 0.4)
+        throttle = self._random.uniform(0.3, 0.7)
 
-        return [steering, throttle, brake]
+        # TorcsEnv is configured for steering and throttle only.
+        return [steering, throttle]
 
     def reset(self):
-        pass
+        self._random.seed(self.seed)

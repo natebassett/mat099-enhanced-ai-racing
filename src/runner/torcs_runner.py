@@ -3,6 +3,7 @@ import sys
 import time
 import ctypes
 from ctypes import wintypes
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -138,6 +139,8 @@ class TorcsRunner:
 
     def run(self, agent):
         assert self.env is not None, "Call connect() before run()"
+        started_at = datetime.now(timezone.utc).isoformat()
+        started_timer = time.perf_counter()
         observation = self.env.reset(relaunch=False)
 
         agent.reset()
@@ -145,12 +148,15 @@ class TorcsRunner:
         max_steps = 10000
         stuck_counter = 0
 
-        results: dict[str, float] = {
+        results = {
+            "started_at": started_at,
             "steps": 0,
-            "reward": 0.0,
+            "total_score": 0.0,
             "max_speed": 0.0,
             "avg_speed": 0.0,
             "off_track": 0,
+            "duration_seconds": 0.0,
+            "termination_reason": "max_steps",
         }
 
         speed_sum = 0.0
@@ -159,7 +165,9 @@ class TorcsRunner:
         try:
             for _ in range(max_steps):
                 if self.torcs_process is not None and self.torcs_process.poll() is not None:
-                    raise RuntimeError("TORCS crashed or was closed unexpectedly")
+                    results["termination_reason"] = "torcs_closed"
+                    print("\nTORCS closed unexpectedly.")
+                    break
 
                 action = np.array(agent.act(observation))
                 observation, reward, done, _info = self.env.step(action)
@@ -172,7 +180,7 @@ class TorcsRunner:
                 previous_damage = damage
 
                 speed_sum += speed
-                results["reward"] += reward
+                results["total_score"] += float(reward)
                 results["steps"] += 1
 
                 if speed > results["max_speed"]:
@@ -180,6 +188,7 @@ class TorcsRunner:
 
                 if off_track:
                     results["off_track"] += 1
+                    results["termination_reason"] = "off_track"
                     print(
                         "\nAgent went off track. "
                         f"Closing TORCS in {self.OFF_TRACK_SHUTDOWN_DELAY:g} seconds..."
@@ -188,6 +197,7 @@ class TorcsRunner:
                     break
 
                 if crashed:
+                    results["termination_reason"] = "crashed"
                     print("\nAgent crashed.")
                     break
 
@@ -198,14 +208,17 @@ class TorcsRunner:
                     stuck_counter = 0
 
                 if stuck_counter > 100:
+                    results["termination_reason"] = "stuck"
                     print("\nAgent became stuck.")
                     break
 
                 if done:
+                    results["termination_reason"] = "finished"
                     print("\nRace finished.")
                     break
         finally:
             results["avg_speed"] = speed_sum / max(results["steps"], 1)
+            results["duration_seconds"] = time.perf_counter() - started_timer
             self.env.end()
             self.shutdown()
 

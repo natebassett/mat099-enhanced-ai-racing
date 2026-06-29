@@ -14,6 +14,11 @@ ppo_driver/logs/
 ppo_driver/models/
 *.log
 
+# Generated race databases
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
 # OS / editor
 .DS_Store
 .vscode/
