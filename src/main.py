@@ -1,36 +1,65 @@
-# src/main/main.py
-
 from agents.random_agent import RandomAgent
+from runner.torcs_runner import TorcsRunner
 
 
-def main():
-    print("=" * 40)
-    print("Enhanced AI Racing")
-    print("=" * 40)
+def print_results(results):
 
-    print("\nChoose an agent:")
-    print("[1] Random Agent")
-    print("[0] Exit")
+    print("\n==============================")
+    print("Race Results")
+    print("==============================")
 
-    choice = input("\nEnter choice: ")
+    print(f"Steps       : {results['steps']}")
+    print(f"Reward      : {results['reward']:.2f}")
+    print(f"Max Speed   : {results['max_speed']:.2f}")
+    print(f"Avg Speed   : {results['avg_speed']:.2f}")
+    print(f"Off Track   : {results['off_track']}")
 
-    if choice == "1":
-        agent = RandomAgent(seed=42)
-        print("\nRandom Agent selected.")
-        print("Launching TORCS on Corkscrew...")
-        
-        # Later this becomes:
-        # run_torcs(agent, track="corkscrew")
+    print("==============================\n")
 
-        for step in range(10):
-            action = agent.act(None)
-            print(f"Step {step}: steering={action[0]:.2f}, throttle={action[1]:.2f}, brake={action[2]:.2f}")
 
-    elif choice == "0":
-        print("Exiting.")
-    else:
-        print("Invalid choice.")
+def menu():
+
+    while True:
+
+        print("========================================")
+        print(" Enhanced AI Racing")
+        print("========================================\n")
+
+        print("Choose an agent")
+        print("[1] Random Agent")
+        print("[0] Exit\n")
+
+        choice = input("Enter choice: ")
+
+        if choice == "1":
+
+            runner = TorcsRunner()
+
+            agent = RandomAgent()
+
+            try:
+                runner.launch()
+
+                runner.connect()
+
+                runner.load_track("corkscrew")
+
+                results = runner.run(agent)
+            finally:
+                runner.shutdown()
+
+            print_results(results)
+
+            input("Press ENTER to continue...")
+
+        elif choice == "0":
+
+            break
+
+        else:
+
+            print("\nInvalid option.\n")
 
 
 if __name__ == "__main__":
-    main()
+    menu()

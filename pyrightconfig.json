@@ -1,0 +1,7 @@
+{
+    "pythonVersion": "3.10",
+    "extraPaths": [
+        "torcs-wrapper/gym_torcs",
+        "src"
+    ]
+}
