@@ -1,4 +1,5 @@
 from agents.random_agent import RandomAgent
+from agents.rule_based_agent import RuleBasedAgent
 from runner.torcs_runner import TorcsRunner
 from storage import RaceRepository
 
@@ -31,15 +32,16 @@ def menu():
 
         print("Choose an agent")
         print("[1] Random Agent")
+        print("[2] Rule-Based Anti-Spin Agent")
         print("[0] Exit\n")
 
         choice = input("Enter choice: ")
 
-        if choice == "1":
+        if choice in {"1", "2"}:
 
             runner = TorcsRunner()
 
-            agent = RandomAgent()
+            agent = RandomAgent() if choice == "1" else RuleBasedAgent()
 
             agent_id = repository.register_agent(
                 name=agent.name,

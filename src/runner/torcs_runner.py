@@ -2,6 +2,7 @@ import subprocess
 import sys
 import time
 import ctypes
+from collections.abc import Mapping
 from ctypes import wintypes
 from datetime import datetime, timezone
 from pathlib import Path
@@ -245,6 +246,30 @@ class TorcsRunner:
 
         # The selected track is currently configured in practice.xml.
 
+    def _step_full_control_agent(self, action):
+        """Apply a legacy controller action without gym's automatic controls."""
+        assert self.env is not None
+        client = self.env.client
+        previous_damage = float(client.S.d.get("damage", 0.0))
+
+        client.R.d["steer"] = action["steer"]
+        client.R.d["accel"] = action["accel"]
+        client.R.d["brake"] = action["brake"]
+        client.R.d["gear"] = action["gear"]
+        client.R.d["meta"] = 0
+        client.respond_to_server()
+        client.get_servers_input()
+
+        raw_observation = client.S.d
+        self.env.time_step += 1
+
+        reward = float(raw_observation["speedX"]) * float(
+            np.cos(raw_observation["angle"])
+        )
+        if float(raw_observation.get("damage", 0.0)) > previous_damage:
+            reward = -1.0
+        return raw_observation, reward, False, {}
+
     def run(self, agent):
         assert self.env is not None, "Call connect() before run()"
         started_at = datetime.now(timezone.utc).isoformat()
@@ -253,8 +278,9 @@ class TorcsRunner:
 
         agent.reset()
 
-        max_steps = 10000
+        max_steps = getattr(agent, "max_steps", 10000)
         stuck_counter = 0
+        uses_full_control = bool(getattr(agent, "uses_full_control", False))
 
         results = {
             "started_at": started_at,
@@ -277,12 +303,52 @@ class TorcsRunner:
                     print("\nTORCS closed unexpectedly.")
                     break
 
-                action = np.array(agent.act(observation))
-                observation, reward, done, _info = self.env.step(action)
+                raw_telemetry = self.env.client.S.d
+                agent_action = agent.act(observation, raw_telemetry)
+                if uses_full_control:
+                    if not isinstance(agent_action, Mapping):
+                        raise ValueError("Full-control agents must return an action mapping")
+                    if agent_action.get("terminate", False):
+                        self.env.client.R.d.update(
+                            {
+                                "steer": agent_action["steer"],
+                                "accel": agent_action["accel"],
+                                "brake": agent_action["brake"],
+                                "gear": agent_action["gear"],
+                                "meta": 1,
+                            }
+                        )
+                        self.env.client.respond_to_server()
+                        results["termination_reason"] = agent_action[
+                            "termination_reason"
+                        ]
+                        break
+                    raw_observation, reward, done, _info = self._step_full_control_agent(
+                        agent_action
+                    )
+                else:
+                    action = np.asarray(agent_action, dtype=float)
+                    if action.shape not in [(2,), (3,)]:
+                        raise ValueError(
+                            "Agent actions must be [steering, throttle] or "
+                            "[steering, throttle, brake]"
+                        )
+                    brake = float(action[2]) if action.shape == (3,) else 0.0
+                    self.env.client.R.d["brake"] = float(
+                        np.clip(brake, 0.0, 1.0)
+                    )
+                    observation, reward, done, _info = self.env.step(action[:2])
 
-                # speedX is normalised by default_speed (50) inside gym_torcs.
-                speed = float(observation.speedX)
-                off_track = bool(observation.track.min() < 0)
+                if uses_full_control:
+                    # Keep this path as light as the legacy socket loop. Building
+                    # gym's full NumPy observation every frame can leave control
+                    # commands queued behind newer TORCS sensor packets.
+                    speed = float(raw_observation["speedX"]) / self.env.default_speed
+                    off_track = min(raw_observation["track"]) < 0
+                else:
+                    # speedX is normalised by default_speed (50) inside gym_torcs.
+                    speed = float(observation.speedX)
+                    off_track = bool(observation.track.min() < 0)
                 damage = float(self.env.client.S.d.get("damage", previous_damage))
                 crashed = damage > previous_damage
                 previous_damage = damage
@@ -296,6 +362,11 @@ class TorcsRunner:
 
                 if off_track:
                     results["off_track"] += 1
+
+                if uses_full_control:
+                    continue
+
+                if off_track:
                     results["termination_reason"] = "off_track"
                     print(
                         "\nAgent went off track. "
@@ -327,6 +398,9 @@ class TorcsRunner:
         finally:
             results["avg_speed"] = speed_sum / max(results["steps"], 1)
             results["duration_seconds"] = time.perf_counter() - started_timer
+            close_agent = getattr(agent, "close", None)
+            if close_agent is not None:
+                close_agent()
             self.env.end()
             self.shutdown()
 

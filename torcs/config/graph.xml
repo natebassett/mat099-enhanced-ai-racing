@@ -75,7 +75,7 @@
       <attnum name="enable mirror" val="0"/>
       <attnum name="arcade" val="0"/>
       <attnum name="driver board" val="1"/>
-      <attnum name="camera" val="2"/>
+      <attnum name="camera" val="0"/>
       <attnum name="camera head list" val="0"/>
       <attnum name="fovy-0-1" val="40"/>
       <attnum name="fovy-4-0" val="21"/>
