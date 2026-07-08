@@ -63,6 +63,5 @@ class RuleBasedAgentSafetyTests(unittest.TestCase):
 
         self.assertTrue(is_stability_mode(state))
 
-
 if __name__ == "__main__":
     unittest.main()

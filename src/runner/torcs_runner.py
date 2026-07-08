@@ -263,6 +263,7 @@ class TorcsRunner:
         client.get_servers_input()
 
         raw_observation = client.S.d
+        server_stopped = client.so is None
         self.env.time_step += 1
 
         reward = float(raw_observation["speedX"]) * float(
@@ -270,7 +271,7 @@ class TorcsRunner:
         )
         if float(raw_observation.get("damage", 0.0)) > previous_damage:
             reward = -1.0
-        return raw_observation, reward, False, {}
+        return raw_observation, reward, server_stopped, {}
 
     def run(self, agent):
         assert self.env is not None, "Call connect() before run()"
@@ -372,6 +373,13 @@ class TorcsRunner:
                     results["off_track"] += 1
 
                 completed_lap = lap_tracker.update(self.env.client.S.d)
+                if completed_lap is None and done and uses_full_control:
+                    # Practice mode closes the SCR socket at the timing line
+                    # without populating lastLapTime. The final curLapTime is
+                    # the official completed Practice time in that case.
+                    completed_lap = lap_tracker.record(
+                        self.env.client.S.d.get("curLapTime", 0.0)
+                    )
                 if completed_lap is not None:
                     results["laps_completed"] = lap_tracker.laps_completed
                     results["best_lap_time_seconds"] = lap_tracker.best_lap_time
@@ -385,6 +393,9 @@ class TorcsRunner:
                         break
 
                 if uses_full_control:
+                    if done:
+                        results["termination_reason"] = "race_finished"
+                        break
                     continue
 
                 if off_track:

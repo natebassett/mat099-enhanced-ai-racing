@@ -602,7 +602,10 @@ class RuleBasedAgent:
     version = "1.9"
     seed = None
     uses_full_control = True
-    max_steps = 100000
+    # The old 100,000-step ceiling stopped Corkscrew metres before the timing
+    # line. Lap completion remains the real stop condition; this is only a
+    # failsafe for a race where TORCS never reports a completed lap.
+    max_steps = 150000
     target_laps = 1
 
     def __init__(self, telemetry_path=DEFAULT_TELEMETRY_PATH):
@@ -620,6 +623,7 @@ class RuleBasedAgent:
             "centreline_target": 0.0,
             "speed_sensitive_steering": True,
             "target_laps": self.target_laps,
+            "max_steps": self.max_steps,
             "telemetry_file": str(self.telemetry_path.relative_to(PROJECT_ROOT)),
         }
 

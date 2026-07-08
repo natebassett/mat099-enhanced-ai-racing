@@ -8,6 +8,10 @@ class LapTracker:
 
     def update(self, telemetry):
         lap_time = float(telemetry.get("lastLapTime", 0.0) or 0.0)
+        return self.record(lap_time)
+
+    def record(self, lap_time):
+        lap_time = float(lap_time or 0.0)
         if lap_time <= 0:
             return None
         if self._last_seen is not None and abs(lap_time - self._last_seen) < 1e-6:

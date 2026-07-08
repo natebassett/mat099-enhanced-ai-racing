@@ -30,6 +30,12 @@ class LapTrackerTests(unittest.TestCase):
         self.assertIsNone(tracker.update({"lastLapTime": 92.0}))
         self.assertEqual(tracker.laps_completed, 0)
 
+    def test_can_record_practice_finish_time_when_server_stops(self):
+        tracker = LapTracker()
+
+        self.assertEqual(tracker.record(117.358), 117.358)
+        self.assertEqual(tracker.best_lap_time, 117.358)
+
 
 class RaceRepositoryLapTimingTests(unittest.TestCase):
     def test_migrates_and_records_lap_metrics(self):
