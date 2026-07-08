@@ -17,6 +17,8 @@ sys.path.append(str(GYM_TORCS_DIR))
 
 from gym_torcs import TorcsEnv  # type: ignore[import]
 
+from runner.lap_tracker import LapTracker
+
 
 class TorcsRunner:
     OFF_TRACK_SHUTDOWN_DELAY = 3.0
@@ -279,8 +281,11 @@ class TorcsRunner:
         agent.reset()
 
         max_steps = getattr(agent, "max_steps", 10000)
+        target_laps = getattr(agent, "target_laps", None)
         stuck_counter = 0
         uses_full_control = bool(getattr(agent, "uses_full_control", False))
+        initial_telemetry = self.env.client.S.d
+        lap_tracker = LapTracker(initial_telemetry.get("lastLapTime", 0.0))
 
         results = {
             "started_at": started_at,
@@ -289,6 +294,9 @@ class TorcsRunner:
             "max_speed": 0.0,
             "avg_speed": 0.0,
             "off_track": 0,
+            "laps_completed": 0,
+            "best_lap_time_seconds": None,
+            "average_lap_time_seconds": None,
             "duration_seconds": 0.0,
             "termination_reason": "max_steps",
         }
@@ -362,6 +370,19 @@ class TorcsRunner:
 
                 if off_track:
                     results["off_track"] += 1
+
+                completed_lap = lap_tracker.update(self.env.client.S.d)
+                if completed_lap is not None:
+                    results["laps_completed"] = lap_tracker.laps_completed
+                    results["best_lap_time_seconds"] = lap_tracker.best_lap_time
+                    results["average_lap_time_seconds"] = lap_tracker.average_lap_time
+                    print(
+                        f"\nLap {lap_tracker.laps_completed} completed in "
+                        f"{completed_lap:.3f} seconds."
+                    )
+                    if target_laps and lap_tracker.laps_completed >= target_laps:
+                        results["termination_reason"] = "target_laps_completed"
+                        break
 
                 if uses_full_control:
                     continue

@@ -12,9 +12,12 @@ def print_results(results):
 
     print(f"Steps       : {results['steps']}")
     print(f"Total Score : {results['total_score']:.2f}")
-    print(f"Max Speed   : {results['max_speed']:.2f}")
-    print(f"Avg Speed   : {results['avg_speed']:.2f}")
+    print(f"Max Speed   : {results['max_speed'] * 50:.2f} km/h")
+    print(f"Avg Speed   : {results['avg_speed'] * 50:.2f} km/h")
     print(f"Off Track   : {results['off_track']}")
+    print(f"Laps        : {results['laps_completed']}")
+    if results["best_lap_time_seconds"] is not None:
+        print(f"Best Lap    : {results['best_lap_time_seconds']:.3f} seconds")
     print(f"Ended By    : {results['termination_reason']}")
 
     print("==============================\n")

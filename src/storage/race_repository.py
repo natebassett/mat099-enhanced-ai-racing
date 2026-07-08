@@ -137,10 +137,13 @@ class RaceRepository:
                     max_speed,
                     avg_speed,
                     off_track_count,
+                    laps_completed,
+                    best_lap_time_seconds,
+                    average_lap_time_seconds,
                     duration_seconds,
                     termination_reason
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     experiment_id,
@@ -153,6 +156,9 @@ class RaceRepository:
                     results["max_speed"],
                     results["avg_speed"],
                     results["off_track"],
+                    results.get("laps_completed", 0),
+                    results.get("best_lap_time_seconds"),
+                    results.get("average_lap_time_seconds"),
                     results["duration_seconds"],
                     results["termination_reason"],
                 ),
@@ -183,6 +189,7 @@ class RaceRepository:
             "total_score": "race_runs.total_score",
             "steps": "race_runs.steps",
             "duration_seconds": "race_runs.duration_seconds",
+            "best_lap_time": "race_runs.best_lap_time_seconds",
         }
         if sort_by not in sortable_columns:
             raise ValueError(f"Unsupported run sort column: {sort_by}")

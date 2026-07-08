@@ -76,6 +76,10 @@ TELEMETRY_COLUMNS = [
     "emergency_front_brake",
     "stability_mode",
     "stuck_counter",
+    "curLapTime",
+    "lastLapTime",
+    "distFromStart",
+    "distRaced",
 ] + [f"track_{index}" for index in range(19)]
 
 
@@ -599,6 +603,7 @@ class RuleBasedAgent:
     seed = None
     uses_full_control = True
     max_steps = 100000
+    target_laps = 1
 
     def __init__(self, telemetry_path=DEFAULT_TELEMETRY_PATH):
         self.telemetry_path = Path(telemetry_path)
@@ -614,6 +619,7 @@ class RuleBasedAgent:
             "steering_gain": ANGLE_STEER_GAIN,
             "centreline_target": 0.0,
             "speed_sensitive_steering": True,
+            "target_laps": self.target_laps,
             "telemetry_file": str(self.telemetry_path.relative_to(PROJECT_ROOT)),
         }
 
@@ -727,6 +733,10 @@ class RuleBasedAgent:
                 get_emergency_front_brake(state),
                 is_stability_mode(state),
                 self.stuck_counter,
+                state.get("curLapTime", 0),
+                state.get("lastLapTime", 0),
+                state.get("distFromStart", 0),
+                state.get("distRaced", 0),
             ]
             + list(state["track"])
         )
