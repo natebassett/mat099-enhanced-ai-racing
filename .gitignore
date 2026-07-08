@@ -19,6 +19,7 @@ data/*.db
 data/*.db-shm
 data/*.db-wal
 data/rule_based_telemetry.csv
+data/map_aware_telemetry.csv
 torcs/results/practice/results-*.xml
 
 # OS / editor
