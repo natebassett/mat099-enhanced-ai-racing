@@ -17,7 +17,7 @@ sys.path.append(str(GYM_TORCS_DIR))
 
 from gym_torcs import TorcsEnv  # type: ignore[import]
 
-from runner.lap_tracker import LapTracker
+from runner.lap_tracker import LapTracker, practice_finish_is_plausible
 
 
 class TorcsRunner:
@@ -373,7 +373,16 @@ class TorcsRunner:
                     results["off_track"] += 1
 
                 completed_lap = lap_tracker.update(self.env.client.S.d)
-                if completed_lap is None and done and uses_full_control:
+                if (
+                    completed_lap is None
+                    and done
+                    and uses_full_control
+                    and practice_finish_is_plausible(
+                        initial_telemetry,
+                        self.env.client.S.d,
+                        agent,
+                    )
+                ):
                     # Practice mode closes the SCR socket at the timing line
                     # without populating lastLapTime. The final curLapTime is
                     # the official completed Practice time in that case.

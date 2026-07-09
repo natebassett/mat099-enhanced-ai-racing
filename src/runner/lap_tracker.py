@@ -1,3 +1,17 @@
+def practice_finish_is_plausible(initial_telemetry, final_telemetry, agent):
+    """Reject socket closures caused by a stopped/off-track Practice car."""
+    initial_distance = float(initial_telemetry.get("distRaced", 0.0) or 0.0)
+    final_distance = float(final_telemetry.get("distRaced", 0.0) or 0.0)
+    distance_raced = max(0.0, final_distance - initial_distance)
+    racing_line = getattr(agent, "racing_line", None)
+    expected_length = float(
+        getattr(racing_line, "track_length", 0.0)
+        or initial_telemetry.get("distFromStart", 0.0)
+        or 0.0
+    )
+    return expected_length > 0.0 and distance_raced >= expected_length * 0.80
+
+
 class LapTracker:
     """Detect completed laps from TORCS' persistent lastLapTime sensor."""
 

@@ -1,9 +1,14 @@
 import csv
 import hashlib
-import math
 from pathlib import Path
 
-from racing_line import RacingLine
+from racing_line import (
+    RacingLine,
+    choose_driving_mode,
+    smooth_value,
+    calculate_aggressive_steering,
+    calculate_aggressive_speed_control,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -11,6 +16,10 @@ DEFAULT_RACING_LINE_PATH = PROJECT_ROOT / "data" / "racing_lines" / "corkscrew.j
 DEFAULT_TELEMETRY_PATH = PROJECT_ROOT / "data" / "map_aware_telemetry.csv"
 
 GEAR_SPEEDS = [0, 45, 85, 125, 165, 205]
+INSIDE_CORRIDOR_CORRECTION_GAIN = 0.18
+CORRIDOR_EDGE_CORRECTION_GAIN = 0.42
+OUTSIDE_CORRIDOR_CORRECTION_GAIN = 1.08
+MAX_STARTUP_LINE_BLEND_FLOOR = 0.65
 TELEMETRY_COLUMNS = [
     "step",
     "distFromStart",
@@ -19,6 +28,10 @@ TELEMETRY_COLUMNS = [
     "angle",
     "trackPos",
     "targetTrackPos",
+    "steeringTrackPos",
+    "lineError",
+    "effectiveLineError",
+    "corridorHalfWidth",
     "targetSpeed",
     "targetCurvature",
     "headingOffset",
@@ -38,18 +51,6 @@ def clamp(value, lower, upper):
     return max(lower, min(upper, value))
 
 
-def steering_limit(speed, track_position):
-    if abs(track_position) > 0.78:
-        return 0.82
-    if speed < 70:
-        return 0.78
-    if speed < 110:
-        return 0.66
-    if speed < 150:
-        return 0.50
-    return 0.36
-
-
 def shift_gears(speed):
     gear = 1
     for index, threshold in enumerate(GEAR_SPEEDS):
@@ -58,15 +59,69 @@ def shift_gears(speed):
     return int(clamp(gear, 1, 6))
 
 
+def get_racing_line_corridor(speed, curvature):
+    """Return a normalized lateral leeway around the saved racing line.
+
+    TORCS trackPos is normalized around the centreline where roughly -1 and +1
+    are the track edges. The saved racing line is still the ideal point, but
+    the car should not snap toward it while already inside a useful racing
+    corridor. Faster sections get a little more leeway so steering stays calm;
+    tight corners keep a narrower corridor so the apex still matters.
+    """
+    curvature_abs = abs(curvature)
+    if curvature_abs > 0.028:
+        corridor = 0.115
+    elif curvature_abs > 0.016:
+        corridor = 0.145
+    elif curvature_abs > 0.008:
+        corridor = 0.175
+    else:
+        corridor = 0.215
+
+    if speed > 170:
+        corridor += 0.035
+    elif speed > 125:
+        corridor += 0.020
+    elif speed < 70:
+        corridor -= 0.020
+
+    return clamp(corridor, 0.10, 0.25)
+
+
+def soften_line_error(line_error, corridor_half_width):
+    """Keep a gentle pull to the line inside the corridor, not a hard snap."""
+    error_abs = abs(line_error)
+    if error_abs < 1e-9:
+        return 0.0
+
+    direction = 1.0 if line_error > 0.0 else -1.0
+    if error_abs <= corridor_half_width:
+        corridor_fraction = error_abs / corridor_half_width
+        gain = (
+            INSIDE_CORRIDOR_CORRECTION_GAIN
+            + (CORRIDOR_EDGE_CORRECTION_GAIN - INSIDE_CORRIDOR_CORRECTION_GAIN)
+            * corridor_fraction
+            * corridor_fraction
+        )
+        return line_error * gain
+
+    outside_error = error_abs - corridor_half_width
+    softened = (
+        corridor_half_width * CORRIDOR_EDGE_CORRECTION_GAIN
+        + outside_error * OUTSIDE_CORRIDOR_CORRECTION_GAIN
+    )
+    return direction * softened
+
+
 class MapAwareAgent:
     name = "Map-Aware Racing-Line Agent"
     agent_type = "map_aware"
-    version = "1.1"
+    version = "1.5"
     seed = None
     uses_full_control = True
     max_steps = 150000
     target_laps = 1
-    line_merge_distance = 140.0
+    line_merge_distance = 45.0
 
     def __init__(
         self,
@@ -104,6 +159,8 @@ class MapAwareAgent:
     def reset(self):
         self.close()
         self.previous_steer = 0.0
+        self.previous_target_speed = None
+        self.previous_target_position = None
         self.start_distance = None
         self.start_distance_raced = None
         self.start_track_position = None
@@ -144,14 +201,21 @@ class MapAwareAgent:
             1.0,
         )
         line_blend = merge_fraction * merge_fraction * (3.0 - 2.0 * merge_fraction)
-        lookahead_distance = clamp(12.0 + speed * 0.12, 12.0, 38.0)
+        lookahead_distance = clamp(22.0 + speed * 0.15, 22.0, 46.0)
         target = self.racing_line.lookup(distance)
         lookahead = self.racing_line.lookup(distance + lookahead_distance)
-
-        target_position = (
-            target["target_track_pos"] * 0.35
-            + lookahead["target_track_pos"] * 0.65
+        initial_line_error = abs(self.start_track_position - target["target_track_pos"])
+        minimum_line_blend = clamp(
+            (initial_line_error - 0.12) / 0.55,
+            0.0,
+            MAX_STARTUP_LINE_BLEND_FLOOR,
         )
+        line_blend = max(line_blend, minimum_line_blend)
+
+        # Cross-track error belongs to the line underneath the car. Using a
+        # future lateral position here made the controller cut toward the exit
+        # before reaching the apex and then reverse its steering to recover.
+        target_position = target["target_track_pos"]
         target_position = (
             self.start_track_position * (1.0 - line_blend)
             + target_position * line_blend
@@ -160,61 +224,87 @@ class MapAwareAgent:
             target["target_speed_kmh"],
             lookahead["target_speed_kmh"] + 4.0,
         )
-        position_error = track_position - target_position
-        heading_error = float(telemetry["angle"]) + target["heading_offset"]
+
         lateral_speed = float(telemetry["speedY"])
+        angle = float(telemetry["angle"])
 
-        stability_mode = abs(lateral_speed) > 12.0 or abs(telemetry["angle"]) > 0.70
-        if stability_mode:
-            raw_steer = (
-                float(telemetry["angle"]) * 7.0 / math.pi
-                - track_position * 0.85
-                - lateral_speed * 0.030
-            )
-        else:
-            raw_steer = (
-                heading_error * 10.0 / math.pi
-                - position_error * 0.72
-                + lookahead["curvature"] * 6.0
-                - lateral_speed * 0.018
-            )
-
-        limit = steering_limit(speed, track_position)
-        raw_steer = clamp(raw_steer, -limit, limit)
-        smoothed_steer = 0.82 * self.previous_steer + 0.18 * raw_steer
-        maximum_change = 0.075 if abs(track_position) > 0.72 else 0.055
-        steer = self.previous_steer + clamp(
-            smoothed_steer - self.previous_steer,
-            -maximum_change,
-            maximum_change,
+        # Smooth the target so the car does not twitch when the racing line changes.
+        target_position = smooth_value(
+            self.previous_target_position,
+            target_position,
+            alpha=0.22,
         )
-        steer = clamp(steer, -limit, limit)
 
-        speed_error = target_speed - speed
-        if stability_mode:
-            accel = 0.0
-            brake = 0.30 if abs(lateral_speed) < 20 else 0.45
-        elif speed_error < -4.0:
-            accel = 0.0
-            brake = clamp((-speed_error - 2.0) / 24.0, 0.0, 1.0)
-        else:
-            brake = 0.0
-            accel = clamp(0.16 + speed_error / 32.0, 0.08, 1.0)
+        target_speed = smooth_value(
+            self.previous_target_speed,
+            target_speed,
+            alpha=0.18,
+        )
 
-        steering_magnitude = abs(steer)
-        if steering_magnitude > 0.65:
-            accel = min(accel, 0.16)
-        elif steering_magnitude > 0.48:
-            accel = min(accel, 0.32)
-        elif steering_magnitude > 0.32:
-            accel = min(accel, 0.55)
-        if abs(track_position) > 0.72:
-            accel = min(accel, 0.20)
+        raw_line_error = track_position - target_position
+        corridor_half_width = get_racing_line_corridor(
+            speed,
+            max(abs(target["curvature"]), abs(lookahead["curvature"])),
+        )
+        effective_line_error = soften_line_error(
+            raw_line_error,
+            corridor_half_width,
+        )
+        steering_target_position = track_position - effective_line_error
+        mode_line_error = max(
+            0.0,
+            abs(raw_line_error) - corridor_half_width * 0.65,
+        )
 
-        wheel_spin = telemetry["wheelSpinVel"]
-        slip = wheel_spin[2] + wheel_spin[3] - wheel_spin[0] - wheel_spin[1]
-        if slip > 3.2:
-            accel = max(0.0, accel - 0.10)
+        mode = choose_driving_mode(
+            track_pos=track_position,
+            angle=angle,
+            speed_y=lateral_speed,
+            line_error=mode_line_error,
+        )
+
+        desired_heading = (
+            target["heading_offset"] * 0.60
+            + lookahead["heading_offset"] * 0.40
+        )
+
+        # Use the lookahead curvature because it prepares the car for the corner.
+        target_curvature = (
+            target["curvature"] * 0.35
+            + lookahead["curvature"] * 0.65
+        )
+        # The car spawns close to the Corkscrew timing line, then immediately
+        # wraps from distFromStart ~= track_length to 0. During the startup
+        # merge, the lateral target is blended from the car's actual position;
+        # heading and curvature need the same ramp-in or they can command a
+        # full racing-line corner before the car has physically joined it.
+        line_authority = line_blend * line_blend
+        desired_heading *= line_authority
+        target_curvature *= line_authority
+
+        steer = calculate_aggressive_steering(
+            speed=speed,
+            track_pos=track_position,
+            angle=angle,
+            speed_y=lateral_speed,
+            target_track_pos=steering_target_position,
+            heading_offset=desired_heading,
+            curvature=target_curvature,
+            previous_steer=self.previous_steer,
+            mode=mode,
+        )
+
+        accel, brake, adjusted_target_speed = calculate_aggressive_speed_control(
+            speed=speed,
+            target_speed=target_speed,
+            steer=steer,
+            track_pos=track_position,
+            angle=angle,
+            speed_y=lateral_speed,
+            line_error=mode_line_error,
+            mode=mode,
+            wheel_spin=telemetry.get("wheelSpinVel"),
+        )
 
         action = {
             "steer": steer,
@@ -228,12 +318,18 @@ class MapAwareAgent:
             telemetry,
             action,
             target_position,
-            target_speed,
+            steering_target_position,
+            raw_line_error,
+            effective_line_error,
+            corridor_half_width,
+            adjusted_target_speed,
             lookahead,
             lookahead_distance,
             line_blend,
         )
         self.previous_steer = steer
+        self.previous_target_speed = target_speed
+        self.previous_target_position = target_position
         self.step += 1
         return action
 
@@ -242,6 +338,10 @@ class MapAwareAgent:
         telemetry,
         action,
         target_position,
+        steering_target_position,
+        raw_line_error,
+        effective_line_error,
+        corridor_half_width,
         target_speed,
         target,
         lookahead_distance,
@@ -258,6 +358,10 @@ class MapAwareAgent:
                 telemetry.get("angle", 0),
                 telemetry.get("trackPos", 0),
                 target_position,
+                steering_target_position,
+                raw_line_error,
+                effective_line_error,
+                corridor_half_width,
                 target_speed,
                 target["curvature"],
                 target["heading_offset"],

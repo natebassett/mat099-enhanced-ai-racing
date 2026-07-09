@@ -5,6 +5,10 @@ import math
 from pathlib import Path
 
 
+def clamp(value, lower, upper):
+    return max(lower, min(upper, value))
+
+
 class RacingLine:
     def __init__(self, payload):
         self.payload = payload
@@ -57,11 +61,11 @@ class RacingLineOptimizer:
         *,
         measured_length=None,
         spacing=3.0,
-        safety_margin=1.5,
+        safety_margin=1.15,
         maximum_speed_kmh=216.0,
-        minimum_speed_kmh=72.0,
-        lateral_acceleration=11.5,
-        acceleration=6.5,
+        minimum_speed_kmh=78.0,
+        lateral_acceleration=12.5,
+        acceleration=8.5,
         braking=10.0,
     ):
         self.track_map = track_map
@@ -76,8 +80,6 @@ class RacingLineOptimizer:
 
     def optimize(self):
         import numpy as np
-        from scipy.interpolate import PchipInterpolator
-        from scipy.optimize import minimize
 
         samples = self.track_map.sample_centerline(
             self.spacing,
@@ -88,21 +90,166 @@ class RacingLineOptimizer:
             [(point["normal_x"], point["normal_y"]) for point in samples]
         )
         sample_distances = np.array([point["distance"] for point in samples])
-        control_indices = []
-        for segment_index, segment in enumerate(self.track_map.segments):
-            sample_indices = [
-                index
-                for index, point in enumerate(samples)
-                if point["segment_index"] == segment_index
-            ]
-            control_indices.append(sample_indices[0])
-            if segment.turn_radians and len(sample_indices) > 2:
-                control_indices.append(sample_indices[len(sample_indices) // 2])
-        control_indices = sorted(set(control_indices))
-        control_distances = sample_distances[control_indices]
-        control_count = len(control_indices)
+        desired_controls = {}
+
+        def add_control(index, value, weight=1.0):
+            values = desired_controls.setdefault(index % len(samples), [])
+            values.append((value, weight))
+
+        def nearest_sample_index(distance):
+            distance = distance % lookup_length
+            index = int(np.searchsorted(sample_distances, distance))
+            before = (index - 1) % len(samples)
+            after = index % len(samples)
+            before_error = abs(
+                (sample_distances[before] - distance + lookup_length / 2.0)
+                % lookup_length
+                - lookup_length / 2.0
+            )
+            after_error = abs(
+                (sample_distances[after] - distance + lookup_length / 2.0)
+                % lookup_length
+                - lookup_length / 2.0
+            )
+            return before if before_error <= after_error else after
+
         lookup_length = self.measured_length or self.track_map.geometry_length
         usable_half_width = self.track_map.width / 2.0 - self.safety_margin
+
+        segment_sample_indices = []
+        for segment_index, _segment in enumerate(self.track_map.segments):
+            segment_sample_indices.append(
+                [
+                    index
+                    for index, point in enumerate(samples)
+                    if point["segment_index"] == segment_index
+                ]
+            )
+
+        def neighbouring_turn(segment_index, step):
+            index = (segment_index + step) % len(self.track_map.segments)
+            while index != segment_index:
+                segment = self.track_map.segments[index]
+                if segment.turn_radians:
+                    return index, math.copysign(1.0, segment.turn_radians)
+                index = (index + step) % len(self.track_map.segments)
+            return None, 0.0
+
+        def segment_start_distance(segment_index):
+            return sample_distances[segment_sample_indices[segment_index][0]]
+
+        def segment_end_distance(segment_index):
+            return (
+                sample_distances[segment_sample_indices[segment_index][-1]]
+                + self.spacing
+            ) % lookup_length
+
+        def cyclic_gap(start, end):
+            return (end - start) % lookup_length
+
+        turn_groups = []
+        current_group = None
+
+        for segment_index, segment in enumerate(self.track_map.segments):
+            sample_indices = segment_sample_indices[segment_index]
+            if not sample_indices:
+                continue
+
+            if not segment.turn_radians or len(sample_indices) <= 2:
+                continue
+
+            turn_sign = math.copysign(1.0, segment.turn_radians)
+            corner_start = sample_distances[sample_indices[0]]
+            corner_end = (
+                sample_distances[sample_indices[-1]]
+                + self.spacing
+            ) % lookup_length
+
+            if (
+                current_group is not None
+                and current_group["sign"] == turn_sign
+                and cyclic_gap(current_group["end"], corner_start) < 75.0
+            ):
+                current_group["end"] = corner_end
+                current_group["segments"].append(segment_index)
+                current_group["turn_radians"] += segment.turn_radians
+            else:
+                current_group = {
+                    "sign": turn_sign,
+                    "start": corner_start,
+                    "end": corner_end,
+                    "segments": [segment_index],
+                    "turn_radians": segment.turn_radians,
+                }
+                turn_groups.append(current_group)
+
+        for index, group in enumerate(turn_groups):
+            turn_sign = group["sign"]
+            corner_start = group["start"]
+            corner_end = group["end"]
+            span = max(cyclic_gap(corner_start, corner_end), self.spacing)
+            apex_distance = (corner_start + span * 0.52) % lookup_length
+            previous_group = turn_groups[index - 1]
+            next_group = turn_groups[(index + 1) % len(turn_groups)]
+            approach_gap = cyclic_gap(previous_group["end"], corner_start)
+            exit_gap = cyclic_gap(corner_end, next_group["start"])
+            approach_length = clamp(approach_gap * 0.55, 45.0, 125.0)
+            exit_length = clamp(exit_gap * 0.48, 35.0, 115.0)
+            next_approach_length = clamp(exit_gap * 0.55, 45.0, 125.0)
+            exit_entry_overlap = exit_length + next_approach_length > exit_gap
+            group["approach_start"] = (corner_start - approach_length) % lookup_length
+            group["apex"] = apex_distance
+            group["exit_end"] = (corner_end + exit_length) % lookup_length
+
+            outside = -turn_sign * usable_half_width * 0.40
+            apex = turn_sign * usable_half_width * 0.24
+            next_entry_outside = -next_group["sign"] * usable_half_width * 0.40
+            natural_exit_outside = -turn_sign * usable_half_width * 0.36
+            if exit_entry_overlap:
+                # The exit of this bend is the entry setup for the next bend.
+                # Do not open to this corner's outside in the same metres
+                # where the following sector is trying to set up its entry.
+                corner_exit = (
+                    next_entry_outside if exit_gap < 75.0 else natural_exit_outside
+                )
+                mid_exit = (corner_exit + next_entry_outside) / 2.0
+                final_exit = next_entry_outside
+            else:
+                corner_exit = natural_exit_outside
+                mid_exit = natural_exit_outside
+                final_exit = natural_exit_outside
+
+            # A usable racing line starts before the whole corner group,
+            # crosses once toward the apex, then opens once toward the exit.
+            # Treating every TORCS curve segment as its own corner caused the
+            # first compound left to ask for multiple different turns.
+            add_control(
+                nearest_sample_index(group["approach_start"]),
+                outside,
+                weight=3.50,
+            )
+            add_control(
+                nearest_sample_index(corner_start - approach_length * 0.35),
+                outside,
+                weight=4.00,
+            )
+            add_control(nearest_sample_index(corner_start), outside, weight=5.00)
+            add_control(nearest_sample_index(apex_distance), apex, weight=8.00)
+            add_control(nearest_sample_index(corner_end), corner_exit, weight=5.00)
+            add_control(
+                nearest_sample_index(corner_end + exit_length * 0.45),
+                mid_exit,
+                weight=4.00,
+            )
+            add_control(
+                nearest_sample_index(group["exit_end"]),
+                final_exit,
+                weight=3.00,
+            )
+
+        control_indices = sorted(desired_controls)
+        control_distances = sample_distances[control_indices]
+        control_count = len(control_indices)
 
         def expanded_offsets(controls):
             periodic_distances = np.concatenate(
@@ -116,32 +263,15 @@ class RacingLineOptimizer:
             periodic_controls = np.concatenate(
                 ([controls[-1]], controls, [controls[0]], [controls[1]])
             )
-            spline = PchipInterpolator(
-                periodic_distances,
-                periodic_controls,
-            )
-            return spline(sample_distances)
+            return np.interp(sample_distances, periodic_distances, periodic_controls)
 
-        initial_values = []
-        for sample_index in control_indices:
-            sample = samples[sample_index]
-            segment_index = sample["segment_index"]
-            segment = self.track_map.segments[segment_index]
-            turn_sign = math.copysign(1.0, segment.turn_radians) if segment.turn_radians else 0.0
-            if segment.turn_radians and sample["segment_fraction"] > 0.25:
-                # Inside at the apex.
-                value = turn_sign * usable_half_width * 0.82
-            elif segment.turn_radians:
-                # Outside on corner entry.
-                value = -turn_sign * usable_half_width * 0.90
-            else:
-                previous_segment = self.track_map.segments[segment_index - 1]
-                if previous_segment.turn_radians:
-                    previous_sign = math.copysign(1.0, previous_segment.turn_radians)
-                    value = -previous_sign * usable_half_width * 0.90
-                else:
-                    value = 0.0
-            initial_values.append(value)
+        initial_values = [
+            (
+                sum(value * weight for value, weight in desired_controls[sample_index])
+                / sum(weight for _value, weight in desired_controls[sample_index])
+            )
+            for sample_index in control_indices
+        ]
         initial = np.array(initial_values)
 
         def objective(controls):
@@ -162,27 +292,49 @@ class RacingLineOptimizer:
             control_second_difference = (
                 np.roll(controls, -1) - 2.0 * controls + np.roll(controls, 1)
             )
-            smoothness_cost = 0.0008 * np.sum(control_second_difference**2)
+            smoothness_cost = 0.0040 * np.sum(control_second_difference**2)
+            lateral_slope = (
+                np.roll(offsets, -1) - np.roll(offsets, 1)
+            ) / (2.0 * self.spacing)
+            maximum_lateral_slope = math.tan(math.radians(9.0))
+            slope_excess = np.maximum(
+                np.abs(lateral_slope) - maximum_lateral_slope,
+                0.0,
+            )
+            line_heading_cost = 30.0 * np.sum(slope_excess**2)
             length_cost = 0.00004 * np.sum(lengths)
             # Keep the numerical solution recognisably on a racing line. Pure
             # curvature minimisation tends to settle near the centre on linked
             # bends, even though that sacrifices the outside-apex-outside line
             # and the exit speed it enables.
-            classical_line_cost = 0.02 * np.sum((controls - initial) ** 2)
-            return curvature_cost + smoothness_cost + length_cost + classical_line_cost
-        result = minimize(
-            objective,
-            initial,
-            method="L-BFGS-B",
-            bounds=[(-usable_half_width, usable_half_width)] * control_count,
-            options={
-                "maxiter": 400,
-                "maxfun": 60000,
-                "ftol": 1e-10,
-                "maxls": 40,
-            },
+            classical_line_cost = 0.055 * np.sum((controls - initial) ** 2)
+            return (
+                curvature_cost
+                + smoothness_cost
+                + line_heading_cost
+                + length_cost
+                + classical_line_cost
+            )
+        optimized_controls = initial
+        optimizer_success = True
+        optimizer_message = "deterministic sector-based racing line"
+        optimizer_objective = float(objective(initial))
+
+        offsets = expanded_offsets(optimized_controls)
+        offsets = _enforce_classical_corner_shape(
+            offsets,
+            samples,
+            turn_groups,
+            lookup_length,
+            usable_half_width,
         )
-        offsets = expanded_offsets(result.x)
+        offsets = _smooth_cyclic_values(offsets, passes=1)
+        offsets = _limit_lateral_slope(
+            offsets,
+            max_delta=self.spacing * math.tan(math.radians(5.5)),
+        )
+        offsets = _smooth_cyclic_values(offsets, passes=1)
+        offsets = np.clip(offsets, -usable_half_width, usable_half_width)
         path = centre + normals * offsets[:, None]
         curvatures, path_lengths = _closed_path_curvature(path)
         speeds = self._speed_profile(curvatures, path_lengths)
@@ -219,9 +371,9 @@ class RacingLineOptimizer:
                 "track_width_m": self.track_map.width,
                 "source_sha256": source_hash,
                 "optimizer": {
-                    "success": bool(result.success),
-                    "message": str(result.message),
-                    "objective": float(result.fun),
+                    "success": optimizer_success,
+                    "message": optimizer_message,
+                    "objective": optimizer_objective,
                     "spacing_m": self.spacing,
                     "safety_margin_m": self.safety_margin,
                     "lateral_acceleration_mps2": self.lateral_acceleration,
@@ -295,6 +447,97 @@ def _heading_offsets(offsets, samples):
         derivative = (offsets_after[index] - offsets_before[index]) / max(span, 0.1)
         headings.append(math.atan(derivative))
     return headings
+
+
+def _smooth_cyclic_values(values, passes=1):
+    import numpy as np
+
+    smoothed = np.asarray(values, dtype=float).copy()
+    for _ in range(passes):
+        smoothed = (
+            np.roll(smoothed, 2) * 0.06
+            + np.roll(smoothed, 1) * 0.24
+            + smoothed * 0.40
+            + np.roll(smoothed, -1) * 0.24
+            + np.roll(smoothed, -2) * 0.06
+        )
+    return smoothed
+
+
+def _limit_lateral_slope(values, max_delta):
+    import numpy as np
+
+    limited = np.asarray(values, dtype=float).copy()
+    count = len(limited)
+    for _ in range(6):
+        for index in range(count):
+            previous = (index - 1) % count
+            delta = limited[index] - limited[previous]
+            if delta > max_delta:
+                limited[index] = limited[previous] + max_delta
+            elif delta < -max_delta:
+                limited[index] = limited[previous] - max_delta
+
+        for index in range(count - 1, -1, -1):
+            following = (index + 1) % count
+            delta = limited[index] - limited[following]
+            if delta > max_delta:
+                limited[index] = limited[following] + max_delta
+            elif delta < -max_delta:
+                limited[index] = limited[following] - max_delta
+    return limited
+
+
+def _enforce_classical_corner_shape(
+    offsets,
+    samples,
+    turn_groups,
+    track_length,
+    usable_half_width,
+):
+    import numpy as np
+
+    shaped = np.asarray(offsets, dtype=float).copy()
+    group_by_sample = {}
+    for group_index, group in enumerate(turn_groups):
+        group["index"] = group_index
+        span = (group["end"] - group["start"]) % track_length
+        if span <= 0.0:
+            continue
+        for index, sample in enumerate(samples):
+            travelled = (sample["distance"] - group["start"]) % track_length
+            if travelled <= span:
+                group_by_sample[index] = group
+
+    for index, sample in enumerate(samples):
+        group = group_by_sample.get(index)
+        if group is None:
+            continue
+
+        turn_sign = group["sign"]
+        outside = -turn_sign * usable_half_width * 0.40
+        apex = turn_sign * usable_half_width * 0.24
+        next_group = turn_groups[(group["index"] + 1) % len(turn_groups)]
+        exit_gap = (next_group["start"] - group["end"]) % track_length
+        exit_length = (group["exit_end"] - group["end"]) % track_length
+        next_approach_length = clamp(exit_gap * 0.55, 45.0, 125.0)
+        if exit_length + next_approach_length > exit_gap:
+            exit_outside = -next_group["sign"] * usable_half_width * 0.40
+        else:
+            exit_outside = -turn_sign * usable_half_width * 0.36
+        span = max((group["end"] - group["start"]) % track_length, 0.1)
+        fraction = ((sample["distance"] - group["start"]) % track_length) / span
+        if fraction <= 0.5:
+            blend = fraction / 0.5
+            desired = outside * (1.0 - blend) + apex * blend
+        else:
+            blend = (fraction - 0.5) / 0.5
+            desired = apex * (1.0 - blend) + exit_outside * blend
+
+        apex_weight = 1.0 - min(abs(fraction - 0.5) / 0.5, 1.0)
+        weight = 0.45 + 0.35 * apex_weight
+        shaped[index] = shaped[index] * (1.0 - weight) + desired * weight
+    return shaped
 
 
 def _phase(speed_kmh, maximum_speed_kmh):

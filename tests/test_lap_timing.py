@@ -8,7 +8,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from runner.lap_tracker import LapTracker  # noqa: E402
+from runner.lap_tracker import (  # noqa: E402
+    LapTracker,
+    practice_finish_is_plausible,
+)
 from storage import RaceRepository  # noqa: E402
 
 
@@ -35,6 +38,25 @@ class LapTrackerTests(unittest.TestCase):
 
         self.assertEqual(tracker.record(117.358), 117.358)
         self.assertEqual(tracker.best_lap_time, 117.358)
+
+    def test_rejects_server_stop_before_car_completes_lap(self):
+        class Agent:
+            racing_line = type("Line", (), {"track_length": 3608.28})()
+
+        self.assertFalse(
+            practice_finish_is_plausible(
+                {"distRaced": 0.0, "distFromStart": 3598.45},
+                {"distRaced": 1988.59, "distFromStart": 1978.76},
+                Agent(),
+            )
+        )
+        self.assertTrue(
+            practice_finish_is_plausible(
+                {"distRaced": 0.0, "distFromStart": 3598.45},
+                {"distRaced": 3618.18, "distFromStart": 3608.18},
+                Agent(),
+            )
+        )
 
 
 class RaceRepositoryLapTimingTests(unittest.TestCase):
