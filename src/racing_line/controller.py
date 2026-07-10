@@ -97,8 +97,8 @@ def calculate_aggressive_steering(
         # Save the car first.
         if edge_risk:
             raw_steer = (
-                -track_pos * 1.35
-                - angle * 7.0 / math.pi
+                -track_pos * 2.00
+                - angle * 3.5 / math.pi
                 - speed_y * 0.045
             )
         else:
@@ -167,6 +167,9 @@ def calculate_aggressive_steering(
     if mode == DrivingMode.RECOVERY:
         max_delta *= 1.90
         smooth_alpha = 0.46
+        if edge_risk and abs(track_pos) > 0.78:
+            max_delta = max(max_delta, 0.28)
+            smooth_alpha = 0.68
 
     smoothed = previous_steer * (1.0 - smooth_alpha) + raw_steer * smooth_alpha
     steer = limit_change(previous_steer, smoothed, max_delta)
@@ -203,7 +206,7 @@ def calculate_aggressive_speed_control(
     else:
         adjusted_target *= 0.62
 
-    # Map-aware phase control, generated from the racing-line speed profile.
+    # Map-aware phase control, generated from the live dynamic speed target.
     # This mirrors the reference style: brake before turn-in, coast/rotate
     # around the apex, accelerate on exit, and full throttle on clear straights.
     if is_braking_phase:
@@ -266,7 +269,7 @@ def calculate_aggressive_speed_control(
                 brake = 0.35
             else:
                 brake = 0.12
-    elif is_braking_phase and speed > 40.0:
+    elif is_braking_phase and speed > 40.0 and speed > adjusted_target - 4.0:
         accel = 0.0
         brake = clamp((6.0 - speed_error) / 22.0, 0.10, 0.62)
     elif abs(speed_y) > 18.0 and speed > 35.0:
@@ -275,6 +278,12 @@ def calculate_aggressive_speed_control(
     elif abs(speed_y) > 14.0 and speed > 45.0:
         accel = 0.0
         brake = 0.24
+    elif abs(speed_y) > 10.0 and speed > 50.0:
+        accel = 0.0
+        brake = 0.16
+    elif abs(speed_y) > 7.5 and abs(angle) > 0.08 and speed > 60.0:
+        accel = 0.0
+        brake = 0.10
     elif speed_error < -4.0:
         accel = 0.0
         brake = clamp((-speed_error - 2.0) / 26.0, 0.0, 1.0)
@@ -289,7 +298,7 @@ def calculate_aggressive_speed_control(
 
     if abs(angle) > 0.38 or abs(speed_y) > 10.0:
         accel = min(accel, 0.12)
-    elif is_braking_phase:
+    elif is_braking_phase and speed > adjusted_target - 10.0:
         accel = 0.0
     elif abs(track_pos) > 0.45 and drifting_outward:
         accel = min(accel, 0.18)

@@ -1,5 +1,6 @@
 import csv
 import hashlib
+import math
 from pathlib import Path
 
 from racing_line import (
@@ -68,6 +69,9 @@ TELEMETRY_COLUMNS = [
     "sensorSpeedCap",
     "lookaheadDistance",
     "lineBlend",
+    "referenceThrottle",
+    "referenceBrake",
+    "referenceSection",
     "phase",
     "steer",
     "accel",
@@ -238,6 +242,92 @@ def sensor_speed_cap(track, speed, previous_front):
     return 216.0
 
 
+def curvature_limited_speed(
+    curvature,
+    *,
+    lateral_acceleration=8.6,
+    minimum_speed=58.0,
+    maximum_speed=216.0,
+):
+    curvature_abs = abs(curvature)
+    if curvature_abs < 0.0012:
+        return maximum_speed
+
+    speed = math.sqrt(lateral_acceleration / curvature_abs) * 3.6
+    return clamp(speed, minimum_speed, maximum_speed)
+
+
+def calculate_dynamic_target_speed(
+    *,
+    speed,
+    target,
+    lookahead,
+    far_lookahead,
+    very_far_lookahead,
+    live_sensor_speed_cap,
+    line_complexity,
+    line_error,
+):
+    """Calculate speed from road geometry instead of hand-authored sectors."""
+
+    curvature_limits = [
+        curvature_limited_speed(target["curvature"], lateral_acceleration=9.4) + 4.0,
+        curvature_limited_speed(lookahead["curvature"], lateral_acceleration=8.9)
+        + 8.0,
+        curvature_limited_speed(far_lookahead["curvature"], lateral_acceleration=8.5)
+        + 18.0,
+        curvature_limited_speed(
+            very_far_lookahead["curvature"],
+            lateral_acceleration=8.2,
+        )
+        + 30.0,
+    ]
+    target_speed = min(curvature_limits)
+
+    max_preview_curvature = max(
+        abs(target["curvature"]),
+        abs(lookahead["curvature"]),
+        abs(far_lookahead["curvature"]),
+        abs(very_far_lookahead["curvature"]),
+    )
+    if max_preview_curvature < 0.0035 and live_sensor_speed_cap > 170.0:
+        target_speed = max(target_speed, 188.0)
+    elif max_preview_curvature < 0.006 and live_sensor_speed_cap > 150.0:
+        target_speed = max(target_speed, 162.0)
+
+    if line_complexity > 0.72:
+        target_speed -= 8.0
+    elif line_complexity > 0.50:
+        target_speed -= 4.0
+
+    if abs(line_error) > 0.35:
+        target_speed -= 10.0
+    if abs(line_error) > 0.55:
+        target_speed -= 14.0
+
+    if live_sensor_speed_cap < 216.0:
+        # Sensor caps are noisy in corners, so keep a small margin unless the
+        # cap is already saying the road ahead is genuinely short.
+        sensor_margin = 8.0 if live_sensor_speed_cap >= 82.0 else 0.0
+        target_speed = min(target_speed, live_sensor_speed_cap + sensor_margin)
+
+    # Avoid asking for a sudden over-brake from one frame of lookahead noise.
+    if target_speed < speed - 65.0 and live_sensor_speed_cap > 82.0:
+        target_speed = speed - 65.0
+
+    return clamp(target_speed, 58.0, 216.0)
+
+
+def choose_dynamic_control_phase(speed, target_speed, curvature, front_sensor):
+    if target_speed < speed - 7.0:
+        return "brake"
+    if abs(curvature) > 0.006 or front_sensor < 46.0:
+        return "turn"
+    if target_speed > speed + 8.0:
+        return "accelerate"
+    return "accelerate"
+
+
 def guard_racing_line_target(
     *,
     track_position,
@@ -245,6 +335,7 @@ def guard_racing_line_target(
     speed,
     track_sensors,
     line_complexity,
+    line_blend=1.0,
 ):
     """Keep the saved racing line drivable when the live road edge disagrees.
 
@@ -257,6 +348,7 @@ def guard_racing_line_target(
     guarded = target_position
     edge_abs = abs(track_position)
     front = track_sensors[9]
+    minimum_sensor = min(track_sensors) if track_sensors else front
     best_index = get_best_sensor(track_sensors)
     best_angle = TRACK_SENSOR_ANGLES[best_index]
     best_distance = track_sensors[best_index]
@@ -273,25 +365,34 @@ def guard_racing_line_target(
     elif track_position > SAFE_TRACK_LIMIT:
         guarded = min(guarded, track_position - 0.20)
 
-    # If the forward road is short, bias toward the sensor with the most road.
-    # This matters most in the Corkscrew/last hairpin where the generated line
-    # may be valid geometrically but the car arrives rotated or late.
-    if front < 52.0 or best_distance > front * 1.35:
+    # A normal corner often has a short straight-ahead sensor; that must not
+    # veto the map line. Only bias away from the line when the car is already
+    # near/off the edge or the road immediately ahead has effectively vanished.
+    off_track = front < 0.0 or minimum_sensor < 0.0 or edge_abs > 1.02
+    immediate_wall = front < 7.0 and speed > 18.0
+    edge_escape = (
+        edge_abs > SAFE_TRACK_LIMIT
+        and front < 34.0
+        and best_distance > max(front * 1.55, front + 12.0)
+    )
+    if line_blend > 0.18 and (off_track or immediate_wall or edge_escape):
         sensor_target = clamp(best_angle / 45.0, -0.55, 0.55)
-        sensor_weight = clamp((70.0 - front) / 55.0, 0.0, 0.55)
+        sensor_weight = clamp((34.0 - front) / 32.0, 0.0, 0.40)
         if speed > 125.0:
-            sensor_weight = min(0.68, sensor_weight + 0.12)
+            sensor_weight = min(0.50, sensor_weight + 0.08)
         if line_complexity > 0.45:
-            sensor_weight = min(0.74, sensor_weight + 0.12)
+            sensor_weight = min(0.55, sensor_weight + 0.07)
+        if off_track:
+            sensor_weight = max(sensor_weight, 0.62)
         guarded = guarded * (1.0 - sensor_weight) + sensor_target * sensor_weight
 
-    return clamp(guarded, -0.62, 0.62)
+    return clamp(guarded, -0.76, 0.76)
 
 
 class MapAwareAgent:
     name = "Map-Aware Racing-Line Agent"
     agent_type = "map_aware"
-    version = "1.7"
+    version = "2.1"
     seed = None
     uses_full_control = True
     max_steps = 150000
@@ -398,6 +499,9 @@ class MapAwareAgent:
         far_lookahead = self.racing_line.lookup(
             distance + lookahead_distance * 1.85
         )
+        very_far_lookahead = self.racing_line.lookup(
+            distance + lookahead_distance * 3.25
+        )
         line_complexity = estimate_line_complexity(
             target,
             lookahead,
@@ -431,12 +535,14 @@ class MapAwareAgent:
             self.start_track_position * (1.0 - line_blend)
             + target_position * line_blend
         )
-        target_speed = min(
-            target["target_speed_kmh"],
-            lookahead["target_speed_kmh"] + 8.0,
-            far_lookahead["target_speed_kmh"] + 15.0,
-            live_sensor_speed_cap,
-        )
+        if distance_travelled < 70.0:
+            launch_fraction = distance_travelled / 70.0
+            maximum_launch_shift = 0.08 + 0.18 * launch_fraction
+            target_position = clamp(
+                target_position,
+                self.start_track_position - maximum_launch_shift,
+                self.start_track_position + maximum_launch_shift,
+            )
 
         lateral_speed = float(telemetry["speedY"])
         angle = float(telemetry["angle"])
@@ -466,6 +572,7 @@ class MapAwareAgent:
             speed=speed,
             track_sensors=track_sensors,
             line_complexity=line_complexity,
+            line_blend=line_blend,
         )
         if self.previous_target_position is not None:
             guarded_delta = 0.030
@@ -477,18 +584,34 @@ class MapAwareAgent:
                 guarded_delta,
             )
 
-        speed_alpha = 0.18
-        if target["phase"].startswith("brake"):
-            speed_alpha = 0.36
-        elif target["phase"].startswith("accelerate"):
-            speed_alpha = 0.26
+        raw_line_error = track_position - target_position
+        target_speed = calculate_dynamic_target_speed(
+            speed=speed,
+            target=target,
+            lookahead=lookahead,
+            far_lookahead=far_lookahead,
+            very_far_lookahead=very_far_lookahead,
+            live_sensor_speed_cap=live_sensor_speed_cap,
+            line_complexity=line_complexity,
+            line_error=raw_line_error,
+        )
+
+        speed_alpha = 0.24
+        if (
+            self.previous_target_speed is not None
+            and target_speed < self.previous_target_speed - 8.0
+        ):
+            speed_alpha = 0.42
+        elif target_speed > speed + 20.0:
+            speed_alpha = 0.28
         target_speed = smooth_value(
             self.previous_target_speed,
             target_speed,
             alpha=speed_alpha,
         )
+        if live_sensor_speed_cap < 216.0:
+            target_speed = min(target_speed, live_sensor_speed_cap)
 
-        raw_line_error = track_position - target_position
         corridor_half_width = get_racing_line_corridor(
             speed,
             max(abs(target["curvature"]), abs(lookahead["curvature"])),
@@ -543,6 +666,19 @@ class MapAwareAgent:
             previous_steer=self.previous_steer,
             mode=mode,
         )
+        if (
+            distance_travelled < 70.0
+            and speed < 120.0
+            and abs(track_position) < 0.62
+        ):
+            launch_fraction = distance_travelled / 70.0
+            launch_steer_limit = 0.20 + 0.10 * launch_fraction
+            steer = clamp(steer, -launch_steer_limit, launch_steer_limit)
+            steer = limit_change(
+                self.previous_steer,
+                steer,
+                0.035 if speed > 45.0 else 0.045,
+            )
         if line_complexity > 0.42 and speed > 35.0:
             complex_limit = 0.56 if speed < 95.0 else 0.46
             if abs(track_position) > 0.62:
@@ -554,7 +690,12 @@ class MapAwareAgent:
                 0.040 if speed > 75.0 else 0.052,
             )
 
-        control_phase = target["phase"]
+        control_phase = choose_dynamic_control_phase(
+            speed,
+            target_speed,
+            target_curvature,
+            front_sensor,
+        )
         is_launching = line_blend < 0.05 and speed < 18.0
         if is_launching:
             control_phase = "launch"
@@ -592,7 +733,26 @@ class MapAwareAgent:
                 and abs(angle) > 0.05
                 and speed > 65.0
             ):
-                accel = min(accel, 0.28)
+                accel = min(accel, 0.18)
+            if abs(lateral_speed) > 7.5 and speed > 55.0:
+                accel = min(accel, 0.06)
+                if abs(angle) > 0.08 or abs(track_position) > 0.48:
+                    brake = max(brake, 0.10)
+            if abs(lateral_speed) > 12.0 and speed > 45.0:
+                accel = 0.0
+                brake = max(brake, 0.18)
+            if abs(lateral_speed) > 16.0 and speed > 35.0:
+                accel = 0.0
+                brake = max(brake, 0.30)
+            if distance_travelled < 45.0 and abs(lateral_speed) > 4.0:
+                accel = min(accel, 0.08)
+            if (
+                speed < 30.0
+                and brake < 0.05
+                and target_speed > speed + 35.0
+                and front_sensor > 24.0
+            ):
+                accel = max(accel, 0.42)
 
         action = {
             "steer": steer,
@@ -632,6 +792,10 @@ class MapAwareAgent:
             live_sensor_speed_cap,
             lookahead_distance,
             line_blend,
+            target.get("reference_throttle", 0.0),
+            target.get("reference_brake", 0.0),
+            target.get("reference_section", ""),
+            control_phase,
         )
         self.previous_steer = steer
         self.previous_accel = accel
@@ -691,6 +855,10 @@ class MapAwareAgent:
         live_sensor_speed_cap,
         lookahead_distance,
         line_blend,
+        reference_throttle,
+        reference_brake,
+        reference_section,
+        control_phase,
     ):
         if self._telemetry_writer is None:
             return
@@ -719,7 +887,10 @@ class MapAwareAgent:
                 live_sensor_speed_cap,
                 lookahead_distance,
                 line_blend,
-                target["phase"],
+                reference_throttle,
+                reference_brake,
+                reference_section,
+                control_phase,
                 action["steer"],
                 action["accel"],
                 action["brake"],

@@ -12,12 +12,17 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from agents.map_aware_agent import (  # noqa: E402
     MapAwareAgent,
+    calculate_dynamic_target_speed,
     estimate_line_complexity,
+    guard_racing_line_target,
     preview_track_position,
+    choose_dynamic_control_phase,
 )
 from racing_line import RacingLine, TorcsTrackMap  # noqa: E402
+from racing_line.optimizer import _CORKSCREW_REFERENCE_ANCHORS  # noqa: E402
 from racing_line.controller import (  # noqa: E402
     DrivingMode,
+    calculate_aggressive_speed_control,
     calculate_aggressive_steering,
     choose_driving_mode,
 )
@@ -100,104 +105,129 @@ class RacingLineArtifactTests(unittest.TestCase):
             0.05,
         )
 
-    def test_major_bends_use_outside_apex_outside_line(self):
-        track_map = TorcsTrackMap.from_xml(TRACK_PATH)
-        samples = track_map.sample_centerline(3.0, 3608.28)
-        strongest_by_direction = {}
+    def test_reference_profile_matches_corner_anchors(self):
+        self.assertEqual(
+            self.payload["optimizer"]["reference_profile"],
+            "laguna_seca_corkscrew_v1",
+        )
 
-        for segment_index, segment in enumerate(track_map.segments):
-            if not segment.turn_radians:
-                continue
-            direction = 1 if segment.turn_radians > 0 else -1
-            current = strongest_by_direction.get(direction)
-            if current is None or abs(segment.turn_radians) > abs(current.turn_radians):
-                strongest_by_direction[direction] = segment
+        for anchor in _CORKSCREW_REFERENCE_ANCHORS:
+            waypoint = self.racing_line.lookup(anchor["distance"])
 
-        for direction, segment in strongest_by_direction.items():
-            segment_index = track_map.segments.index(segment)
-            group_indices = [segment_index]
+            self.assertLessEqual(
+                abs(waypoint["target_track_pos"] - anchor["track_pos"]),
+                0.05,
+                anchor["name"],
+            )
+            self.assertLessEqual(
+                abs(waypoint["target_speed_kmh"] - anchor["speed_kmh"]),
+                5.0,
+                anchor["name"],
+            )
 
-            previous_index = segment_index - 1
-            while previous_index >= 0:
-                previous_segment = track_map.segments[previous_index]
-                previous_samples = [
-                    point
-                    for point in samples
-                    if point["segment_index"] == previous_index
-                ]
-                current_samples = [
-                    point
-                    for point in samples
-                    if point["segment_index"] == group_indices[0]
-                ]
-                if not previous_samples:
-                    break
-                gap = current_samples[0]["distance"] - previous_samples[-1]["distance"]
-                previous_direction = (
-                    1
-                    if previous_segment.turn_radians > 0
-                    else -1
-                    if previous_segment.turn_radians < 0
-                    else 0
-                )
-                if previous_direction == direction and gap < 75.0:
-                    group_indices.insert(0, previous_index)
-                    previous_index -= 1
-                    continue
-                if previous_direction == 0 and gap < 75.0:
-                    previous_index -= 1
-                    continue
-                break
+    def test_t1_entry_stays_on_launch_side_before_apex(self):
+        for distance in [3598.0, 0.0, 50.0, 120.0]:
+            waypoint = self.racing_line.lookup(distance)
 
-            next_index = segment_index + 1
-            while next_index < len(track_map.segments):
-                next_segment = track_map.segments[next_index]
-                next_samples = [
-                    point
-                    for point in samples
-                    if point["segment_index"] == next_index
-                ]
-                current_samples = [
-                    point
-                    for point in samples
-                    if point["segment_index"] == group_indices[-1]
-                ]
-                if not next_samples:
-                    break
-                gap = next_samples[0]["distance"] - current_samples[-1]["distance"]
-                next_direction = (
-                    1
-                    if next_segment.turn_radians > 0
-                    else -1
-                    if next_segment.turn_radians < 0
-                    else 0
-                )
-                if next_direction == direction and gap < 75.0:
-                    group_indices.append(next_index)
-                    next_index += 1
-                    continue
-                if next_direction == 0 and gap < 75.0:
-                    next_index += 1
-                    continue
-                break
+            self.assertGreater(
+                waypoint["target_track_pos"],
+                0.30,
+                f"T1 setup at {distance} m",
+            )
+            self.assertLess(
+                waypoint["target_track_pos"],
+                0.46,
+                f"T1 setup at {distance} m",
+            )
 
-            segment_samples = [
-                point
-                for point in samples
-                if point["segment_index"] in group_indices
-            ]
-            directed_positions = [
-                direction
-                * self.racing_line.lookup(point["distance"])["target_track_pos"]
-                for point in segment_samples
-            ]
-            midpoint = len(directed_positions) // 2
+        self.assertLess(
+            self.racing_line.lookup(200.0)["target_track_pos"],
+            -0.30,
+        )
+        self.assertGreater(
+            self.racing_line.lookup(545.0)["target_track_pos"],
+            0.34,
+        )
+        self.assertLess(
+            self.racing_line.lookup(545.0)["target_track_pos"],
+            0.48,
+        )
 
-            self.assertLess(min(directed_positions), -0.05)
-            # Compound bends may deliberately use a shallower apex so the next
-            # turn can be linked smoothly. The line must still cross inward,
-            # but its exit may become the entry setup for the next sector.
-            self.assertGreater(max(directed_positions), 0.03)
+    def test_t3_setup_avoids_full_width_snap_after_t2(self):
+        self.assertGreater(
+            self.racing_line.lookup(585.0)["target_track_pos"],
+            0.34,
+        )
+        self.assertLess(
+            self.racing_line.lookup(585.0)["target_track_pos"],
+            0.48,
+        )
+        self.assertGreater(
+            self.racing_line.lookup(620.0)["target_track_pos"],
+            -0.45,
+        )
+        self.assertLess(
+            self.racing_line.lookup(620.0)["target_track_pos"],
+            -0.20,
+        )
+        self.assertGreater(
+            self.racing_line.lookup(775.0)["target_track_pos"],
+            0.34,
+        )
+        self.assertLess(
+            self.racing_line.lookup(775.0)["target_track_pos"],
+            0.48,
+        )
+
+    def test_dynamic_speed_stays_fast_on_clear_straight(self):
+        target = self.racing_line.lookup(90.0)
+        lookahead = self.racing_line.lookup(116.0)
+        far_lookahead = self.racing_line.lookup(138.0)
+        very_far_lookahead = self.racing_line.lookup(175.0)
+
+        target_speed = calculate_dynamic_target_speed(
+            speed=80.0,
+            target=target,
+            lookahead=lookahead,
+            far_lookahead=far_lookahead,
+            very_far_lookahead=very_far_lookahead,
+            live_sensor_speed_cap=216.0,
+            line_complexity=0.0,
+            line_error=0.02,
+        )
+
+        self.assertGreater(target_speed, 180.0)
+
+    def test_dynamic_speed_anticipates_t2_curvature(self):
+        target = self.racing_line.lookup(350.0)
+        lookahead = self.racing_line.lookup(402.0)
+        far_lookahead = self.racing_line.lookup(455.0)
+        very_far_lookahead = self.racing_line.lookup(520.0)
+
+        target_speed = calculate_dynamic_target_speed(
+            speed=112.0,
+            target=target,
+            lookahead=lookahead,
+            far_lookahead=far_lookahead,
+            very_far_lookahead=very_far_lookahead,
+            live_sensor_speed_cap=216.0,
+            line_complexity=0.45,
+            line_error=0.06,
+        )
+
+        self.assertLess(target_speed, 118.0)
+        self.assertGreater(target_speed, 58.0)
+
+    def test_dynamic_phase_brakes_from_target_delta(self):
+        self.assertEqual(
+            choose_dynamic_control_phase(
+                speed=112.0,
+                target_speed=92.0,
+                curvature=0.002,
+                front_sensor=120.0,
+            ),
+            "brake",
+        )
 
     def test_line_has_no_abrupt_lateral_heading_changes(self):
         maximum_heading_offset = max(
@@ -205,7 +235,10 @@ class RacingLineArtifactTests(unittest.TestCase):
             for waypoint in self.payload["waypoints"]
         )
 
-        self.assertLess(maximum_heading_offset, 0.18)
+        # The reference profile deliberately cuts across the full track on
+        # short straights, so its lateral heading is more aggressive than the
+        # old generic centre-biased line.
+        self.assertLess(maximum_heading_offset, 0.60)
 
     def test_line_contains_map_aware_driving_phases(self):
         phases = {
@@ -300,6 +333,36 @@ class MapAwareAgentTests(unittest.TestCase):
         self.assertGreaterEqual(action["accel"], 0.85)
         self.assertEqual(action["brake"], 0.0)
 
+    def test_launch_target_does_not_creep_from_sensor_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            telemetry_path = Path(directory) / "telemetry.csv"
+            agent = MapAwareAgent(
+                racing_line_path=LINE_PATH,
+                telemetry_path=telemetry_path,
+            )
+            launch_track = [62.0] * 19
+            launch_track[5] = 112.0
+            for _step in range(12):
+                agent.act(
+                    None,
+                    make_telemetry(
+                        speedX=0.0,
+                        distFromStart=3598.45,
+                        distRaced=0.0,
+                        trackPos=0.33,
+                        track=launch_track,
+                    ),
+                )
+            agent.close()
+
+            with telemetry_path.open(newline="", encoding="utf-8") as handle:
+                telemetry_rows = list(csv.DictReader(handle))
+
+        self.assertAlmostEqual(
+            float(telemetry_rows[-1]["targetTrackPos"]),
+            0.33,
+        )
+
     def test_launch_stuck_terminates_after_five_seconds(self):
         with tempfile.TemporaryDirectory() as directory:
             agent = MapAwareAgent(
@@ -350,6 +413,19 @@ class MapAwareAgentTests(unittest.TestCase):
         self.assertGreater(preview_position, target["target_track_pos"])
         self.assertLess(preview_position, lookahead["target_track_pos"])
 
+    def test_normal_corner_sensor_does_not_override_saved_line(self):
+        track = [18.0] * 19
+        guarded = guard_racing_line_target(
+            track_position=0.02,
+            target_position=0.72,
+            speed=86.0,
+            track_sensors=track,
+            line_complexity=0.45,
+            line_blend=1.0,
+        )
+
+        self.assertGreater(guarded, 0.68)
+
     def test_edge_hug_becomes_limit_mode_when_pointing_outward(self):
         mode = choose_driving_mode(
             track_pos=-0.35,
@@ -374,6 +450,38 @@ class MapAwareAgentTests(unittest.TestCase):
         )
 
         self.assertGreater(steer, 0.0)
+
+    def test_braking_phase_accelerates_when_well_below_target(self):
+        accel, brake, _adjusted_target = calculate_aggressive_speed_control(
+            speed=82.0,
+            target_speed=145.0,
+            steer=0.04,
+            track_pos=0.30,
+            angle=0.02,
+            speed_y=0.0,
+            line_error=0.05,
+            mode=DrivingMode.ATTACK,
+            phase="brake",
+        )
+
+        self.assertGreater(accel, 0.5)
+        self.assertEqual(brake, 0.0)
+
+    def test_lateral_drift_cuts_throttle_before_full_spin(self):
+        accel, brake, _adjusted_target = calculate_aggressive_speed_control(
+            speed=84.0,
+            target_speed=180.0,
+            steer=0.03,
+            track_pos=0.30,
+            angle=-0.12,
+            speed_y=-9.0,
+            line_error=0.08,
+            mode=DrivingMode.ATTACK,
+            phase="accelerate_left_turn",
+        )
+
+        self.assertEqual(accel, 0.0)
+        self.assertGreaterEqual(brake, 0.10)
 
 
 if __name__ == "__main__":
