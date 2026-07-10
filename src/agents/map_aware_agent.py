@@ -6,6 +6,7 @@ from racing_line import (
     RacingLine,
     choose_driving_mode,
     smooth_value,
+    limit_change,
     calculate_aggressive_steering,
     calculate_aggressive_speed_control,
 )
@@ -16,10 +17,33 @@ DEFAULT_RACING_LINE_PATH = PROJECT_ROOT / "data" / "racing_lines" / "corkscrew.j
 DEFAULT_TELEMETRY_PATH = PROJECT_ROOT / "data" / "map_aware_telemetry.csv"
 
 GEAR_SPEEDS = [0, 45, 85, 125, 165, 205]
+TRACK_SENSOR_ANGLES = [
+    -45,
+    -19,
+    -12,
+    -7,
+    -4,
+    -2.5,
+    -1.7,
+    -1,
+    -0.5,
+    0,
+    0.5,
+    1,
+    1.7,
+    2.5,
+    4,
+    7,
+    12,
+    19,
+    45,
+]
 INSIDE_CORRIDOR_CORRECTION_GAIN = 0.18
 CORRIDOR_EDGE_CORRECTION_GAIN = 0.42
 OUTSIDE_CORRIDOR_CORRECTION_GAIN = 1.08
 MAX_STARTUP_LINE_BLEND_FLOOR = 0.65
+SAFE_TRACK_LIMIT = 0.72
+HARD_TRACK_LIMIT = 0.90
 TELEMETRY_COLUMNS = [
     "step",
     "distFromStart",
@@ -28,13 +52,20 @@ TELEMETRY_COLUMNS = [
     "angle",
     "trackPos",
     "targetTrackPos",
+    "previewTrackPos",
     "steeringTrackPos",
     "lineError",
     "effectiveLineError",
     "corridorHalfWidth",
+    "lineComplexity",
     "targetSpeed",
     "targetCurvature",
     "headingOffset",
+    "speedDelta30m",
+    "turnDirection",
+    "sensorFront",
+    "sensorBestAngle",
+    "sensorSpeedCap",
     "lookaheadDistance",
     "lineBlend",
     "phase",
@@ -59,7 +90,7 @@ def shift_gears(speed):
     return int(clamp(gear, 1, 6))
 
 
-def get_racing_line_corridor(speed, curvature):
+def get_racing_line_corridor(speed, curvature, line_complexity=0.0):
     """Return a normalized lateral leeway around the saved racing line.
 
     TORCS trackPos is normalized around the centreline where roughly -1 and +1
@@ -84,6 +115,11 @@ def get_racing_line_corridor(speed, curvature):
         corridor += 0.020
     elif speed < 70:
         corridor -= 0.020
+
+    # Linked bends need a little more lateral freedom. If the target line
+    # moves left-right-left quickly, snapping to the exact ideal point causes
+    # oscillation and costs more time than a slightly wider, calmer corridor.
+    corridor += 0.040 * line_complexity
 
     return clamp(corridor, 0.10, 0.25)
 
@@ -113,10 +149,149 @@ def soften_line_error(line_error, corridor_half_width):
     return direction * softened
 
 
+def estimate_line_complexity(target, lookahead, far_lookahead):
+    lateral_swing = max(
+        abs(lookahead["target_track_pos"] - target["target_track_pos"]),
+        abs(far_lookahead["target_track_pos"] - lookahead["target_track_pos"]),
+    )
+    curvature_values = [
+        target["curvature"],
+        lookahead["curvature"],
+        far_lookahead["curvature"],
+    ]
+    strong_curvatures = [
+        value
+        for value in curvature_values
+        if abs(value) > 0.006
+    ]
+    has_direction_change = any(
+        left * right < 0.0
+        for left, right in zip(strong_curvatures, strong_curvatures[1:])
+    )
+    complexity = clamp((lateral_swing - 0.10) / 0.22, 0.0, 1.0)
+    if has_direction_change:
+        complexity += 0.28
+    return clamp(complexity, 0.0, 1.0)
+
+
+def preview_track_position(target, lookahead, far_lookahead, speed, line_complexity):
+    """Aim through the racing line instead of chasing one instantaneous point."""
+
+    current_position = target["target_track_pos"]
+    future_position = (
+        lookahead["target_track_pos"] * 0.68
+        + far_lookahead["target_track_pos"] * 0.32
+    )
+    preview_weight = clamp(0.18 + speed / 520.0 + line_complexity * 0.10, 0.18, 0.48)
+    maximum_preview_shift = 0.17 - line_complexity * 0.055
+    preview_shift = clamp(
+        future_position - current_position,
+        -maximum_preview_shift,
+        maximum_preview_shift,
+    )
+    return current_position + preview_shift * preview_weight
+
+
+def get_track_sensors(telemetry):
+    track = telemetry.get("track", [])
+    if len(track) >= 19:
+        return [float(value) for value in track[:19]]
+    return [float(telemetry.get(f"track_{index}", 200.0)) for index in range(19)]
+
+
+def get_best_sensor(track):
+    front = track[9]
+    candidate_indices = range(4, 15) if front < 65.0 else range(6, 13)
+    best_index = 9
+    best_score = front * 1.12
+
+    for index in candidate_indices:
+        offset = abs(index - 9)
+        centre_penalty = 1.0 - offset * (0.035 if front < 65.0 else 0.10)
+        score = track[index] * centre_penalty
+        if score > best_score:
+            best_score = score
+            best_index = index
+    return best_index
+
+
+def sensor_speed_cap(track, speed, previous_front):
+    front = track[9]
+    front_delta = 0.0 if previous_front is None else front - previous_front
+    closing_fast = front_delta < -0.75
+
+    if front < 8.0:
+        return 42.0
+    if front < 14.0:
+        return 60.0
+    if front < 22.0:
+        return 82.0
+    if front < 32.0:
+        return 105.0
+    if front < 45.0:
+        return 128.0
+    if closing_fast and speed > 155.0:
+        if front < 76.0:
+            return 150.0
+        if front < 102.0:
+            return 172.0
+    return 216.0
+
+
+def guard_racing_line_target(
+    *,
+    track_position,
+    target_position,
+    speed,
+    track_sensors,
+    line_complexity,
+):
+    """Keep the saved racing line drivable when the live road edge disagrees.
+
+    The map line is still the ideal. This guard only vetoes it when the car is
+    already close to an edge or the road sensors say the chosen lane is about to
+    disappear. That lets the agent use the track width aggressively without
+    obeying a target that is physically unrecoverable in the current state.
+    """
+
+    guarded = target_position
+    edge_abs = abs(track_position)
+    front = track_sensors[9]
+    best_index = get_best_sensor(track_sensors)
+    best_angle = TRACK_SENSOR_ANGLES[best_index]
+    best_distance = track_sensors[best_index]
+
+    if edge_abs > HARD_TRACK_LIMIT:
+        guarded = clamp(guarded, -0.22, 0.22)
+    elif edge_abs > SAFE_TRACK_LIMIT:
+        guarded = clamp(guarded, -0.42, 0.42)
+
+    # Do not keep asking the car to move farther toward the same edge once it is
+    # already using most of the track. Hold a small leeway, then recover inward.
+    if track_position < -SAFE_TRACK_LIMIT:
+        guarded = max(guarded, track_position + 0.20)
+    elif track_position > SAFE_TRACK_LIMIT:
+        guarded = min(guarded, track_position - 0.20)
+
+    # If the forward road is short, bias toward the sensor with the most road.
+    # This matters most in the Corkscrew/last hairpin where the generated line
+    # may be valid geometrically but the car arrives rotated or late.
+    if front < 52.0 or best_distance > front * 1.35:
+        sensor_target = clamp(best_angle / 45.0, -0.55, 0.55)
+        sensor_weight = clamp((70.0 - front) / 55.0, 0.0, 0.55)
+        if speed > 125.0:
+            sensor_weight = min(0.68, sensor_weight + 0.12)
+        if line_complexity > 0.45:
+            sensor_weight = min(0.74, sensor_weight + 0.12)
+        guarded = guarded * (1.0 - sensor_weight) + sensor_target * sensor_weight
+
+    return clamp(guarded, -0.62, 0.62)
+
+
 class MapAwareAgent:
     name = "Map-Aware Racing-Line Agent"
     agent_type = "map_aware"
-    version = "1.5"
+    version = "1.7"
     seed = None
     uses_full_control = True
     max_steps = 150000
@@ -159,11 +334,15 @@ class MapAwareAgent:
     def reset(self):
         self.close()
         self.previous_steer = 0.0
+        self.previous_accel = None
+        self.previous_brake = None
         self.previous_target_speed = None
         self.previous_target_position = None
         self.start_distance = None
         self.start_distance_raced = None
         self.start_track_position = None
+        self.launch_stuck_steps = 0
+        self.previous_front = None
         self.step = 0
         self.telemetry_path.parent.mkdir(parents=True, exist_ok=True)
         self._telemetry_file = self.telemetry_path.open(
@@ -182,6 +361,15 @@ class MapAwareAgent:
         speed = float(telemetry["speedX"])
         track_position = float(telemetry["trackPos"])
         distance = float(telemetry.get("distFromStart", 0.0))
+        track_sensors = get_track_sensors(telemetry)
+        front_sensor = track_sensors[9]
+        best_sensor_index = get_best_sensor(track_sensors)
+        best_sensor_angle = TRACK_SENSOR_ANGLES[best_sensor_index]
+        live_sensor_speed_cap = sensor_speed_cap(
+            track_sensors,
+            speed,
+            self.previous_front,
+        )
         if self.start_distance is None:
             self.start_distance = distance
             self.start_distance_raced = float(telemetry.get("distRaced", 0.0))
@@ -195,34 +383,59 @@ class MapAwareAgent:
             distance_travelled = (
                 distance - self.start_distance
             ) % self.racing_line.track_length
+        merge_distance = self.line_merge_distance
+        if distance_travelled < 120.0:
+            merge_distance = 95.0
         merge_fraction = clamp(
-            distance_travelled / self.line_merge_distance,
+            distance_travelled / merge_distance,
             0.0,
             1.0,
         )
         line_blend = merge_fraction * merge_fraction * (3.0 - 2.0 * merge_fraction)
-        lookahead_distance = clamp(22.0 + speed * 0.15, 22.0, 46.0)
+        lookahead_distance = clamp(24.0 + speed * 0.16, 24.0, 56.0)
         target = self.racing_line.lookup(distance)
         lookahead = self.racing_line.lookup(distance + lookahead_distance)
+        far_lookahead = self.racing_line.lookup(
+            distance + lookahead_distance * 1.85
+        )
+        line_complexity = estimate_line_complexity(
+            target,
+            lookahead,
+            far_lookahead,
+        )
         initial_line_error = abs(self.start_track_position - target["target_track_pos"])
+        launch_authority = clamp(
+            (distance_travelled - 6.0) / 32.0,
+            0.0,
+            1.0,
+        ) * clamp(speed / 34.0, 0.0, 1.0)
         minimum_line_blend = clamp(
             (initial_line_error - 0.12) / 0.55,
             0.0,
             MAX_STARTUP_LINE_BLEND_FLOOR,
-        )
+        ) * launch_authority
         line_blend = max(line_blend, minimum_line_blend)
 
-        # Cross-track error belongs to the line underneath the car. Using a
-        # future lateral position here made the controller cut toward the exit
-        # before reaching the apex and then reverse its steering to recover.
-        target_position = target["target_track_pos"]
+        # Cross-track error mostly belongs to the line underneath the car, but
+        # a small preview window helps linked bends become one flowing target
+        # rather than a sequence of urgent left-right corrections.
+        preview_position = preview_track_position(
+            target,
+            lookahead,
+            far_lookahead,
+            speed,
+            line_complexity,
+        )
+        target_position = preview_position
         target_position = (
             self.start_track_position * (1.0 - line_blend)
             + target_position * line_blend
         )
         target_speed = min(
             target["target_speed_kmh"],
-            lookahead["target_speed_kmh"] + 4.0,
+            lookahead["target_speed_kmh"] + 8.0,
+            far_lookahead["target_speed_kmh"] + 15.0,
+            live_sensor_speed_cap,
         )
 
         lateral_speed = float(telemetry["speedY"])
@@ -232,19 +445,54 @@ class MapAwareAgent:
         target_position = smooth_value(
             self.previous_target_position,
             target_position,
-            alpha=0.22,
+            alpha=0.22 - line_complexity * 0.06,
         )
+        if self.previous_target_position is not None:
+            max_target_delta = 0.026
+            if speed > 150:
+                max_target_delta = 0.018
+            elif speed > 100:
+                max_target_delta = 0.022
+            max_target_delta *= 1.0 - line_complexity * 0.28
+            target_position = limit_change(
+                self.previous_target_position,
+                target_position,
+                max_target_delta,
+            )
 
+        target_position = guard_racing_line_target(
+            track_position=track_position,
+            target_position=target_position,
+            speed=speed,
+            track_sensors=track_sensors,
+            line_complexity=line_complexity,
+        )
+        if self.previous_target_position is not None:
+            guarded_delta = 0.030
+            if line_complexity > 0.42 or speed > 120.0:
+                guarded_delta = 0.022
+            target_position = limit_change(
+                self.previous_target_position,
+                target_position,
+                guarded_delta,
+            )
+
+        speed_alpha = 0.18
+        if target["phase"].startswith("brake"):
+            speed_alpha = 0.36
+        elif target["phase"].startswith("accelerate"):
+            speed_alpha = 0.26
         target_speed = smooth_value(
             self.previous_target_speed,
             target_speed,
-            alpha=0.18,
+            alpha=speed_alpha,
         )
 
         raw_line_error = track_position - target_position
         corridor_half_width = get_racing_line_corridor(
             speed,
             max(abs(target["curvature"]), abs(lookahead["curvature"])),
+            line_complexity,
         )
         effective_line_error = soften_line_error(
             raw_line_error,
@@ -264,14 +512,16 @@ class MapAwareAgent:
         )
 
         desired_heading = (
-            target["heading_offset"] * 0.60
+            target["heading_offset"] * 0.45
             + lookahead["heading_offset"] * 0.40
+            + far_lookahead["heading_offset"] * 0.15
         )
 
         # Use the lookahead curvature because it prepares the car for the corner.
         target_curvature = (
-            target["curvature"] * 0.35
-            + lookahead["curvature"] * 0.65
+            target["curvature"] * 0.25
+            + lookahead["curvature"] * 0.50
+            + far_lookahead["curvature"] * 0.25
         )
         # The car spawns close to the Corkscrew timing line, then immediately
         # wraps from distFromStart ~= track_length to 0. During the startup
@@ -293,6 +543,21 @@ class MapAwareAgent:
             previous_steer=self.previous_steer,
             mode=mode,
         )
+        if line_complexity > 0.42 and speed > 35.0:
+            complex_limit = 0.56 if speed < 95.0 else 0.46
+            if abs(track_position) > 0.62:
+                complex_limit += 0.10
+            steer = clamp(steer, -complex_limit, complex_limit)
+            steer = limit_change(
+                self.previous_steer,
+                steer,
+                0.040 if speed > 75.0 else 0.052,
+            )
+
+        control_phase = target["phase"]
+        is_launching = line_blend < 0.05 and speed < 18.0
+        if is_launching:
+            control_phase = "launch"
 
         accel, brake, adjusted_target_speed = calculate_aggressive_speed_control(
             speed=speed,
@@ -303,8 +568,31 @@ class MapAwareAgent:
             speed_y=lateral_speed,
             line_error=mode_line_error,
             mode=mode,
+            phase=control_phase,
             wheel_spin=telemetry.get("wheelSpinVel"),
         )
+        if is_launching:
+            accel = max(accel, 0.85)
+            brake = 0.0
+        else:
+            accel, brake = self._smooth_pedals(
+                accel,
+                brake,
+                line_complexity,
+                mode,
+            )
+            if (
+                abs(track_position) > 0.46
+                and abs(raw_line_error) > 0.20
+                and speed > 45.0
+            ):
+                accel = min(accel, 0.34)
+            if (
+                abs(lateral_speed) > 4.0
+                and abs(angle) > 0.05
+                and speed > 65.0
+            ):
+                accel = min(accel, 0.28)
 
         action = {
             "steer": steer,
@@ -314,36 +602,93 @@ class MapAwareAgent:
             "terminate": False,
             "termination_reason": "",
         }
+        if (
+            distance_travelled < 2.0
+            and abs(speed) < 1.0
+            and float(telemetry.get("curLapTime", 0.0)) >= 0.0
+        ):
+            self.launch_stuck_steps += 1
+        else:
+            self.launch_stuck_steps = 0
+
+        if self.launch_stuck_steps > 250:
+            action["terminate"] = True
+            action["termination_reason"] = "launch_stuck"
+
         self._write_telemetry(
             telemetry,
             action,
             target_position,
+            preview_position,
             steering_target_position,
             raw_line_error,
             effective_line_error,
             corridor_half_width,
+            line_complexity,
             adjusted_target_speed,
-            lookahead,
+            target,
+            front_sensor,
+            best_sensor_angle,
+            live_sensor_speed_cap,
             lookahead_distance,
             line_blend,
         )
         self.previous_steer = steer
+        self.previous_accel = accel
+        self.previous_brake = brake
         self.previous_target_speed = target_speed
         self.previous_target_position = target_position
+        self.previous_front = front_sensor
         self.step += 1
         return action
+
+    def _smooth_pedals(self, accel, brake, line_complexity, mode):
+        if self.previous_accel is None or self.previous_brake is None:
+            return accel, brake
+
+        if brake > 0.0:
+            accel = 0.0
+        elif self.previous_brake > 0.0 and line_complexity > 0.35:
+            accel = min(accel, 0.34)
+
+        accel_up = 0.18 if line_complexity > 0.42 else 0.25
+        accel_down = 0.34
+        if mode.value == "RECOVERY":
+            accel_up = 0.12
+            accel_down = 0.40
+        accel = self.previous_accel + clamp(
+            accel - self.previous_accel,
+            -accel_down,
+            accel_up,
+        )
+
+        brake_up = 0.30
+        brake_down = 0.20 if line_complexity > 0.42 else 0.28
+        brake = self.previous_brake + clamp(
+            brake - self.previous_brake,
+            -brake_down,
+            brake_up,
+        )
+        if brake > 0.02:
+            accel = 0.0
+        return accel, brake
 
     def _write_telemetry(
         self,
         telemetry,
         action,
         target_position,
+        preview_position,
         steering_target_position,
         raw_line_error,
         effective_line_error,
         corridor_half_width,
+        line_complexity,
         target_speed,
         target,
+        front_sensor,
+        best_sensor_angle,
+        live_sensor_speed_cap,
         lookahead_distance,
         line_blend,
     ):
@@ -358,13 +703,20 @@ class MapAwareAgent:
                 telemetry.get("angle", 0),
                 telemetry.get("trackPos", 0),
                 target_position,
+                preview_position,
                 steering_target_position,
                 raw_line_error,
                 effective_line_error,
                 corridor_half_width,
+                line_complexity,
                 target_speed,
                 target["curvature"],
                 target["heading_offset"],
+                target.get("speed_delta_30m", 0.0),
+                target.get("turn_direction", 0.0),
+                front_sensor,
+                best_sensor_angle,
+                live_sensor_speed_cap,
                 lookahead_distance,
                 line_blend,
                 target["phase"],

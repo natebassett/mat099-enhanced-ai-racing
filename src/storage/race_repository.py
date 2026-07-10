@@ -176,6 +176,66 @@ class RaceRepository:
 
             return run_id
 
+    def record_run_telemetry(
+        self,
+        run_id: int,
+        samples: list[Mapping[str, Any]],
+    ) -> None:
+        if not samples:
+            return
+
+        with self._connect() as connection:
+            connection.executemany(
+                """
+                INSERT OR REPLACE INTO run_telemetry(
+                    run_id,
+                    step,
+                    dist_from_start,
+                    dist_raced,
+                    speed_x,
+                    speed_y,
+                    angle,
+                    track_pos,
+                    damage,
+                    steer,
+                    accel,
+                    brake,
+                    gear,
+                    reward,
+                    off_track,
+                    front_sensor,
+                    min_track_sensor,
+                    cur_lap_time,
+                    last_lap_time
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        run_id,
+                        sample["step"],
+                        sample.get("dist_from_start"),
+                        sample.get("dist_raced"),
+                        sample.get("speed_x"),
+                        sample.get("speed_y"),
+                        sample.get("angle"),
+                        sample.get("track_pos"),
+                        sample.get("damage"),
+                        sample.get("steer"),
+                        sample.get("accel"),
+                        sample.get("brake"),
+                        sample.get("gear"),
+                        sample.get("reward"),
+                        1 if sample.get("off_track") else 0,
+                        sample.get("front_sensor"),
+                        sample.get("min_track_sensor"),
+                        sample.get("cur_lap_time"),
+                        sample.get("last_lap_time"),
+                    )
+                    for sample in samples
+                ),
+            )
+
     def list_runs(
         self,
         *,

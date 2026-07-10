@@ -285,7 +285,7 @@ class TorcsRunner:
         target_laps = getattr(agent, "target_laps", None)
         stuck_counter = 0
         uses_full_control = bool(getattr(agent, "uses_full_control", False))
-        initial_telemetry = self.env.client.S.d
+        initial_telemetry = dict(self.env.client.S.d)
         lap_tracker = LapTracker(initial_telemetry.get("lastLapTime", 0.0))
 
         results = {
@@ -300,6 +300,7 @@ class TorcsRunner:
             "average_lap_time_seconds": None,
             "duration_seconds": 0.0,
             "termination_reason": "max_steps",
+            "telemetry_samples": [],
         }
 
         speed_sum = 0.0
@@ -354,10 +355,17 @@ class TorcsRunner:
                     # commands queued behind newer TORCS sensor packets.
                     speed = float(raw_observation["speedX"]) / self.env.default_speed
                     off_track = min(raw_observation["track"]) < 0
+                    action_snapshot = agent_action
                 else:
                     # speedX is normalised by default_speed (50) inside gym_torcs.
                     speed = float(observation.speedX)
                     off_track = bool(observation.track.min() < 0)
+                    action_snapshot = {
+                        "steer": float(action[0]),
+                        "accel": float(action[1]),
+                        "brake": brake,
+                        "gear": self.env.client.R.d.get("gear"),
+                    }
                 damage = float(self.env.client.S.d.get("damage", previous_damage))
                 crashed = damage > previous_damage
                 previous_damage = damage
@@ -371,6 +379,14 @@ class TorcsRunner:
 
                 if off_track:
                     results["off_track"] += 1
+
+                self._record_telemetry_sample(
+                    results,
+                    self.env.client.S.d,
+                    action_snapshot,
+                    reward,
+                    off_track,
+                )
 
                 completed_lap = lap_tracker.update(self.env.client.S.d)
                 if (
@@ -446,3 +462,37 @@ class TorcsRunner:
             self.shutdown()
 
         return results
+
+    def _record_telemetry_sample(
+        self,
+        results,
+        telemetry,
+        action,
+        reward,
+        off_track,
+    ):
+        track = telemetry.get("track", [])
+        front_sensor = track[9] if len(track) > 9 else None
+        min_track_sensor = min(track) if track else None
+        results["telemetry_samples"].append(
+            {
+                "step": results["steps"],
+                "dist_from_start": telemetry.get("distFromStart"),
+                "dist_raced": telemetry.get("distRaced"),
+                "speed_x": telemetry.get("speedX"),
+                "speed_y": telemetry.get("speedY"),
+                "angle": telemetry.get("angle"),
+                "track_pos": telemetry.get("trackPos"),
+                "damage": telemetry.get("damage"),
+                "steer": action.get("steer") if isinstance(action, Mapping) else None,
+                "accel": action.get("accel") if isinstance(action, Mapping) else None,
+                "brake": action.get("brake") if isinstance(action, Mapping) else None,
+                "gear": action.get("gear") if isinstance(action, Mapping) else None,
+                "reward": reward,
+                "off_track": off_track,
+                "front_sensor": front_sensor,
+                "min_track_sensor": min_track_sensor,
+                "cur_lap_time": telemetry.get("curLapTime"),
+                "last_lap_time": telemetry.get("lastLapTime"),
+            }
+        )

@@ -10,8 +10,17 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from agents.map_aware_agent import MapAwareAgent  # noqa: E402
+from agents.map_aware_agent import (  # noqa: E402
+    MapAwareAgent,
+    estimate_line_complexity,
+    preview_track_position,
+)
 from racing_line import RacingLine, TorcsTrackMap  # noqa: E402
+from racing_line.controller import (  # noqa: E402
+    DrivingMode,
+    calculate_aggressive_steering,
+    choose_driving_mode,
+)
 
 
 TRACK_PATH = PROJECT_ROOT / "torcs" / "tracks" / "road" / "corkscrew" / "corkscrew.xml"
@@ -198,6 +207,20 @@ class RacingLineArtifactTests(unittest.TestCase):
 
         self.assertLess(maximum_heading_offset, 0.18)
 
+    def test_line_contains_map_aware_driving_phases(self):
+        phases = {
+            waypoint["phase"]
+            for waypoint in self.payload["waypoints"]
+        }
+
+        self.assertIn("brake", phases)
+        self.assertIn("accelerate", phases)
+        self.assertTrue(any("left_turn" in phase for phase in phases))
+        self.assertTrue(any("right_turn" in phase for phase in phases))
+        self.assertTrue(
+            all("speed_delta_30m" in waypoint for waypoint in self.payload["waypoints"])
+        )
+
 
 class MapAwareAgentTests(unittest.TestCase):
     def test_action_is_bounded_and_uses_full_control(self):
@@ -246,6 +269,111 @@ class MapAwareAgentTests(unittest.TestCase):
                 telemetry_rows = list(csv.DictReader(handle))
 
         self.assertEqual(float(telemetry_rows[-1]["lineBlend"]), 1.0)
+
+    def test_launch_does_not_snap_to_racing_line_while_stationary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            telemetry_path = Path(directory) / "telemetry.csv"
+            agent = MapAwareAgent(
+                racing_line_path=LINE_PATH,
+                telemetry_path=telemetry_path,
+            )
+            action = agent.act(
+                None,
+                make_telemetry(
+                    speedX=0.0,
+                    distFromStart=3598.45,
+                    distRaced=0.0,
+                    trackPos=0.33,
+                ),
+            )
+            agent.close()
+
+            with telemetry_path.open(newline="", encoding="utf-8") as handle:
+                telemetry_rows = list(csv.DictReader(handle))
+
+        self.assertEqual(float(telemetry_rows[-1]["lineBlend"]), 0.0)
+        self.assertAlmostEqual(
+            float(telemetry_rows[-1]["targetTrackPos"]),
+            0.33,
+        )
+        self.assertLess(abs(action["steer"]), 0.08)
+        self.assertGreaterEqual(action["accel"], 0.85)
+        self.assertEqual(action["brake"], 0.0)
+
+    def test_launch_stuck_terminates_after_five_seconds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent = MapAwareAgent(
+                racing_line_path=LINE_PATH,
+                telemetry_path=Path(directory) / "telemetry.csv",
+            )
+            action = None
+            for step in range(252):
+                action = agent.act(
+                    None,
+                    make_telemetry(
+                        speedX=0.0,
+                        distFromStart=3598.45,
+                        distRaced=0.0,
+                        trackPos=0.33,
+                        curLapTime=step / 50.0,
+                    ),
+                )
+            agent.close()
+
+        self.assertTrue(action["terminate"])
+        self.assertEqual(action["termination_reason"], "launch_stuck")
+
+    def test_preview_target_calms_tight_alternating_bends(self):
+        target = {
+            "target_track_pos": -0.20,
+            "curvature": 0.015,
+        }
+        lookahead = {
+            "target_track_pos": 0.18,
+            "curvature": -0.014,
+        }
+        far_lookahead = {
+            "target_track_pos": -0.10,
+            "curvature": 0.012,
+        }
+
+        complexity = estimate_line_complexity(target, lookahead, far_lookahead)
+        preview_position = preview_track_position(
+            target,
+            lookahead,
+            far_lookahead,
+            speed=120.0,
+            line_complexity=complexity,
+        )
+
+        self.assertGreater(complexity, 0.90)
+        self.assertGreater(preview_position, target["target_track_pos"])
+        self.assertLess(preview_position, lookahead["target_track_pos"])
+
+    def test_edge_hug_becomes_limit_mode_when_pointing_outward(self):
+        mode = choose_driving_mode(
+            track_pos=-0.35,
+            angle=0.18,
+            speed_y=0.2,
+            line_error=0.05,
+        )
+
+        self.assertEqual(mode, DrivingMode.LIMIT)
+
+    def test_edge_risk_countersteers_before_sliding_off(self):
+        steer = calculate_aggressive_steering(
+            speed=85.0,
+            track_pos=-0.35,
+            angle=0.18,
+            speed_y=0.2,
+            target_track_pos=-0.30,
+            heading_offset=-0.06,
+            curvature=0.001,
+            previous_steer=0.0,
+            mode=DrivingMode.LIMIT,
+        )
+
+        self.assertGreater(steer, 0.0)
 
 
 if __name__ == "__main__":

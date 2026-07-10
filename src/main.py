@@ -77,6 +77,10 @@ def menu():
                 seed=agent.seed,
                 results=results,
             )
+            repository.record_run_telemetry(
+                run_id,
+                results.get("telemetry_samples", []),
+            )
 
             print_results(results)
 

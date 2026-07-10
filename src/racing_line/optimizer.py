@@ -41,15 +41,21 @@ class RacingLine:
         travelled = (distance - left["distance"]) % self.track_length
         fraction = travelled / span if span else 0.0
 
-        return {
-            key: _interpolate(left[key], right[key], fraction)
-            for key in (
-                "target_track_pos",
-                "target_speed_kmh",
-                "curvature",
-                "heading_offset",
-            )
-        } | {"phase": left["phase"]}
+        numeric_keys = (
+            "target_track_pos",
+            "target_speed_kmh",
+            "curvature",
+            "heading_offset",
+            "speed_delta_30m",
+            "turn_direction",
+        )
+        interpolated = {}
+        for key in numeric_keys:
+            if key in left and key in right:
+                interpolated[key] = _interpolate(left[key], right[key], fraction)
+            else:
+                interpolated[key] = 0.0
+        return interpolated | {"phase": left["phase"]}
 
 
 class RacingLineOptimizer:
@@ -63,7 +69,7 @@ class RacingLineOptimizer:
         spacing=3.0,
         safety_margin=1.15,
         maximum_speed_kmh=216.0,
-        minimum_speed_kmh=78.0,
+        minimum_speed_kmh=82.0,
         lateral_acceleration=12.5,
         acceleration=8.5,
         braking=10.0,
@@ -188,11 +194,17 @@ class RacingLineOptimizer:
             corner_start = group["start"]
             corner_end = group["end"]
             span = max(cyclic_gap(corner_start, corner_end), self.spacing)
-            apex_distance = (corner_start + span * 0.52) % lookup_length
+            apex_distance = (corner_start + span * 0.68) % lookup_length
             previous_group = turn_groups[index - 1]
             next_group = turn_groups[(index + 1) % len(turn_groups)]
             approach_gap = cyclic_gap(previous_group["end"], corner_start)
             exit_gap = cyclic_gap(corner_end, next_group["start"])
+            technical_complex = _is_tight_alternating_complex(
+                previous_group,
+                group,
+                next_group,
+                lookup_length,
+            )
             approach_length = clamp(approach_gap * 0.55, 45.0, 125.0)
             exit_length = clamp(exit_gap * 0.48, 35.0, 115.0)
             next_approach_length = clamp(exit_gap * 0.55, 45.0, 125.0)
@@ -200,11 +212,22 @@ class RacingLineOptimizer:
             group["approach_start"] = (corner_start - approach_length) % lookup_length
             group["apex"] = apex_distance
             group["exit_end"] = (corner_end + exit_length) % lookup_length
+            group["technical_complex"] = technical_complex
 
-            outside = -turn_sign * usable_half_width * 0.40
-            apex = turn_sign * usable_half_width * 0.24
-            next_entry_outside = -next_group["sign"] * usable_half_width * 0.40
-            natural_exit_outside = -turn_sign * usable_half_width * 0.36
+            outside_scale, apex_scale, exit_scale = _line_scales(technical_complex)
+            next_technical_complex = _is_tight_alternating_complex(
+                group,
+                next_group,
+                turn_groups[(index + 2) % len(turn_groups)],
+                lookup_length,
+            )
+            next_entry_scale, _next_apex_scale, _next_exit_scale = _line_scales(
+                next_technical_complex
+            )
+            outside = -turn_sign * usable_half_width * outside_scale
+            apex = turn_sign * usable_half_width * apex_scale
+            next_entry_outside = -next_group["sign"] * usable_half_width * next_entry_scale
+            natural_exit_outside = -turn_sign * usable_half_width * exit_scale
             if exit_entry_overlap:
                 # The exit of this bend is the entry setup for the next bend.
                 # Do not open to this corner's outside in the same metres
@@ -234,6 +257,11 @@ class RacingLineOptimizer:
                 weight=4.00,
             )
             add_control(nearest_sample_index(corner_start), outside, weight=5.00)
+            add_control(
+                nearest_sample_index(corner_start + span * 0.34),
+                outside * 0.60 + apex * 0.40,
+                weight=5.50,
+            )
             add_control(nearest_sample_index(apex_distance), apex, weight=8.00)
             add_control(nearest_sample_index(corner_end), corner_exit, weight=5.00)
             add_control(
@@ -331,7 +359,7 @@ class RacingLineOptimizer:
         offsets = _smooth_cyclic_values(offsets, passes=1)
         offsets = _limit_lateral_slope(
             offsets,
-            max_delta=self.spacing * math.tan(math.radians(5.5)),
+            max_delta=self.spacing * math.tan(math.radians(5.0)),
         )
         offsets = _smooth_cyclic_values(offsets, passes=1)
         offsets = np.clip(offsets, -usable_half_width, usable_half_width)
@@ -339,10 +367,14 @@ class RacingLineOptimizer:
         curvatures, path_lengths = _closed_path_curvature(path)
         speeds = self._speed_profile(curvatures, path_lengths)
         heading_offsets = _heading_offsets(offsets, samples)
+        speed_deltas = _speed_deltas(speeds, self.spacing, window_m=30.0)
+        turn_directions = _turn_directions(curvatures, self.spacing, window_m=30.0)
 
         waypoints = []
         for index, sample in enumerate(samples):
             speed_kmh = float(speeds[index] * 3.6)
+            speed_delta_kmh = float(speed_deltas[index] * 3.6)
+            turn_direction = float(turn_directions[index])
             waypoints.append(
                 {
                     "distance": round(float(sample["distance"]), 4),
@@ -353,7 +385,15 @@ class RacingLineOptimizer:
                     "target_speed_kmh": round(speed_kmh, 3),
                     "curvature": round(float(curvatures[index]), 7),
                     "heading_offset": round(float(heading_offsets[index]), 6),
-                    "phase": _phase(speed_kmh, self.maximum_speed_kmh),
+                    "speed_delta_30m": round(speed_delta_kmh, 3),
+                    "turn_direction": round(turn_direction, 6),
+                    "phase": _phase(
+                        speed_kmh,
+                        speed_delta_kmh,
+                        turn_direction,
+                        float(curvatures[index]),
+                        self.maximum_speed_kmh,
+                    ),
                 }
             )
 
@@ -449,6 +489,31 @@ def _heading_offsets(offsets, samples):
     return headings
 
 
+def _speed_deltas(speeds, spacing, window_m=30.0):
+    import numpy as np
+
+    step = max(1, round(window_m / spacing))
+    return np.roll(speeds, -step) - speeds
+
+
+def _turn_directions(curvatures, spacing, window_m=30.0):
+    import numpy as np
+
+    radius = max(1, round(window_m / spacing))
+    directions = []
+    for index in range(len(curvatures)):
+        window = [
+            curvatures[(index + offset) % len(curvatures)]
+            for offset in range(-radius // 2, radius + 1)
+        ]
+        mean_curvature = float(np.mean(window))
+        if abs(mean_curvature) < 0.0025:
+            directions.append(0.0)
+        else:
+            directions.append(math.copysign(1.0, mean_curvature))
+    return directions
+
+
 def _smooth_cyclic_values(values, passes=1):
     import numpy as np
 
@@ -488,6 +553,34 @@ def _limit_lateral_slope(values, max_delta):
     return limited
 
 
+def _is_tight_alternating_complex(previous_group, group, next_group, track_length):
+    """True when a bend is part of a close left-right or right-left complex.
+
+    In these linked corners, the fastest drivable line is not a full
+    outside-apex-outside swing for each individual bend. Asking for the full
+    swing makes the controller clip the edge, recover, and lose far more time
+    than the shorter geometric path could ever gain.
+    """
+
+    approach_gap = (group["start"] - previous_group["end"]) % track_length
+    exit_gap = (next_group["start"] - group["end"]) % track_length
+    tight_opposite_entry = (
+        previous_group["sign"] != group["sign"] and approach_gap < 135.0
+    )
+    tight_opposite_exit = next_group["sign"] != group["sign"] and exit_gap < 135.0
+    return tight_opposite_entry or tight_opposite_exit
+
+
+def _line_scales(technical_complex):
+    if technical_complex:
+        # TORCS' visible rubbered-in groove is smoother than a textbook
+        # outside-apex-outside line in linked chicanes. Keep the car on a
+        # recognisable racing path, but avoid asking for full-width lane swaps
+        # where the next bend immediately reverses direction.
+        return 0.24, 0.12, 0.20
+    return 0.56, 0.34, 0.52
+
+
 def _enforce_classical_corner_shape(
     offsets,
     samples,
@@ -515,16 +608,22 @@ def _enforce_classical_corner_shape(
             continue
 
         turn_sign = group["sign"]
-        outside = -turn_sign * usable_half_width * 0.40
-        apex = turn_sign * usable_half_width * 0.24
+        outside_scale, apex_scale, exit_scale = _line_scales(
+            group.get("technical_complex", False)
+        )
+        outside = -turn_sign * usable_half_width * outside_scale
+        apex = turn_sign * usable_half_width * apex_scale
         next_group = turn_groups[(group["index"] + 1) % len(turn_groups)]
         exit_gap = (next_group["start"] - group["end"]) % track_length
         exit_length = (group["exit_end"] - group["end"]) % track_length
         next_approach_length = clamp(exit_gap * 0.55, 45.0, 125.0)
         if exit_length + next_approach_length > exit_gap:
-            exit_outside = -next_group["sign"] * usable_half_width * 0.40
+            next_entry_scale, _next_apex_scale, _next_exit_scale = _line_scales(
+                next_group.get("technical_complex", False)
+            )
+            exit_outside = -next_group["sign"] * usable_half_width * next_entry_scale
         else:
-            exit_outside = -turn_sign * usable_half_width * 0.36
+            exit_outside = -turn_sign * usable_half_width * exit_scale
         span = max((group["end"] - group["start"]) % track_length, 0.1)
         fraction = ((sample["distance"] - group["start"]) % track_length) / span
         if fraction <= 0.5:
@@ -540,15 +639,27 @@ def _enforce_classical_corner_shape(
     return shaped
 
 
-def _phase(speed_kmh, maximum_speed_kmh):
+def _phase(speed_kmh, speed_delta_kmh, turn_direction, curvature, maximum_speed_kmh):
+    if turn_direction > 0.0:
+        turn = "left_turn"
+    elif turn_direction < 0.0:
+        turn = "right_turn"
+    else:
+        turn = ""
+
+    if speed_delta_kmh < -11.0:
+        return f"brake_{turn}" if turn else "brake"
+    if speed_delta_kmh > 8.0:
+        return f"accelerate_{turn}" if turn else "accelerate"
+    if turn:
+        return turn
+
     ratio = speed_kmh / maximum_speed_kmh
     if ratio > 0.92:
         return "full_throttle"
-    if ratio > 0.72:
-        return "fast_corner"
-    if ratio > 0.50:
-        return "braking_or_medium_corner"
-    return "slow_corner"
+    if abs(curvature) > 0.004:
+        return "turn"
+    return "accelerate"
 
 
 def _interpolate(left, right, fraction):
