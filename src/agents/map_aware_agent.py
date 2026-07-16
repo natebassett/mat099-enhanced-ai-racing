@@ -1067,6 +1067,17 @@ def calculate_raceline_pursuit_steer(
         else:
             max_delta = 0.108
             smooth_alpha = 0.54
+        if (
+            control_state in (
+                RacingControlState.EDGE_GUARD,
+                RacingControlState.JOIN_RACELINE,
+            )
+            and speed < 92.0
+            and abs(line_error) > 0.62
+        ):
+            limit = min(limit, 0.62)
+            max_delta = min(max_delta, 0.056 if speed > 45.0 else 0.070)
+            smooth_alpha = min(smooth_alpha, 0.34)
 
     raw_steer = clamp(raw_steer, -limit, limit)
     if (
@@ -1096,13 +1107,19 @@ def calculate_raceline_pedals(
 ):
     """Simple speed controller for the raceline follower."""
 
+    speed_error = target_speed - speed
+    stable_on_line = (
+        pursuit_error < 0.18
+        and abs(track_position) < 0.76
+        and abs(angle) < 0.18
+        and abs(lateral_speed) < 4.2
+    )
     if control_state == RacingControlState.RECOVERY:
         if speed < 8.0:
             accel, brake = 0.24, 0.0
         else:
             accel, brake = 0.0, 0.38
     else:
-        speed_error = target_speed - speed
         if speed_error < -18.0:
             accel = 0.0
             brake = clamp((-speed_error - 8.0) / 34.0, 0.12, 0.82)
@@ -1125,20 +1142,62 @@ def calculate_raceline_pedals(
             ),
         )
 
-        if abs(lateral_speed) > 7.5 or abs(angle) > 0.20:
+        transient_wobble = (
+            (abs(lateral_speed) > 7.5 or abs(angle) > 0.20)
+            and abs(lateral_speed) < 8.8
+            and speed_error > 8.0
+            and pursuit_error < 0.20
+            and abs(track_position) < 0.76
+            and abs(angle) < 0.26
+        )
+        if (abs(lateral_speed) > 7.5 or abs(angle) > 0.20) and not transient_wobble:
             accel = min(accel, 0.12)
             brake = max(brake, 0.12)
+        elif transient_wobble:
+            accel = min(accel, 0.36)
         if abs(lateral_speed) > 11.0:
             accel = 0.0
             brake = max(brake, 0.26)
 
     if previous_accel is not None and previous_brake is not None:
         accel = previous_accel + clamp(accel - previous_accel, -0.42, 0.22)
-        brake = previous_brake + clamp(brake - previous_brake, -0.30, 0.34)
+        brake_release = 0.30
+        if speed_error > 6.0 and stable_on_line:
+            brake_release = 0.80
+        elif speed_error > 0.0 and stable_on_line:
+            brake_release = 0.42
+        brake = previous_brake + clamp(brake - previous_brake, -brake_release, 0.34)
         if brake > 0.02:
             accel = 0.0
 
     return clamp(accel, 0.0, 1.0), clamp(brake, 0.0, 1.0)
+
+
+def apply_edge_guard_crawl_assist(
+    accel,
+    brake,
+    *,
+    speed,
+    target_speed,
+    track_position,
+    angle,
+    front_sensor,
+    min_track_sensor,
+    control_state,
+):
+    """Let an on-track EDGE_GUARD car crawl out instead of sitting on brake."""
+
+    if (
+        control_state == RacingControlState.EDGE_GUARD
+        and speed < 12.0
+        and target_speed > speed + 10.0
+        and abs(track_position) < 0.86
+        and abs(angle) < 0.55
+        and front_sensor > 3.0
+        and min_track_sensor > 1.0
+    ):
+        return max(accel, 0.18), 0.0
+    return accel, brake
 
 
 def guard_racing_line_target(
@@ -1241,7 +1300,7 @@ def guard_racing_line_target(
 class MapAwareAgent:
     name = "Map-Aware Racing-Line Agent"
     agent_type = "map_aware"
-    version = "3.3"
+    version = "3.5"
     seed = None
     uses_full_control = True
     max_steps = 150000
@@ -1279,7 +1338,7 @@ class MapAwareAgent:
             "target_laps": self.target_laps,
             "max_steps": self.max_steps,
             "line_merge_distance": self.line_merge_distance,
-            "control_profile": "raceline_pursuit_with_agent2_stability_confidence",
+            "control_profile": "raceline_pursuit_with_agent2_stability_slow_rejoin",
             "speed_profile": "speedway_confidence_curvature_buckets",
         }
 
@@ -1458,16 +1517,6 @@ class MapAwareAgent:
                 target_speed = min(target_speed, 78.0)
             elif track_position * lateral_speed > 1.0 or track_position * angle < -0.045:
                 target_speed = min(target_speed, 104.0)
-        if pre_finish_launch:
-            if distance_travelled < 35.0:
-                target_speed = min(target_speed, 62.0)
-            elif distance_travelled < 75.0:
-                target_speed = min(target_speed, 82.0)
-            else:
-                target_speed = min(target_speed, 98.0)
-            if abs(lateral_speed) > 3.0 or abs(angle) > 0.10:
-                target_speed = min(target_speed, 62.0)
-
         desired_heading = (
             target["heading_offset"] * 0.30
             + near["heading_offset"] * 0.50
@@ -1517,6 +1566,17 @@ class MapAwareAgent:
         accel = apply_raceline_traction_control(
             telemetry.get("wheelSpinVel"),
             accel,
+        )
+        accel, brake = apply_edge_guard_crawl_assist(
+            accel,
+            brake,
+            speed=speed,
+            target_speed=target_speed,
+            track_position=track_position,
+            angle=angle,
+            front_sensor=front_sensor,
+            min_track_sensor=min_track_sensor,
+            control_state=control_state,
         )
 
         is_launching = line_blend < 0.05 and speed < 18.0

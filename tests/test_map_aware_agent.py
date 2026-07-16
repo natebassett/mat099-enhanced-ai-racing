@@ -14,6 +14,7 @@ from agents.map_aware_agent import (  # noqa: E402
     DEFAULT_RACING_LINE_PATH,
     MapAwareAgent,
     RacingControlState,
+    apply_edge_guard_crawl_assist,
     apply_practical_target_limit,
     cap_speed_for_line_join,
     cap_speed_for_control_state,
@@ -545,9 +546,43 @@ class MapAwareAgentTests(unittest.TestCase):
 
         latest = telemetry_rows[-1]
         self.assertLess(abs(float(latest["targetTrackPos"])), 0.05)
-        self.assertLessEqual(float(latest["targetSpeed"]), 62.0)
-        self.assertGreater(float(latest["targetSpeed"]), 42.0)
+        self.assertGreater(float(latest["targetSpeed"]), 80.0)
         self.assertLess(action["steer"], 0.0)
+
+    def test_pre_finish_launch_has_no_artificial_speed_leash_when_stable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            telemetry_path = Path(directory) / "telemetry.csv"
+            agent = MapAwareAgent(
+                telemetry_path=telemetry_path,
+            )
+            agent.act(
+                None,
+                make_telemetry(
+                    speedX=0.0,
+                    distFromStart=2743.1,
+                    distRaced=0.0,
+                    trackPos=0.0,
+                ),
+            )
+            agent.act(
+                None,
+                make_telemetry(
+                    speedX=80.0,
+                    speedY=0.0,
+                    angle=0.0,
+                    distFromStart=2761.5,
+                    distRaced=18.4,
+                    trackPos=0.02,
+                ),
+            )
+            agent.close()
+
+            with telemetry_path.open(newline="", encoding="utf-8") as handle:
+                telemetry_rows = list(csv.DictReader(handle))
+
+        latest = telemetry_rows[-1]
+        self.assertLess(abs(float(latest["targetTrackPos"])), 0.05)
+        self.assertGreater(float(latest["targetSpeed"]), 150.0)
 
     def test_launch_stuck_terminates_after_five_seconds(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -912,6 +947,41 @@ class MapAwareAgentTests(unittest.TestCase):
         self.assertEqual(brake, 0.0)
         self.assertGreaterEqual(accel, 0.50)
 
+    def test_stable_on_line_releases_residual_brake_quickly(self):
+        accel, brake = calculate_raceline_pedals(
+            speed=195.0,
+            target_speed=210.0,
+            steer=0.02,
+            pursuit_error=0.02,
+            track_position=0.22,
+            lateral_speed=0.05,
+            angle=0.002,
+            previous_accel=0.0,
+            previous_brake=0.38,
+            control_state=RacingControlState.RACE,
+        )
+
+        self.assertLessEqual(brake, 0.01)
+        self.assertGreater(accel, 0.15)
+
+    def test_on_line_transient_wobble_avoids_brake(self):
+        accel, brake = calculate_raceline_pedals(
+            speed=116.0,
+            target_speed=145.0,
+            steer=0.08,
+            pursuit_error=0.08,
+            track_position=0.24,
+            lateral_speed=7.9,
+            angle=0.06,
+            previous_accel=None,
+            previous_brake=None,
+            control_state=RacingControlState.RACE,
+        )
+
+        self.assertEqual(brake, 0.0)
+        self.assertGreater(accel, 0.0)
+        self.assertLessEqual(accel, 0.36)
+
     def test_high_speed_raceline_steering_changes_like_agent_two(self):
         steer = calculate_raceline_pursuit_steer(
             speed=180.0,
@@ -954,6 +1024,54 @@ class MapAwareAgentTests(unittest.TestCase):
 
         self.assertGreaterEqual(debt, 0.80)
         self.assertLessEqual(confidence_speed_cap(debt), 106.0)
+
+    def test_slow_edge_guard_rejoin_does_not_snap_to_full_lock(self):
+        steer = calculate_raceline_pursuit_steer(
+            speed=70.0,
+            track_position=-0.41,
+            pursuit_target=0.58,
+            heading_offset=0.0,
+            curvature=0.011,
+            lateral_speed=-0.1,
+            angle=0.20,
+            previous_steer=0.52,
+            control_state=RacingControlState.EDGE_GUARD,
+        )
+
+        self.assertGreater(steer, 0.0)
+        self.assertLessEqual(steer, 0.62)
+
+    def test_slow_join_rejoin_does_not_snap_to_full_lock(self):
+        steer = calculate_raceline_pursuit_steer(
+            speed=49.0,
+            track_position=-0.52,
+            pursuit_target=0.59,
+            heading_offset=0.0,
+            curvature=0.011,
+            lateral_speed=-0.1,
+            angle=-0.29,
+            previous_steer=0.62,
+            control_state=RacingControlState.JOIN_RACELINE,
+        )
+
+        self.assertGreater(steer, 0.0)
+        self.assertLessEqual(steer, 0.62)
+
+    def test_edge_guard_crawl_assist_releases_on_track_stuck_brake(self):
+        accel, brake = apply_edge_guard_crawl_assist(
+            0.0,
+            0.12,
+            speed=0.2,
+            target_speed=38.0,
+            track_position=0.72,
+            angle=-0.37,
+            front_sensor=4.2,
+            min_track_sensor=1.6,
+            control_state=RacingControlState.EDGE_GUARD,
+        )
+
+        self.assertGreaterEqual(accel, 0.18)
+        self.assertEqual(brake, 0.0)
 
     def test_normal_corner_sensor_does_not_cap_mapped_speed(self):
         track = [18.0] * 19
