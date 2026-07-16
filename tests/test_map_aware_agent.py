@@ -19,8 +19,12 @@ from agents.map_aware_agent import (  # noqa: E402
     cap_speed_for_control_state,
     calculate_path_tracking_steer,
     calculate_raceline_pursuit_steer,
+    calculate_raceline_pedals,
+    calculate_raceline_target_speed,
     calculate_dynamic_target_speed,
+    choose_raceline_control_state,
     choose_control_state,
+    confidence_speed_cap,
     estimate_line_complexity,
     get_racing_line_corridor,
     guard_racing_line_target,
@@ -28,6 +32,7 @@ from agents.map_aware_agent import (  # noqa: E402
     preview_track_position,
     choose_dynamic_control_phase,
     soften_line_error,
+    update_raceline_confidence_debt,
 )
 from racing_line import RacingLine, TorcsTrackMap  # noqa: E402
 from racing_line.optimizer import _CORKSCREW_REFERENCE_ANCHORS  # noqa: E402
@@ -540,7 +545,8 @@ class MapAwareAgentTests(unittest.TestCase):
 
         latest = telemetry_rows[-1]
         self.assertLess(abs(float(latest["targetTrackPos"])), 0.05)
-        self.assertLessEqual(float(latest["targetSpeed"]), 42.0)
+        self.assertLessEqual(float(latest["targetSpeed"]), 62.0)
+        self.assertGreater(float(latest["targetSpeed"]), 42.0)
         self.assertLess(action["steer"], 0.0)
 
     def test_launch_stuck_terminates_after_five_seconds(self):
@@ -866,6 +872,88 @@ class MapAwareAgentTests(unittest.TestCase):
         )
 
         self.assertLess(steer, 0.0)
+
+    def test_stable_speedway_sweeper_gets_agent_two_speed_confidence(self):
+        waypoint = {
+            "curvature": 0.0105,
+            "target_speed_kmh": 108.0,
+        }
+
+        target_speed = calculate_raceline_target_speed(
+            speed=104.0,
+            local=waypoint,
+            near=waypoint,
+            far=waypoint,
+            very_far=waypoint,
+            track_position=0.34,
+            pursuit_target=0.30,
+            lateral_speed=0.3,
+            angle=0.02,
+            sensor_cap=216.0,
+            line_complexity=0.10,
+        )
+
+        self.assertGreaterEqual(target_speed, 150.0)
+
+    def test_moderate_line_miss_can_still_accelerate_when_under_target(self):
+        accel, brake = calculate_raceline_pedals(
+            speed=105.0,
+            target_speed=132.0,
+            steer=0.31,
+            pursuit_error=0.28,
+            track_position=0.32,
+            lateral_speed=0.6,
+            angle=0.03,
+            previous_accel=None,
+            previous_brake=None,
+            control_state=RacingControlState.JOIN_RACELINE,
+        )
+
+        self.assertEqual(brake, 0.0)
+        self.assertGreaterEqual(accel, 0.50)
+
+    def test_high_speed_raceline_steering_changes_like_agent_two(self):
+        steer = calculate_raceline_pursuit_steer(
+            speed=180.0,
+            track_position=0.0,
+            pursuit_target=0.45,
+            heading_offset=0.0,
+            curvature=0.0,
+            lateral_speed=0.0,
+            angle=0.0,
+            previous_steer=0.0,
+            control_state=RacingControlState.JOIN_RACELINE,
+        )
+
+        self.assertGreater(steer, 0.0)
+        self.assertLessEqual(abs(steer), 0.0341)
+
+    def test_raceline_state_enters_edge_guard_before_run62_left_exit(self):
+        state = choose_raceline_control_state(
+            track_position=-0.37,
+            local_target=-0.09,
+            pursuit_target=-0.22,
+            speed=107.0,
+            lateral_speed=-0.5,
+            angle=0.17,
+            front_sensor=13.4,
+            min_track_sensor=2.0,
+        )
+
+        self.assertEqual(state, RacingControlState.EDGE_GUARD)
+
+    def test_raceline_confidence_debt_caps_speed_after_overshoot(self):
+        debt = update_raceline_confidence_debt(
+            previous_debt=0.0,
+            previous_pursuit_error=0.44,
+            pursuit_error=-0.27,
+            lateral_speed=-2.6,
+            angle=-0.05,
+            track_position=0.23,
+        )
+
+        self.assertGreaterEqual(debt, 0.80)
+        self.assertLessEqual(confidence_speed_cap(debt), 106.0)
 
     def test_normal_corner_sensor_does_not_cap_mapped_speed(self):
         track = [18.0] * 19

@@ -731,19 +731,36 @@ def choose_raceline_control_state(
 ):
     """Small state machine for the raceline-first controller."""
 
-    off_track = min_track_sensor < 0.0 or front_sensor < 0.0 or abs(track_position) > 1.03
+    edge_abs = abs(track_position)
+    line_error_abs = max(
+        abs(track_position - local_target),
+        abs(track_position - pursuit_target),
+    )
+    outward_motion = track_position * lateral_speed > 1.4
+    outward_heading = track_position * angle < -0.045 and edge_abs > 0.25
+    off_track = min_track_sensor < 0.0 or front_sensor < 0.0 or edge_abs > 1.03
     if (
         off_track
         or abs(angle) > 0.62
         or abs(lateral_speed) > 17.0
-        or (abs(track_position) > 0.94 and front_sensor < 12.0)
+        or (edge_abs > 0.94 and front_sensor < 12.0)
     ):
         return RacingControlState.RECOVERY
 
+    near_edge_with_short_road = (
+        front_sensor < 18.0
+        and (
+            edge_abs > 0.36
+            or line_error_abs > 0.22
+            or outward_motion
+            or outward_heading
+        )
+    )
     if (
-        abs(track_position) > 0.88
+        edge_abs > 0.88
         or front_sensor < 5.0
-        or (abs(track_position) > 0.74 and track_position * lateral_speed > 2.4)
+        or (edge_abs > 0.68 and (outward_motion or outward_heading))
+        or near_edge_with_short_road
     ):
         return RacingControlState.EDGE_GUARD
 
@@ -756,7 +773,14 @@ def choose_raceline_control_state(
     return RacingControlState.RACE
 
 
-def sensor_emergency_speed_cap(track_sensors, track_position, speed, previous_front):
+def sensor_emergency_speed_cap(
+    track_sensors,
+    track_position,
+    speed,
+    previous_front,
+    lateral_speed=0.0,
+    angle=0.0,
+):
     """Use TORCS range sensors as emergency limits, not navigation."""
 
     if not track_sensors:
@@ -765,17 +789,147 @@ def sensor_emergency_speed_cap(track_sensors, track_position, speed, previous_fr
     front = track_sensors[9]
     minimum = min(track_sensors)
     raw_cap = sensor_speed_cap(track_sensors, speed, previous_front)
+    edge_abs = abs(track_position)
+    outward_motion = track_position * lateral_speed > 1.4
+    outward_heading = track_position * angle < -0.045 and edge_abs > 0.25
     if front < 0.0 or minimum < 0.0:
         return 45.0
     if front < 5.0:
         return 38.0
     if front < 8.0:
         return 55.0
-    if abs(track_position) > 0.88 and front < 18.0:
+    if front < 18.0 and edge_abs > 0.34 and (
+        outward_motion or outward_heading or abs(lateral_speed) > 2.8
+    ):
+        return min(raw_cap + 20.0, 92.0)
+    if front < 24.0 and edge_abs > 0.52 and (outward_motion or outward_heading):
+        return min(raw_cap + 28.0, 112.0)
+    if edge_abs > 0.88 and front < 18.0:
         return min(raw_cap, 70.0)
-    if abs(track_position) > 0.72 and front < 14.0:
+    if edge_abs > 0.72 and front < 14.0:
         return min(raw_cap + 10.0, 90.0)
     return 216.0
+
+
+def speedway_confidence_speed(preview_curvature, line_complexity=0.0):
+    """Return an aggressive-but-plausible speed from map curvature."""
+
+    curvature_abs = abs(preview_curvature)
+    if curvature_abs < 0.0035:
+        speed = 210.0
+    elif curvature_abs < 0.006:
+        speed = 198.0
+    elif curvature_abs < 0.009:
+        speed = 176.0
+    elif curvature_abs < 0.012:
+        speed = 154.0
+    elif curvature_abs < 0.018:
+        speed = 132.0
+    elif curvature_abs < 0.026:
+        speed = 112.0
+    elif curvature_abs < 0.034:
+        speed = 98.0
+    else:
+        speed = 90.0
+
+    speed -= 8.0 * clamp(line_complexity, 0.0, 1.0)
+    return clamp(speed, 88.0, 216.0)
+
+
+def raceline_corner_throttle_cap(steer, track_position, pursuit_error):
+    """Borrow agent 2's corner throttle discipline without centreline steering."""
+
+    steer_abs = abs(steer)
+    if steer_abs >= 0.75:
+        cap = 0.10
+    elif steer_abs >= 0.60:
+        cap = 0.20
+    elif steer_abs >= 0.45:
+        cap = 0.35
+    elif steer_abs >= 0.30:
+        cap = 0.55
+    else:
+        cap = 1.0
+
+    if pursuit_error > 0.58:
+        cap = min(cap, 0.18)
+    elif pursuit_error > 0.44:
+        cap = min(cap, 0.32)
+    elif pursuit_error > 0.30:
+        cap = min(cap, 0.52)
+
+    if abs(track_position) > 0.72:
+        cap = min(cap, 0.26)
+    elif abs(track_position) > 0.58:
+        cap = min(cap, 0.42)
+    return cap
+
+
+def apply_raceline_traction_control(wheel_spin, accel):
+    if wheel_spin is None or len(wheel_spin) < 4:
+        return accel
+
+    rear_spin = float(wheel_spin[2]) + float(wheel_spin[3])
+    front_spin = float(wheel_spin[0]) + float(wheel_spin[1])
+    if rear_spin - front_spin > 3.2:
+        accel -= 0.10
+    return clamp(accel, 0.0, 1.0)
+
+
+def update_raceline_confidence_debt(
+    previous_debt,
+    previous_pursuit_error,
+    pursuit_error,
+    lateral_speed,
+    angle,
+    track_position,
+):
+    """Track whether the car has earned full-speed raceline confidence."""
+
+    debt = previous_debt * 0.975
+    error_abs = abs(pursuit_error)
+
+    if (
+        previous_pursuit_error is not None
+        and previous_pursuit_error * pursuit_error < 0.0
+        and max(abs(previous_pursuit_error), error_abs) > 0.16
+        and error_abs > 0.10
+    ):
+        debt = max(debt, 0.82)
+
+    if error_abs > 0.58:
+        debt = max(debt, 1.0)
+    elif error_abs > 0.42:
+        debt = max(debt, 0.84)
+    elif error_abs > 0.30:
+        debt = max(debt, 0.62)
+    elif error_abs > 0.24:
+        debt = max(debt, 0.44)
+    elif error_abs > 0.16:
+        debt = max(debt, 0.28)
+
+    if abs(lateral_speed) > 5.8 or abs(angle) > 0.18:
+        debt = max(debt, 0.78)
+    elif abs(lateral_speed) > 3.4 or abs(angle) > 0.12:
+        debt = max(debt, 0.52)
+    elif abs(lateral_speed) > 2.4 or abs(angle) > 0.09:
+        debt = max(debt, 0.36)
+
+    if abs(track_position) > 0.58 and track_position * lateral_speed > 1.0:
+        debt = max(debt, 0.78)
+
+    if error_abs < 0.10 and abs(lateral_speed) < 1.0 and abs(angle) < 0.045:
+        debt *= 0.72
+    elif error_abs < 0.16 and abs(lateral_speed) < 1.8 and abs(angle) < 0.075:
+        debt *= 0.86
+
+    return clamp(debt, 0.0, 1.0)
+
+
+def confidence_speed_cap(confidence_debt):
+    if confidence_debt <= 0.05:
+        return 216.0
+    return clamp(168.0 - confidence_debt * 96.0, 82.0, 216.0)
 
 
 def calculate_raceline_target_speed(
@@ -790,6 +944,7 @@ def calculate_raceline_target_speed(
     lateral_speed,
     angle,
     sensor_cap,
+    line_complexity=0.0,
 ):
     """Speed plan from the saved raceline plus ability to reach it."""
 
@@ -800,37 +955,60 @@ def calculate_raceline_target_speed(
     )
     curvature_cap = curvature_limited_speed(
         preview_curvature,
-        lateral_acceleration=9.0,
+        lateral_acceleration=10.8,
         minimum_speed=58.0,
         maximum_speed=216.0,
     )
     target_speed = min(
-        local["target_speed_kmh"] + 2.0,
-        near["target_speed_kmh"] + 4.0,
-        far["target_speed_kmh"] + 14.0,
-        very_far["target_speed_kmh"] + 28.0,
-        curvature_cap + 8.0,
+        local["target_speed_kmh"] + 10.0,
+        near["target_speed_kmh"] + 16.0,
+        far["target_speed_kmh"] + 30.0,
+        very_far["target_speed_kmh"] + 48.0,
+        curvature_cap + 18.0,
         sensor_cap,
     )
 
     pursuit_error = abs(track_position - pursuit_target)
+    settled_body = (
+        abs(lateral_speed) < 4.8
+        and abs(angle) < 0.12
+        and abs(track_position) < 0.78
+    )
+    confidence_speed = speedway_confidence_speed(preview_curvature, line_complexity)
+
+    if sensor_cap > 150.0:
+        if settled_body and pursuit_error < 0.20:
+            target_speed = max(target_speed, confidence_speed)
+        elif settled_body and pursuit_error < 0.34:
+            target_speed = max(target_speed, confidence_speed - 18.0)
+        elif (
+            pursuit_error < 0.48
+            and abs(lateral_speed) < 3.2
+            and abs(angle) < 0.08
+        ):
+            target_speed = max(target_speed, confidence_speed - 32.0)
+
+    target_speed = min(target_speed, sensor_cap)
+
     if pursuit_error > 0.82:
-        target_speed = min(target_speed, 42.0)
-    elif pursuit_error > 0.64:
         target_speed = min(target_speed, 52.0)
+    elif pursuit_error > 0.64:
+        target_speed = min(target_speed, 68.0)
     elif pursuit_error > 0.48:
-        target_speed = min(target_speed, 64.0)
+        target_speed = min(target_speed, 92.0)
     elif pursuit_error > 0.34:
-        target_speed = min(target_speed, 78.0)
-    elif pursuit_error > 0.22:
-        target_speed = min(target_speed, 96.0)
+        target_speed = min(target_speed, 118.0)
+    elif pursuit_error > 0.22 and not settled_body:
+        target_speed = min(target_speed, 138.0)
 
     if abs(lateral_speed) > 7.0:
-        target_speed = min(target_speed, 78.0)
+        target_speed = min(target_speed, 118.0)
     if abs(lateral_speed) > 10.0:
-        target_speed = min(target_speed, 62.0)
+        target_speed = min(target_speed, 88.0)
     if abs(angle) > 0.26:
-        target_speed = min(target_speed, 70.0)
+        target_speed = min(target_speed, 96.0)
+    if abs(angle) > 0.38:
+        target_speed = min(target_speed, 72.0)
 
     # If the car is already too fast for the line, allow a strong speed drop.
     if target_speed < speed - 70.0 and sensor_cap > 70.0:
@@ -871,15 +1049,34 @@ def calculate_raceline_pursuit_steer(
         limit = 0.84 if speed < 120.0 else 0.72
         if control_state == RacingControlState.EDGE_GUARD:
             limit = 0.90
-        if speed > 145.0:
-            max_delta = 0.072
-        elif speed > 95.0:
-            max_delta = 0.092
+        if speed > 170.0:
+            limit = min(limit, 0.42)
+            max_delta = 0.034
+            smooth_alpha = 0.22
+        elif speed > 140.0:
+            limit = min(limit, 0.52)
+            max_delta = 0.046
+            smooth_alpha = 0.28
+        elif speed > 105.0:
+            limit = min(limit, 0.62)
+            max_delta = 0.060
+            smooth_alpha = 0.36
+        elif speed > 75.0:
+            max_delta = 0.082
+            smooth_alpha = 0.46
         else:
-            max_delta = 0.118
-        smooth_alpha = 0.58
+            max_delta = 0.108
+            smooth_alpha = 0.54
 
     raw_steer = clamp(raw_steer, -limit, limit)
+    if (
+        previous_steer * raw_steer < 0.0
+        and abs(previous_steer) > 0.22
+        and abs(raw_steer) > 0.22
+        and speed > 55.0
+        and control_state != RacingControlState.RECOVERY
+    ):
+        raw_steer *= 0.55
     smoothed = previous_steer * (1.0 - smooth_alpha) + raw_steer * smooth_alpha
     return clamp(limit_change(previous_steer, smoothed, max_delta), -limit, limit)
 
@@ -890,6 +1087,7 @@ def calculate_raceline_pedals(
     target_speed,
     steer,
     pursuit_error,
+    track_position,
     lateral_speed,
     angle,
     previous_accel,
@@ -905,25 +1103,30 @@ def calculate_raceline_pedals(
             accel, brake = 0.0, 0.38
     else:
         speed_error = target_speed - speed
-        if speed_error < -4.0:
+        if speed_error < -18.0:
             accel = 0.0
-            brake = clamp((-speed_error - 2.0) / 32.0, 0.08, 0.85)
-        elif speed_error < 2.0 and (abs(steer) > 0.34 or pursuit_error > 0.24):
+            brake = clamp((-speed_error - 8.0) / 34.0, 0.12, 0.82)
+        elif speed_error < -5.0:
             accel = 0.0
-            brake = clamp((2.0 - speed_error) / 30.0, 0.0, 0.18)
+            brake = clamp((-speed_error - 5.0) / 42.0, 0.0, 0.36)
+        elif speed_error < 2.0 and (abs(steer) > 0.42 or pursuit_error > 0.34):
+            accel = 0.0
+            brake = clamp((2.0 - speed_error) / 34.0, 0.0, 0.14)
         else:
             brake = 0.0
-            accel = clamp(speed_error / 34.0, 0.18, 1.0)
+            accel = clamp(0.46 + speed_error / 26.0, 0.20, 1.0)
 
-        if abs(steer) > 0.62 or pursuit_error > 0.42:
-            accel = min(accel, 0.10)
-        elif abs(steer) > 0.42 or pursuit_error > 0.28:
-            accel = min(accel, 0.24)
-        elif abs(steer) > 0.26:
-            accel = min(accel, 0.46)
+        accel = min(
+            accel,
+            raceline_corner_throttle_cap(
+                steer,
+                track_position,
+                pursuit_error,
+            ),
+        )
 
         if abs(lateral_speed) > 7.5 or abs(angle) > 0.20:
-            accel = min(accel, 0.08)
+            accel = min(accel, 0.12)
             brake = max(brake, 0.12)
         if abs(lateral_speed) > 11.0:
             accel = 0.0
@@ -1038,7 +1241,7 @@ def guard_racing_line_target(
 class MapAwareAgent:
     name = "Map-Aware Racing-Line Agent"
     agent_type = "map_aware"
-    version = "3.1"
+    version = "3.3"
     seed = None
     uses_full_control = True
     max_steps = 150000
@@ -1076,6 +1279,8 @@ class MapAwareAgent:
             "target_laps": self.target_laps,
             "max_steps": self.max_steps,
             "line_merge_distance": self.line_merge_distance,
+            "control_profile": "raceline_pursuit_with_agent2_stability_confidence",
+            "speed_profile": "speedway_confidence_curvature_buckets",
         }
 
     def reset(self):
@@ -1085,6 +1290,8 @@ class MapAwareAgent:
         self.previous_brake = None
         self.previous_target_speed = None
         self.previous_target_position = None
+        self.previous_pursuit_error = None
+        self.line_confidence_debt = 0.0
         self.start_distance = None
         self.start_distance_raced = None
         self.start_track_position = None
@@ -1204,6 +1411,8 @@ class MapAwareAgent:
             track_position,
             speed,
             self.previous_front,
+            lateral_speed=lateral_speed,
+            angle=angle,
         )
         control_state = choose_raceline_control_state(
             track_position=track_position,
@@ -1218,6 +1427,14 @@ class MapAwareAgent:
 
         pursuit_error = track_position - pursuit_target
         line_error = track_position - local_target
+        self.line_confidence_debt = update_raceline_confidence_debt(
+            self.line_confidence_debt,
+            self.previous_pursuit_error,
+            pursuit_error,
+            lateral_speed,
+            angle,
+            track_position,
+        )
         target_speed = calculate_raceline_target_speed(
             speed=speed,
             local=target,
@@ -1229,16 +1446,27 @@ class MapAwareAgent:
             lateral_speed=lateral_speed,
             angle=angle,
             sensor_cap=sensor_cap,
+            line_complexity=line_complexity,
         )
+        if self.line_confidence_debt > 0.05:
+            target_speed = min(
+                target_speed,
+                confidence_speed_cap(self.line_confidence_debt),
+            )
+        if control_state == RacingControlState.EDGE_GUARD:
+            if front_sensor < 18.0:
+                target_speed = min(target_speed, 78.0)
+            elif track_position * lateral_speed > 1.0 or track_position * angle < -0.045:
+                target_speed = min(target_speed, 104.0)
         if pre_finish_launch:
             if distance_travelled < 35.0:
-                target_speed = min(target_speed, 42.0)
+                target_speed = min(target_speed, 62.0)
             elif distance_travelled < 75.0:
-                target_speed = min(target_speed, 55.0)
+                target_speed = min(target_speed, 82.0)
             else:
-                target_speed = min(target_speed, 66.0)
+                target_speed = min(target_speed, 98.0)
             if abs(lateral_speed) > 3.0 or abs(angle) > 0.10:
-                target_speed = min(target_speed, 42.0)
+                target_speed = min(target_speed, 62.0)
 
         desired_heading = (
             target["heading_offset"] * 0.30
@@ -1279,11 +1507,16 @@ class MapAwareAgent:
             target_speed=target_speed,
             steer=steer,
             pursuit_error=abs(pursuit_error),
+            track_position=track_position,
             lateral_speed=lateral_speed,
             angle=angle,
             previous_accel=self.previous_accel,
             previous_brake=self.previous_brake,
             control_state=control_state,
+        )
+        accel = apply_raceline_traction_control(
+            telemetry.get("wheelSpinVel"),
+            accel,
         )
 
         is_launching = line_blend < 0.05 and speed < 18.0
@@ -1361,6 +1594,7 @@ class MapAwareAgent:
         self.previous_brake = brake
         self.previous_target_speed = target_speed
         self.previous_target_position = local_target
+        self.previous_pursuit_error = pursuit_error
         self.previous_front = front_sensor
         if control_state == self.control_state:
             self.state_steps += 1
