@@ -25,9 +25,10 @@ class TorcsTrackMap:
     @classmethod
     def from_xml(cls, path):
         path = Path(path)
-        xml_text = path.read_text(encoding="utf-8").replace(
-            "&default-surfaces;",
-            "",
+        xml_text = (
+            path.read_text(encoding="utf-8")
+            .replace("&default-surfaces;", "")
+            .replace("&default-objects;", "")
         )
         root = ET.fromstring(xml_text)
         main_track = next(

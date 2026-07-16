@@ -24,8 +24,10 @@ class TorcsRunner:
     OFF_TRACK_SHUTDOWN_DELAY = 3.0
     STARTUP_DELAY = 8.0
     MENU_KEY_DELAY = 1.0
+    MENU_ENTER_ATTEMPTS = 8
     SERVER_PORT = 3001
-    SERVER_START_TIMEOUT = 15.0
+    SERVER_START_TIMEOUT = 25.0
+    MANUAL_START_TIMEOUT = 120.0
 
     def __init__(self):
         self.env: Optional[TorcsEnv] = None
@@ -170,13 +172,21 @@ class TorcsRunner:
         time.sleep(0.5)
 
         # Practice is first in the race list, producing a stable novice flow:
-        # Main menu -> Race -> Practice -> New Race.
-        for _ in range(3):
+        # Main menu -> Race -> Practice -> New Race. TORCS sometimes restores
+        # a slightly different menu depth, so keep advancing until the SCR
+        # server socket appears rather than assuming exactly three presses.
+        deadline = time.monotonic() + self.SERVER_START_TIMEOUT
+        for _ in range(self.MENU_ENTER_ATTEMPTS):
+            if process.poll() is not None:
+                raise RuntimeError("TORCS closed before the SCR race started")
+            if self._server_is_listening(process.pid):
+                print("TORCS Practice race started automatically.")
+                return
+
             send_key(vk_return)
             send_key(vk_return, key_up_flag)
             time.sleep(self.MENU_KEY_DELAY)
 
-        deadline = time.monotonic() + self.SERVER_START_TIMEOUT
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise RuntimeError("TORCS closed before the SCR race started")
@@ -185,7 +195,27 @@ class TorcsRunner:
                 return
             time.sleep(0.5)
 
-        raise RuntimeError("TORCS opened, but automatic Practice startup failed")
+        self._wait_for_manual_practice_start(process)
+
+    def _wait_for_manual_practice_start(self, process):
+        print(
+            "Automatic Practice startup did not open the SCR socket. "
+            "TORCS is still running."
+        )
+        print("In TORCS, choose Race > Practice > New Race. Waiting for the race...")
+
+        deadline = time.monotonic() + self.MANUAL_START_TIMEOUT
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError("TORCS closed before the SCR race started")
+            if self._server_is_listening(process.pid):
+                print("TORCS Practice race detected.")
+                return
+            time.sleep(0.5)
+
+        raise RuntimeError(
+            "TORCS opened, but Practice did not start before the manual timeout"
+        )
 
     def _server_is_listening(self, process_id):
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -202,19 +232,31 @@ class TorcsRunner:
         except (OSError, subprocess.TimeoutExpired):
             return False
 
-        expected_process_id = str(process_id)
-        port_suffix = f":{self.SERVER_PORT}"
+        if self._netstat_reports_server(result.stdout, self.SERVER_PORT, process_id):
+            return True
 
-        for line in result.stdout.splitlines():
+        # Some Windows TORCS builds report the UDP socket under a helper process
+        # rather than the OpenGL window process. If the expected PID check does
+        # not match, still accept an open SCR server port; connect() will fail
+        # quickly if it is stale or unrelated.
+        return self._netstat_reports_server(result.stdout, self.SERVER_PORT)
+
+    @staticmethod
+    def _netstat_reports_server(output, port, process_id=None):
+        expected_process_id = None if process_id is None else str(process_id)
+        port_suffix = f":{port}"
+
+        for line in output.splitlines():
             columns = line.split()
-            if len(columns) >= 3:
-                local_address = columns[1]
-                owner_process_id = columns[-1]
-                if (
-                    local_address.endswith(port_suffix)
-                    and owner_process_id == expected_process_id
-                ):
-                    return True
+            if len(columns) < 3:
+                continue
+
+            local_address = columns[1]
+            owner_process_id = columns[-1]
+            if not local_address.endswith(port_suffix):
+                continue
+            if expected_process_id is None or owner_process_id == expected_process_id:
+                return True
 
         return False
 

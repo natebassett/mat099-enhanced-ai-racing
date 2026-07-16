@@ -5,6 +5,9 @@ from runner.torcs_runner import TorcsRunner
 from storage import RaceRepository
 
 
+DEFAULT_TRACK_NAME = "g-track-3"
+
+
 def print_results(results):
 
     print("\n==============================")
@@ -65,7 +68,7 @@ def menu():
 
                 runner.connect()
 
-                runner.load_track("corkscrew")
+                runner.load_track(DEFAULT_TRACK_NAME)
 
                 results = runner.run(agent)
             finally:
@@ -73,7 +76,7 @@ def menu():
 
             run_id = repository.record_run(
                 agent_id=agent_id,
-                track="corkscrew",
+                track=DEFAULT_TRACK_NAME,
                 seed=agent.seed,
                 results=results,
             )

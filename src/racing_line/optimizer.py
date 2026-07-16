@@ -123,6 +123,11 @@ class RacingLineOptimizer:
 
         lookup_length = self.measured_length or self.track_map.geometry_length
         usable_half_width = self.track_map.width / 2.0 - self.safety_margin
+        line_style = _line_style_for_track(self.track_map.name)
+        half_width = self.track_map.width / 2.0
+
+        def offset_from_track_pos(track_pos):
+            return clamp(track_pos * half_width, -usable_half_width, usable_half_width)
 
         reference_profile = _corkscrew_reference_profile(
             self.track_map.name,
@@ -275,7 +280,6 @@ class RacingLineOptimizer:
             corner_start = group["start"]
             corner_end = group["end"]
             span = max(cyclic_gap(corner_start, corner_end), self.spacing)
-            apex_distance = (corner_start + span * 0.68) % lookup_length
             previous_group = turn_groups[index - 1]
             next_group = turn_groups[(index + 1) % len(turn_groups)]
             approach_gap = cyclic_gap(previous_group["end"], corner_start)
@@ -290,12 +294,19 @@ class RacingLineOptimizer:
             exit_length = clamp(exit_gap * 0.48, 35.0, 115.0)
             next_approach_length = clamp(exit_gap * 0.55, 45.0, 125.0)
             exit_entry_overlap = exit_length + next_approach_length > exit_gap
+            apex_fraction = _apex_fraction(technical_complex, line_style)
+            apex_distance = (corner_start + span * apex_fraction) % lookup_length
             group["approach_start"] = (corner_start - approach_length) % lookup_length
             group["apex"] = apex_distance
+            group["apex_fraction"] = apex_fraction
             group["exit_end"] = (corner_end + exit_length) % lookup_length
             group["technical_complex"] = technical_complex
+            group["line_style"] = line_style
 
-            outside_scale, apex_scale, exit_scale = _line_scales(technical_complex)
+            outside_scale, apex_scale, exit_scale = _line_scales(
+                technical_complex,
+                line_style,
+            )
             next_technical_complex = _is_tight_alternating_complex(
                 group,
                 next_group,
@@ -303,7 +314,8 @@ class RacingLineOptimizer:
                 lookup_length,
             )
             next_entry_scale, _next_apex_scale, _next_exit_scale = _line_scales(
-                next_technical_complex
+                next_technical_complex,
+                line_style,
             )
             outside = -turn_sign * usable_half_width * outside_scale
             apex = turn_sign * usable_half_width * apex_scale
@@ -323,38 +335,93 @@ class RacingLineOptimizer:
                 mid_exit = natural_exit_outside
                 final_exit = natural_exit_outside
 
-            # A usable racing line starts before the whole corner group,
-            # crosses once toward the apex, then opens once toward the exit.
-            # Treating every TORCS curve segment as its own corner caused the
-            # first compound left to ask for multiple different turns.
-            add_control(
-                nearest_sample_index(group["approach_start"]),
-                outside,
-                weight=3.50,
-            )
-            add_control(
-                nearest_sample_index(corner_start - approach_length * 0.35),
-                outside,
-                weight=4.00,
-            )
-            add_control(nearest_sample_index(corner_start), outside, weight=5.00)
-            add_control(
-                nearest_sample_index(corner_start + span * 0.34),
-                outside * 0.60 + apex * 0.40,
-                weight=5.50,
-            )
-            add_control(nearest_sample_index(apex_distance), apex, weight=8.00)
-            add_control(nearest_sample_index(corner_end), corner_exit, weight=5.00)
-            add_control(
-                nearest_sample_index(corner_end + exit_length * 0.45),
-                mid_exit,
-                weight=4.00,
-            )
-            add_control(
-                nearest_sample_index(group["exit_end"]),
-                final_exit,
-                weight=3.00,
-            )
+            if line_style == "speedway_cut":
+                # CG Speedway 3 is mostly fast sweepers. Pinning the car to
+                # the outside edge until the corner starts makes it drive
+                # around the bend; this starts turn-in early and gives the
+                # controller a real inside apex to follow.
+                setup_outside = offset_from_track_pos(-turn_sign * 0.22)
+                turn_in = offset_from_track_pos(turn_sign * 0.22)
+                cut_apex = offset_from_track_pos(turn_sign * 0.58)
+                exit_inside = offset_from_track_pos(turn_sign * 0.44)
+                next_setup = offset_from_track_pos(-next_group["sign"] * 0.22)
+                mid_exit = (exit_inside + next_setup) / 2.0
+                final_exit = next_setup
+
+                add_control(
+                    nearest_sample_index(group["approach_start"]),
+                    setup_outside,
+                    weight=4.50,
+                )
+                add_control(
+                    nearest_sample_index(corner_start - approach_length * 0.35),
+                    setup_outside,
+                    weight=5.00,
+                )
+                add_control(
+                    nearest_sample_index(corner_start - approach_length * 0.12),
+                    setup_outside * 0.35 + turn_in * 0.65,
+                    weight=5.75,
+                )
+                add_control(
+                    nearest_sample_index(corner_start),
+                    turn_in,
+                    weight=7.25,
+                )
+                add_control(
+                    nearest_sample_index(corner_start + span * 0.36),
+                    cut_apex,
+                    weight=8.25,
+                )
+                add_control(nearest_sample_index(apex_distance), cut_apex, weight=9.00)
+                add_control(
+                    nearest_sample_index(corner_end),
+                    exit_inside,
+                    weight=6.50,
+                )
+                add_control(
+                    nearest_sample_index(corner_end + exit_length * 0.45),
+                    mid_exit,
+                    weight=3.50,
+                )
+                add_control(
+                    nearest_sample_index(group["exit_end"]),
+                    final_exit,
+                    weight=2.75,
+                )
+            else:
+                # A usable racing line starts before the whole corner group,
+                # crosses once toward the apex, then opens once toward the exit.
+                # Treating every TORCS curve segment as its own corner caused the
+                # first compound left to ask for multiple different turns.
+                add_control(
+                    nearest_sample_index(group["approach_start"]),
+                    outside,
+                    weight=3.50,
+                )
+                add_control(
+                    nearest_sample_index(corner_start - approach_length * 0.35),
+                    outside,
+                    weight=4.00,
+                )
+                add_control(nearest_sample_index(corner_start), outside, weight=5.00)
+                add_control(
+                    nearest_sample_index(corner_start + span * 0.34),
+                    outside * 0.60 + apex * 0.40,
+                    weight=5.50,
+                )
+                add_control(nearest_sample_index(apex_distance), apex, weight=8.00)
+                add_control(nearest_sample_index(corner_end), corner_exit, weight=5.00)
+                add_control(
+                    nearest_sample_index(corner_end + exit_length * 0.45),
+                    mid_exit,
+                    weight=4.00,
+                )
+                add_control(
+                    nearest_sample_index(group["exit_end"]),
+                    final_exit,
+                    weight=3.00,
+                )
 
         control_indices = sorted(desired_controls)
         control_distances = sample_distances[control_indices]
@@ -426,7 +493,11 @@ class RacingLineOptimizer:
             )
         optimized_controls = initial
         optimizer_success = True
-        optimizer_message = "deterministic sector-based racing line"
+        optimizer_message = (
+            "deterministic sector-based racing line"
+            if line_style == "classical"
+            else "deterministic speedway inside-cut racing line"
+        )
         optimizer_objective = float(objective(initial))
 
         offsets = expanded_offsets(optimized_controls)
@@ -436,13 +507,24 @@ class RacingLineOptimizer:
             turn_groups,
             lookup_length,
             usable_half_width,
+            line_style,
         )
         offsets = _smooth_cyclic_values(offsets, passes=1)
         offsets = _limit_lateral_slope(
             offsets,
-            max_delta=self.spacing * math.tan(math.radians(5.0)),
+            max_delta=self.spacing
+            * math.tan(math.radians(7.0 if line_style == "speedway_cut" else 5.0)),
         )
         offsets = _smooth_cyclic_values(offsets, passes=1)
+        if line_style == "speedway_cut":
+            offsets = _lock_speedway_track_profile(
+                offsets,
+                samples,
+                self.track_map.name,
+                self.track_map.width,
+                usable_half_width,
+                lookup_length,
+            )
         offsets = np.clip(offsets, -usable_half_width, usable_half_width)
         path = centre + normals * offsets[:, None]
         curvatures, path_lengths = _closed_path_curvature(path)
@@ -1014,14 +1096,31 @@ def _is_tight_alternating_complex(previous_group, group, next_group, track_lengt
     return tight_opposite_entry or tight_opposite_exit
 
 
-def _line_scales(technical_complex):
+def _line_style_for_track(track_name):
+    name = track_name.upper()
+    if "SPEEDWAY" in name:
+        return "speedway_cut"
+    return "classical"
+
+
+def _apex_fraction(technical_complex, line_style):
+    if line_style == "speedway_cut":
+        return 0.44 if technical_complex else 0.48
+    return 0.68
+
+
+def _line_scales(technical_complex, line_style="classical"):
+    if line_style == "speedway_cut":
+        if technical_complex:
+            return 0.24, 0.78, 0.48
+        return 0.28, 0.76, 0.54
+
     if technical_complex:
-        # TORCS' visible rubbered-in groove is smoother than a textbook
-        # outside-apex-outside line in linked chicanes. Keep the car on a
-        # recognisable racing path, but avoid asking for full-width lane swaps
-        # where the next bend immediately reverses direction.
-        return 0.24, 0.12, 0.20
-    return 0.56, 0.34, 0.52
+        # Linked bends still need a recognisable racing line, but asking for a
+        # complete edge-to-edge swing before every reversal makes the controller
+        # scrub speed. Keep the late apex while reducing only the lane swap.
+        return 0.78, 0.16, 0.78
+    return 0.98, 0.20, 1.00
 
 
 def _enforce_classical_corner_shape(
@@ -1030,6 +1129,7 @@ def _enforce_classical_corner_shape(
     turn_groups,
     track_length,
     usable_half_width,
+    line_style="classical",
 ):
     import numpy as np
 
@@ -1052,7 +1152,8 @@ def _enforce_classical_corner_shape(
 
         turn_sign = group["sign"]
         outside_scale, apex_scale, exit_scale = _line_scales(
-            group.get("technical_complex", False)
+            group.get("technical_complex", False),
+            line_style,
         )
         outside = -turn_sign * usable_half_width * outside_scale
         apex = turn_sign * usable_half_width * apex_scale
@@ -1062,24 +1163,103 @@ def _enforce_classical_corner_shape(
         next_approach_length = clamp(exit_gap * 0.55, 45.0, 125.0)
         if exit_length + next_approach_length > exit_gap:
             next_entry_scale, _next_apex_scale, _next_exit_scale = _line_scales(
-                next_group.get("technical_complex", False)
+                next_group.get("technical_complex", False),
+                line_style,
             )
             exit_outside = -next_group["sign"] * usable_half_width * next_entry_scale
         else:
             exit_outside = -turn_sign * usable_half_width * exit_scale
         span = max((group["end"] - group["start"]) % track_length, 0.1)
         fraction = ((sample["distance"] - group["start"]) % track_length) / span
-        if fraction <= 0.5:
-            blend = fraction / 0.5
+        apex_fraction = group.get("apex_fraction", 0.68)
+        if fraction <= apex_fraction:
+            if line_style == "speedway_cut":
+                blend = clamp(
+                    (fraction + 0.55) / (apex_fraction + 0.55),
+                    0.0,
+                    1.0,
+                )
+            else:
+                blend = fraction / apex_fraction
             desired = outside * (1.0 - blend) + apex * blend
         else:
-            blend = (fraction - 0.5) / 0.5
+            blend = (fraction - apex_fraction) / (1.0 - apex_fraction)
             desired = apex * (1.0 - blend) + exit_outside * blend
 
-        apex_weight = 1.0 - min(abs(fraction - 0.5) / 0.5, 1.0)
+        apex_distance_fraction = (
+            abs(fraction - apex_fraction)
+            / max(apex_fraction, 1.0 - apex_fraction)
+        )
+        apex_weight = 1.0 - min(apex_distance_fraction, 1.0)
         weight = 0.45 + 0.35 * apex_weight
         shaped[index] = shaped[index] * (1.0 - weight) + desired * weight
     return shaped
+
+
+def _lock_speedway_track_profile(
+    offsets,
+    samples,
+    track_name,
+    track_width,
+    usable_half_width,
+    track_length,
+):
+    """Apply explicit map-aware apex locks for known speedway bends."""
+
+    import numpy as np
+
+    if "CG SPEEDWAY 3" not in track_name.upper():
+        return offsets
+
+    locked = np.asarray(offsets, dtype=float).copy()
+    half_width = track_width / 2.0
+
+    # First bend: right-hander from roughly 40m to 68m. Positive trackPos is
+    # the outside/wall side here, so the map-aware target must be negative
+    # through the bend. These anchors are intentionally in normalized TORCS
+    # trackPos units because that is what the controller follows.
+    anchors = [
+        (2760.0, 0.24),
+        (2800.0, 0.22),
+        (2840.0, 0.19),
+        (track_length, 0.18),
+        (track_length + 20.0, 0.00),
+        (track_length + 30.0, -0.10),
+        (track_length + 40.0, -0.22),
+        (track_length + 50.0, -0.48),
+        (track_length + 55.0, -0.56),
+        (track_length + 60.0, -0.58),
+        (track_length + 68.0, -0.45),
+        (track_length + 80.0, -0.12),
+        (track_length + 90.0, 0.02),
+        (track_length + 105.0, 0.00),
+        (track_length + 130.0, -0.22),
+    ]
+    anchor_distances = [distance for distance, _position in anchors]
+    anchor_offsets = [
+        clamp(position * half_width, -usable_half_width, usable_half_width)
+        for _distance, position in anchors
+    ]
+
+    for index, sample in enumerate(samples):
+        distance = sample["distance"]
+        if distance >= anchor_distances[0]:
+            profile_distance = distance
+        elif distance <= 130.0:
+            profile_distance = distance + track_length
+        else:
+            continue
+
+        if profile_distance < anchor_distances[0] or profile_distance > anchor_distances[-1]:
+            continue
+
+        locked[index] = np.interp(
+            profile_distance,
+            anchor_distances,
+            anchor_offsets,
+        )
+
+    return locked
 
 
 def _phase(speed_kmh, speed_delta_kmh, turn_direction, curvature, maximum_speed_kmh):

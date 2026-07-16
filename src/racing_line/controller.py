@@ -107,7 +107,7 @@ def calculate_aggressive_steering(
     elif mode == DrivingMode.LIMIT:
         # Still follow the line, but prioritise stability.
         heading_component = (angle + heading_offset) * 7.4 / math.pi
-        line_component = -line_error * 0.90
+        line_component = -line_error * 1.04
         lateral_component = -speed_y * 0.030
         curvature_component = curvature * 2.2
 
@@ -124,7 +124,7 @@ def calculate_aggressive_steering(
     else:
         # ATTACK: commit harder to the racing line.
         heading_component = (angle + heading_offset) * 7.8 / math.pi
-        line_component = -line_error * 1.06
+        line_component = -line_error * 1.24
         lateral_component = -speed_y * 0.024
         curvature_component = curvature * 2.7
 
