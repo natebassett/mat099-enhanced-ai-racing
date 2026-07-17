@@ -836,6 +836,74 @@ def speedway_confidence_speed(preview_curvature, line_complexity=0.0):
     return clamp(speed, 88.0, 216.0)
 
 
+def optimizer_sweeper_speed_cap(
+    local,
+    near,
+    far,
+    *,
+    pursuit_target,
+    line_complexity,
+):
+    """Respect the saved speed profile in long, edge-apex sweepers.
+
+    The broad speedway confidence buckets are useful on open bends, but they
+    can exceed the grip-limited speed when a sustained corner also asks the
+    car to hold a wide lateral offset. Ramp this cap in with the apex offset so
+    braking stays progressive on corner entry.
+    """
+
+    preview_curvature = max(
+        abs(local["curvature"]),
+        abs(near["curvature"]),
+        abs(far["curvature"]),
+    )
+    directions = [
+        float(local.get("turn_direction", 0.0)),
+        float(near.get("turn_direction", 0.0)),
+        float(far.get("turn_direction", 0.0)),
+    ]
+    saved_speeds = [
+        float(local["target_speed_kmh"]),
+        float(near["target_speed_kmh"]),
+        float(far["target_speed_kmh"]),
+    ]
+    same_sustained_turn = (
+        all(abs(direction) > 0.4 for direction in directions)
+        and directions[0] * directions[1] > 0.0
+        and directions[1] * directions[2] > 0.0
+    )
+    local_target = float(local.get("target_track_pos", pursuit_target))
+    if not (
+        same_sustained_turn
+        and line_complexity < 0.18
+        and 0.009 <= preview_curvature <= 0.015
+        and pursuit_target > 0.44
+        and min(saved_speeds) > 112.0
+        and abs(pursuit_target - local_target) < 0.08
+    ):
+        return 216.0
+
+    saved_profile_cap = min(
+        saved_speeds[0] + 12.0,
+        saved_speeds[1] + 16.0,
+        saved_speeds[2] + 26.0,
+    )
+    grip_cap = curvature_limited_speed(
+        preview_curvature,
+        lateral_acceleration=10.8,
+    ) + 14.0
+    full_cap = min(saved_profile_cap, grip_cap)
+    apex_commitment = clamp((abs(pursuit_target) - 0.44) / 0.08, 0.0, 1.0)
+    open_sweeper_speed = speedway_confidence_speed(
+        preview_curvature,
+        line_complexity,
+    )
+    return (
+        open_sweeper_speed * (1.0 - apex_commitment)
+        + full_cap * apex_commitment
+    )
+
+
 def raceline_corner_throttle_cap(steer, track_position, pursuit_error):
     """Borrow agent 2's corner throttle discipline without centreline steering."""
 
@@ -988,6 +1056,16 @@ def calculate_raceline_target_speed(
         ):
             target_speed = max(target_speed, confidence_speed - 32.0)
 
+    target_speed = min(
+        target_speed,
+        optimizer_sweeper_speed_cap(
+            local,
+            near,
+            far,
+            pursuit_target=pursuit_target,
+            line_complexity=line_complexity,
+        ),
+    )
     target_speed = min(target_speed, sensor_cap)
 
     if pursuit_error > 0.82:
@@ -1173,6 +1251,86 @@ def calculate_raceline_pedals(
     return clamp(accel, 0.0, 1.0), clamp(brake, 0.0, 1.0)
 
 
+def apply_raceline_momentum_coast(
+    accel,
+    brake,
+    *,
+    focused_sweeper,
+    speed,
+    target_speed,
+    pursuit_error,
+    track_position,
+    lateral_speed,
+    angle,
+    sensor_cap,
+    control_state,
+    preview_curvature=0.0,
+    line_complexity=0.0,
+):
+    """Trade routine mapped braking for a safe throttle lift."""
+
+    safe_control_state = control_state not in (
+        RacingControlState.EDGE_GUARD,
+        RacingControlState.RECOVERY,
+    )
+    focused_safe = (
+        focused_sweeper
+        and safe_control_state
+        and sensor_cap > 150.0
+        and speed < 145.0
+        and speed - target_speed < 28.0
+        and pursuit_error < 0.58
+        and abs(track_position) < 0.78
+        and abs(lateral_speed) < 5.8
+        and abs(angle) < 0.16
+    )
+    general_safe = (
+        not focused_sweeper
+        and safe_control_state
+        and sensor_cap > 180.0
+        and brake <= 0.36
+        and speed < 175.0
+        and speed - target_speed < 22.0
+        and pursuit_error < 0.38
+        and abs(track_position) < 0.76
+        and abs(lateral_speed) < 5.0
+        and abs(angle) < 0.14
+        and abs(preview_curvature) < 0.022
+        and line_complexity < 0.50
+        and (
+            control_state == RacingControlState.RACE
+            or (
+                control_state == RacingControlState.JOIN_RACELINE
+                and pursuit_error < 0.32
+            )
+        )
+    )
+    gentle_transition_safe = (
+        not focused_sweeper
+        and safe_control_state
+        and sensor_cap > 180.0
+        and brake <= 0.28
+        and speed < 170.0
+        and speed - target_speed < 18.0
+        and pursuit_error < 0.28
+        and abs(track_position) < 0.72
+        and abs(lateral_speed) < 4.0
+        and abs(angle) < 0.11
+        and abs(preview_curvature) < 0.010
+        and line_complexity < 0.72
+        and (
+            control_state == RacingControlState.RACE
+            or (
+                control_state == RacingControlState.JOIN_RACELINE
+                and pursuit_error < 0.22
+            )
+        )
+    )
+    if (focused_safe or general_safe or gentle_transition_safe) and brake > 0.02:
+        return 0.0, 0.0
+    return accel, brake
+
+
 def apply_edge_guard_crawl_assist(
     accel,
     brake,
@@ -1300,7 +1458,7 @@ def guard_racing_line_target(
 class MapAwareAgent:
     name = "Map-Aware Racing-Line Agent"
     agent_type = "map_aware"
-    version = "3.5"
+    version = "4.1"
     seed = None
     uses_full_control = True
     max_steps = 150000
@@ -1338,7 +1496,7 @@ class MapAwareAgent:
             "target_laps": self.target_laps,
             "max_steps": self.max_steps,
             "line_merge_distance": self.line_merge_distance,
-            "control_profile": "raceline_pursuit_with_agent2_stability_slow_rejoin",
+            "control_profile": "raceline_pursuit_with_prioritized_momentum_coast",
             "speed_profile": "speedway_confidence_curvature_buckets",
         }
 
@@ -1507,6 +1665,13 @@ class MapAwareAgent:
             sensor_cap=sensor_cap,
             line_complexity=line_complexity,
         )
+        focused_sweeper = optimizer_sweeper_speed_cap(
+            target,
+            near,
+            far,
+            pursuit_target=pursuit_target,
+            line_complexity=line_complexity,
+        ) < 216.0
         if self.line_confidence_debt > 0.05:
             target_speed = min(
                 target_speed,
@@ -1567,6 +1732,23 @@ class MapAwareAgent:
             telemetry.get("wheelSpinVel"),
             accel,
         )
+        requested_brake = brake
+        accel, brake = apply_raceline_momentum_coast(
+            accel,
+            brake,
+            focused_sweeper=focused_sweeper,
+            speed=speed,
+            target_speed=target_speed,
+            pursuit_error=abs(pursuit_error),
+            track_position=track_position,
+            lateral_speed=lateral_speed,
+            angle=angle,
+            sensor_cap=sensor_cap,
+            control_state=control_state,
+            preview_curvature=target_curvature,
+            line_complexity=line_complexity,
+        )
+        momentum_coasting = requested_brake > 0.02 and brake <= 0.02
         accel, brake = apply_edge_guard_crawl_assist(
             accel,
             brake,
@@ -1592,6 +1774,8 @@ class MapAwareAgent:
         )
         if brake > 0.05:
             control_phase = "brake"
+        elif momentum_coasting:
+            control_phase = "coast"
         elif is_launching:
             control_phase = "launch"
 

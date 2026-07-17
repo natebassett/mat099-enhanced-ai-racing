@@ -16,6 +16,7 @@ from agents.map_aware_agent import (  # noqa: E402
     RacingControlState,
     apply_edge_guard_crawl_assist,
     apply_practical_target_limit,
+    apply_raceline_momentum_coast,
     cap_speed_for_line_join,
     cap_speed_for_control_state,
     calculate_path_tracking_steer,
@@ -30,6 +31,7 @@ from agents.map_aware_agent import (  # noqa: E402
     get_racing_line_corridor,
     guard_racing_line_target,
     map_safety_speed_cap,
+    optimizer_sweeper_speed_cap,
     preview_track_position,
     choose_dynamic_control_phase,
     soften_line_error,
@@ -929,6 +931,266 @@ class MapAwareAgentTests(unittest.TestCase):
         )
 
         self.assertGreaterEqual(target_speed, 150.0)
+
+    def test_edge_apex_sweeper_respects_optimizer_speed_profile(self):
+        waypoint = {
+            "curvature": 0.0115,
+            "target_speed_kmh": 119.0,
+            "target_track_pos": 0.57,
+            "turn_direction": 1.0,
+        }
+
+        target_speed = calculate_raceline_target_speed(
+            speed=150.0,
+            local=waypoint,
+            near=waypoint,
+            far=waypoint,
+            very_far=waypoint,
+            track_position=0.50,
+            pursuit_target=0.57,
+            lateral_speed=0.2,
+            angle=0.02,
+            sensor_cap=216.0,
+            line_complexity=0.0,
+        )
+
+        self.assertGreaterEqual(target_speed, 119.0)
+        self.assertLessEqual(target_speed, 126.0)
+
+    def test_sweeper_cap_ramps_in_before_wide_apex(self):
+        waypoint = {
+            "curvature": 0.0115,
+            "target_speed_kmh": 119.0,
+            "turn_direction": 1.0,
+        }
+
+        early_cap = optimizer_sweeper_speed_cap(
+            waypoint,
+            waypoint,
+            waypoint,
+            pursuit_target=0.46,
+            line_complexity=0.0,
+        )
+        apex_cap = optimizer_sweeper_speed_cap(
+            waypoint,
+            waypoint,
+            waypoint,
+            pursuit_target=0.57,
+            line_complexity=0.0,
+        )
+
+        self.assertGreater(early_cap, apex_cap + 15.0)
+        self.assertLessEqual(apex_cap, 126.0)
+
+    def test_sweeper_cap_ignores_low_speed_corner_lookalike(self):
+        local = {
+            "curvature": 0.0115,
+            "target_speed_kmh": 86.0,
+            "target_track_pos": 0.50,
+            "turn_direction": 1.0,
+        }
+        near = local | {"target_speed_kmh": 110.0}
+        far = local | {"target_speed_kmh": 119.0}
+
+        cap = optimizer_sweeper_speed_cap(
+            local,
+            near,
+            far,
+            pursuit_target=0.50,
+            line_complexity=0.0,
+        )
+
+        self.assertEqual(cap, 216.0)
+
+    def test_sweeper_cap_ignores_large_preview_lane_jump(self):
+        waypoint = {
+            "curvature": 0.0115,
+            "target_speed_kmh": 119.0,
+            "target_track_pos": 0.42,
+            "turn_direction": 1.0,
+        }
+
+        cap = optimizer_sweeper_speed_cap(
+            waypoint,
+            waypoint,
+            waypoint,
+            pursuit_target=0.56,
+            line_complexity=0.0,
+        )
+
+        self.assertEqual(cap, 216.0)
+
+    def test_sweeper_cap_ignores_opposite_direction_sweeper(self):
+        waypoint = {
+            "curvature": -0.0115,
+            "target_speed_kmh": 119.0,
+            "target_track_pos": -0.57,
+            "turn_direction": -1.0,
+        }
+
+        cap = optimizer_sweeper_speed_cap(
+            waypoint,
+            waypoint,
+            waypoint,
+            pursuit_target=-0.57,
+            line_complexity=0.0,
+        )
+
+        self.assertEqual(cap, 216.0)
+
+    def test_stable_sweeper_overspeed_coasts_instead_of_braking(self):
+        accel, brake = apply_raceline_momentum_coast(
+            0.0,
+            0.36,
+            focused_sweeper=True,
+            speed=129.0,
+            target_speed=108.5,
+            pursuit_error=0.42,
+            track_position=0.16,
+            lateral_speed=-2.7,
+            angle=-0.06,
+            sensor_cap=216.0,
+            control_state=RacingControlState.JOIN_RACELINE,
+        )
+
+        self.assertEqual(accel, 0.0)
+        self.assertEqual(brake, 0.0)
+
+    def test_unstable_sweeper_keeps_braking_authority(self):
+        accel, brake = apply_raceline_momentum_coast(
+            0.0,
+            0.36,
+            focused_sweeper=True,
+            speed=129.0,
+            target_speed=108.5,
+            pursuit_error=0.42,
+            track_position=0.16,
+            lateral_speed=-6.2,
+            angle=-0.06,
+            sensor_cap=216.0,
+            control_state=RacingControlState.JOIN_RACELINE,
+        )
+
+        self.assertEqual(accel, 0.0)
+        self.assertEqual(brake, 0.36)
+
+    def test_sweeper_sensor_danger_keeps_braking_authority(self):
+        accel, brake = apply_raceline_momentum_coast(
+            0.0,
+            0.36,
+            focused_sweeper=True,
+            speed=129.0,
+            target_speed=108.5,
+            pursuit_error=0.42,
+            track_position=0.16,
+            lateral_speed=-2.7,
+            angle=-0.06,
+            sensor_cap=92.0,
+            control_state=RacingControlState.JOIN_RACELINE,
+        )
+
+        self.assertEqual(accel, 0.0)
+        self.assertEqual(brake, 0.36)
+
+    def test_stable_mapped_section_coasts_instead_of_mild_braking(self):
+        accel, brake = apply_raceline_momentum_coast(
+            0.0,
+            0.26,
+            focused_sweeper=False,
+            speed=150.0,
+            target_speed=134.0,
+            pursuit_error=0.25,
+            track_position=0.30,
+            lateral_speed=2.0,
+            angle=0.08,
+            sensor_cap=216.0,
+            control_state=RacingControlState.RACE,
+            preview_curvature=0.012,
+            line_complexity=0.20,
+        )
+
+        self.assertEqual(accel, 0.0)
+        self.assertEqual(brake, 0.0)
+
+    def test_mapwide_coast_keeps_heavy_braking_authority(self):
+        accel, brake = apply_raceline_momentum_coast(
+            0.0,
+            0.48,
+            focused_sweeper=False,
+            speed=150.0,
+            target_speed=134.0,
+            pursuit_error=0.25,
+            track_position=0.30,
+            lateral_speed=2.0,
+            angle=0.08,
+            sensor_cap=216.0,
+            control_state=RacingControlState.RACE,
+            preview_curvature=0.012,
+            line_complexity=0.20,
+        )
+
+        self.assertEqual(accel, 0.0)
+        self.assertEqual(brake, 0.48)
+
+    def test_mapwide_coast_keeps_linked_bend_braking_authority(self):
+        accel, brake = apply_raceline_momentum_coast(
+            0.0,
+            0.26,
+            focused_sweeper=False,
+            speed=150.0,
+            target_speed=134.0,
+            pursuit_error=0.25,
+            track_position=0.30,
+            lateral_speed=2.0,
+            angle=0.08,
+            sensor_cap=216.0,
+            control_state=RacingControlState.RACE,
+            preview_curvature=0.012,
+            line_complexity=0.70,
+        )
+
+        self.assertEqual(accel, 0.0)
+        self.assertEqual(brake, 0.26)
+
+    def test_focused_sweeper_does_not_use_looser_mapwide_speed_limit(self):
+        accel, brake = apply_raceline_momentum_coast(
+            0.0,
+            0.26,
+            focused_sweeper=True,
+            speed=150.0,
+            target_speed=134.0,
+            pursuit_error=0.25,
+            track_position=0.30,
+            lateral_speed=2.0,
+            angle=0.08,
+            sensor_cap=216.0,
+            control_state=RacingControlState.RACE,
+            preview_curvature=0.012,
+            line_complexity=0.20,
+        )
+
+        self.assertEqual(accel, 0.0)
+        self.assertEqual(brake, 0.26)
+
+    def test_gentle_lane_transition_coasts_despite_moderate_complexity(self):
+        accel, brake = apply_raceline_momentum_coast(
+            0.0,
+            0.21,
+            focused_sweeper=False,
+            speed=132.0,
+            target_speed=118.0,
+            pursuit_error=0.20,
+            track_position=0.25,
+            lateral_speed=1.8,
+            angle=0.07,
+            sensor_cap=216.0,
+            control_state=RacingControlState.JOIN_RACELINE,
+            preview_curvature=0.006,
+            line_complexity=0.70,
+        )
+
+        self.assertEqual(accel, 0.0)
+        self.assertEqual(brake, 0.0)
 
     def test_moderate_line_miss_can_still_accelerate_when_under_target(self):
         accel, brake = calculate_raceline_pedals(
