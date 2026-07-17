@@ -14,12 +14,12 @@ ppo_driver/logs/
 ppo_driver/models/
 *.log
 
-# Generated race databases
-data/*.db
-data/*.db-shm
-data/*.db-wal
-data/rule_based_telemetry.csv
-data/map_aware_telemetry.csv
+# Generated race data
+data/generated/
+data/map_aware_telemetry_run*.csv
+data/map_aware_replay_eval_run*.csv
+data/map_aware_replay_run*.svg
+data/map_aware_tracking_run*.svg
 torcs/results/practice/results-*.xml
 
 # OS / editor

@@ -4,7 +4,9 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_TELEMETRY_PATH = PROJECT_ROOT / "data" / "rule_based_telemetry.csv"
+DEFAULT_TELEMETRY_PATH = (
+    PROJECT_ROOT / "data" / "generated" / "rule_based_telemetry.csv"
+)
 
 TARGET_SPEED = 216
 FAST_BEND_SPEED = 202

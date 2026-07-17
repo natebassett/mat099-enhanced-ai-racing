@@ -19,8 +19,9 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from agents.map_aware_agent import DEFAULT_RACING_LINE_PATH, MapAwareAgent  # noqa: E402
 
 
-DEFAULT_INPUT = PROJECT_ROOT / "data" / "map_aware_telemetry.csv"
-DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "map_aware_replay_eval.csv"
+GENERATED_DATA = PROJECT_ROOT / "data" / "generated"
+DEFAULT_INPUT = GENERATED_DATA / "map_aware_telemetry.csv"
+DEFAULT_OUTPUT = GENERATED_DATA / "map_aware_replay_eval.csv"
 
 
 def parse_float(row, name, default=0.0):

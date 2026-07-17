@@ -7,8 +7,9 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_INPUT = PROJECT_ROOT / "data" / "map_aware_telemetry.csv"
-DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "map_aware_tracking.svg"
+GENERATED_DATA = PROJECT_ROOT / "data" / "generated"
+DEFAULT_INPUT = GENERATED_DATA / "map_aware_telemetry.csv"
+DEFAULT_OUTPUT = GENERATED_DATA / "map_aware_tracking.svg"
 
 
 SERIES = [

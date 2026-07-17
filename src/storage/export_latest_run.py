@@ -1,6 +1,11 @@
 import sqlite3
+from pathlib import Path
 
-conn = sqlite3.connect("data/race_results.db")
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DATABASE_PATH = PROJECT_ROOT / "data" / "generated" / "race_results.db"
+
+conn = sqlite3.connect(DATABASE_PATH)
 cursor = conn.cursor()
 
 cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")

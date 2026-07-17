@@ -16,7 +16,9 @@ from racing_line import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RACING_LINE_PATH = PROJECT_ROOT / "data" / "racing_lines" / "g-track-3.json"
-DEFAULT_TELEMETRY_PATH = PROJECT_ROOT / "data" / "map_aware_telemetry.csv"
+DEFAULT_TELEMETRY_PATH = (
+    PROJECT_ROOT / "data" / "generated" / "map_aware_telemetry.csv"
+)
 
 GEAR_SPEEDS = [0, 45, 85, 125, 165, 205]
 TRACK_SENSOR_ANGLES = [
