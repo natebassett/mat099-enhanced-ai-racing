@@ -904,7 +904,13 @@ def optimizer_sweeper_speed_cap(
     )
 
 
-def raceline_corner_throttle_cap(steer, track_position, pursuit_error):
+def raceline_corner_throttle_cap(
+    steer,
+    track_position,
+    pursuit_error,
+    lateral_speed=0.0,
+    angle=0.0,
+):
     """Borrow agent 2's corner throttle discipline without centreline steering."""
 
     steer_abs = abs(steer)
@@ -926,10 +932,16 @@ def raceline_corner_throttle_cap(steer, track_position, pursuit_error):
     elif pursuit_error > 0.30:
         cap = min(cap, 0.52)
 
+    settled_on_wide_line = (
+        pursuit_error < 0.12
+        and steer_abs < 0.22
+        and abs(lateral_speed) < 2.0
+        and abs(angle) < 0.08
+    )
     if abs(track_position) > 0.72:
-        cap = min(cap, 0.26)
+        cap = min(cap, 0.42 if settled_on_wide_line else 0.26)
     elif abs(track_position) > 0.58:
-        cap = min(cap, 0.42)
+        cap = min(cap, 0.72 if settled_on_wide_line else 0.42)
     return cap
 
 
@@ -1192,18 +1204,43 @@ def calculate_raceline_pedals(
         and abs(angle) < 0.18
         and abs(lateral_speed) < 4.2
     )
+    late_brake_ready = (
+        control_state
+        not in (
+            RacingControlState.EDGE_GUARD,
+            RacingControlState.RECOVERY,
+        )
+        and pursuit_error < 0.16
+        and abs(track_position) < 0.72
+        and abs(angle) < 0.10
+        and abs(lateral_speed) < 2.8
+    )
     if control_state == RacingControlState.RECOVERY:
         if speed < 8.0:
             accel, brake = 0.24, 0.0
         else:
             accel, brake = 0.0, 0.38
     else:
-        if speed_error < -18.0:
+        strong_brake_error = -20.0 if late_brake_ready else -18.0
+        mild_brake_error = -7.0 if late_brake_ready else -5.0
+        if speed_error < strong_brake_error:
             accel = 0.0
-            brake = clamp((-speed_error - 8.0) / 34.0, 0.12, 0.82)
-        elif speed_error < -5.0:
+            brake_offset = 10.0 if late_brake_ready else 8.0
+            brake = clamp(
+                (-speed_error - brake_offset) / 34.0,
+                0.12,
+                0.82,
+            )
+        elif speed_error < mild_brake_error:
             accel = 0.0
-            brake = clamp((-speed_error - 5.0) / 42.0, 0.0, 0.36)
+            brake = clamp(
+                (-speed_error + mild_brake_error) / 42.0,
+                0.0,
+                0.36,
+            )
+        elif late_brake_ready and speed_error < -5.0:
+            accel = 0.0
+            brake = 0.0
         elif speed_error < 2.0 and (abs(steer) > 0.42 or pursuit_error > 0.34):
             accel = 0.0
             brake = clamp((2.0 - speed_error) / 34.0, 0.0, 0.14)
@@ -1217,6 +1254,8 @@ def calculate_raceline_pedals(
                 steer,
                 track_position,
                 pursuit_error,
+                lateral_speed,
+                angle,
             ),
         )
 
@@ -1238,7 +1277,16 @@ def calculate_raceline_pedals(
             brake = max(brake, 0.26)
 
     if previous_accel is not None and previous_brake is not None:
-        accel = previous_accel + clamp(accel - previous_accel, -0.42, 0.22)
+        accel_rise = 0.22
+        if late_brake_ready and speed_error > 12.0:
+            accel_rise = 0.34
+        elif stable_on_line and speed_error > 6.0:
+            accel_rise = 0.28
+        accel = previous_accel + clamp(
+            accel - previous_accel,
+            -0.42,
+            accel_rise,
+        )
         brake_release = 0.30
         if speed_error > 6.0 and stable_on_line:
             brake_release = 0.80
@@ -1264,10 +1312,8 @@ def apply_raceline_momentum_coast(
     angle,
     sensor_cap,
     control_state,
-    preview_curvature=0.0,
-    line_complexity=0.0,
 ):
-    """Trade routine mapped braking for a safe throttle lift."""
+    """Trade mild braking for a lift in the validated long sweeper."""
 
     safe_control_state = control_state not in (
         RacingControlState.EDGE_GUARD,
@@ -1284,49 +1330,7 @@ def apply_raceline_momentum_coast(
         and abs(lateral_speed) < 5.8
         and abs(angle) < 0.16
     )
-    general_safe = (
-        not focused_sweeper
-        and safe_control_state
-        and sensor_cap > 180.0
-        and brake <= 0.36
-        and speed < 175.0
-        and speed - target_speed < 22.0
-        and pursuit_error < 0.38
-        and abs(track_position) < 0.76
-        and abs(lateral_speed) < 5.0
-        and abs(angle) < 0.14
-        and abs(preview_curvature) < 0.022
-        and line_complexity < 0.50
-        and (
-            control_state == RacingControlState.RACE
-            or (
-                control_state == RacingControlState.JOIN_RACELINE
-                and pursuit_error < 0.32
-            )
-        )
-    )
-    gentle_transition_safe = (
-        not focused_sweeper
-        and safe_control_state
-        and sensor_cap > 180.0
-        and brake <= 0.28
-        and speed < 170.0
-        and speed - target_speed < 18.0
-        and pursuit_error < 0.28
-        and abs(track_position) < 0.72
-        and abs(lateral_speed) < 4.0
-        and abs(angle) < 0.11
-        and abs(preview_curvature) < 0.010
-        and line_complexity < 0.72
-        and (
-            control_state == RacingControlState.RACE
-            or (
-                control_state == RacingControlState.JOIN_RACELINE
-                and pursuit_error < 0.22
-            )
-        )
-    )
-    if (focused_safe or general_safe or gentle_transition_safe) and brake > 0.02:
+    if focused_safe and brake > 0.02:
         return 0.0, 0.0
     return accel, brake
 
@@ -1458,7 +1462,7 @@ def guard_racing_line_target(
 class MapAwareAgent:
     name = "Map-Aware Racing-Line Agent"
     agent_type = "map_aware"
-    version = "4.1"
+    version = "4.2"
     seed = None
     uses_full_control = True
     max_steps = 150000
@@ -1496,7 +1500,7 @@ class MapAwareAgent:
             "target_laps": self.target_laps,
             "max_steps": self.max_steps,
             "line_merge_distance": self.line_merge_distance,
-            "control_profile": "raceline_pursuit_with_prioritized_momentum_coast",
+            "control_profile": "raceline_pursuit_with_late_brake_fast_exit",
             "speed_profile": "speedway_confidence_curvature_buckets",
         }
 
@@ -1745,8 +1749,6 @@ class MapAwareAgent:
             angle=angle,
             sensor_cap=sensor_cap,
             control_state=control_state,
-            preview_curvature=target_curvature,
-            line_complexity=line_complexity,
         )
         momentum_coasting = requested_brake > 0.02 and brake <= 0.02
         accel, brake = apply_edge_guard_crawl_assist(

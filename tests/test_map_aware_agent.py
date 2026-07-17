@@ -33,6 +33,7 @@ from agents.map_aware_agent import (  # noqa: E402
     map_safety_speed_cap,
     optimizer_sweeper_speed_cap,
     preview_track_position,
+    raceline_corner_throttle_cap,
     choose_dynamic_control_phase,
     soften_line_error,
     update_raceline_confidence_debt,
@@ -1092,7 +1093,7 @@ class MapAwareAgentTests(unittest.TestCase):
         self.assertEqual(accel, 0.0)
         self.assertEqual(brake, 0.36)
 
-    def test_stable_mapped_section_coasts_instead_of_mild_braking(self):
+    def test_routine_mapped_section_keeps_planned_braking(self):
         accel, brake = apply_raceline_momentum_coast(
             0.0,
             0.26,
@@ -1105,12 +1106,10 @@ class MapAwareAgentTests(unittest.TestCase):
             angle=0.08,
             sensor_cap=216.0,
             control_state=RacingControlState.RACE,
-            preview_curvature=0.012,
-            line_complexity=0.20,
         )
 
         self.assertEqual(accel, 0.0)
-        self.assertEqual(brake, 0.0)
+        self.assertEqual(brake, 0.26)
 
     def test_mapwide_coast_keeps_heavy_braking_authority(self):
         accel, brake = apply_raceline_momentum_coast(
@@ -1125,8 +1124,6 @@ class MapAwareAgentTests(unittest.TestCase):
             angle=0.08,
             sensor_cap=216.0,
             control_state=RacingControlState.RACE,
-            preview_curvature=0.012,
-            line_complexity=0.20,
         )
 
         self.assertEqual(accel, 0.0)
@@ -1145,8 +1142,6 @@ class MapAwareAgentTests(unittest.TestCase):
             angle=0.08,
             sensor_cap=216.0,
             control_state=RacingControlState.RACE,
-            preview_curvature=0.012,
-            line_complexity=0.70,
         )
 
         self.assertEqual(accel, 0.0)
@@ -1165,14 +1160,12 @@ class MapAwareAgentTests(unittest.TestCase):
             angle=0.08,
             sensor_cap=216.0,
             control_state=RacingControlState.RACE,
-            preview_curvature=0.012,
-            line_complexity=0.20,
         )
 
         self.assertEqual(accel, 0.0)
         self.assertEqual(brake, 0.26)
 
-    def test_gentle_lane_transition_coasts_despite_moderate_complexity(self):
+    def test_gentle_lane_transition_keeps_planned_braking(self):
         accel, brake = apply_raceline_momentum_coast(
             0.0,
             0.21,
@@ -1185,12 +1178,83 @@ class MapAwareAgentTests(unittest.TestCase):
             angle=0.07,
             sensor_cap=216.0,
             control_state=RacingControlState.JOIN_RACELINE,
-            preview_curvature=0.006,
-            line_complexity=0.70,
+        )
+
+        self.assertEqual(accel, 0.0)
+        self.assertEqual(brake, 0.21)
+
+    def test_stable_driver_delays_mild_braking_with_a_short_coast(self):
+        accel, brake = calculate_raceline_pedals(
+            speed=138.0,
+            target_speed=132.0,
+            steer=0.08,
+            pursuit_error=0.08,
+            track_position=0.24,
+            lateral_speed=0.8,
+            angle=0.03,
+            previous_accel=None,
+            previous_brake=None,
+            control_state=RacingControlState.RACE,
         )
 
         self.assertEqual(accel, 0.0)
         self.assertEqual(brake, 0.0)
+
+    def test_unsettled_driver_retains_earlier_braking(self):
+        accel, brake = calculate_raceline_pedals(
+            speed=138.0,
+            target_speed=132.0,
+            steer=0.08,
+            pursuit_error=0.22,
+            track_position=0.24,
+            lateral_speed=3.2,
+            angle=0.11,
+            previous_accel=None,
+            previous_brake=None,
+            control_state=RacingControlState.JOIN_RACELINE,
+        )
+
+        self.assertEqual(accel, 0.0)
+        self.assertGreater(brake, 0.0)
+
+    def test_stable_exit_builds_throttle_more_quickly(self):
+        accel, brake = calculate_raceline_pedals(
+            speed=118.0,
+            target_speed=152.0,
+            steer=0.08,
+            pursuit_error=0.08,
+            track_position=0.24,
+            lateral_speed=0.8,
+            angle=0.03,
+            previous_accel=0.0,
+            previous_brake=0.0,
+            control_state=RacingControlState.RACE,
+        )
+
+        self.assertEqual(brake, 0.0)
+        self.assertGreaterEqual(accel, 0.34)
+
+    def test_stable_wide_raceline_keeps_exit_throttle(self):
+        cap = raceline_corner_throttle_cap(
+            steer=0.04,
+            track_position=0.60,
+            pursuit_error=0.05,
+            lateral_speed=0.6,
+            angle=0.02,
+        )
+
+        self.assertEqual(cap, 0.72)
+
+    def test_unstable_wide_position_keeps_conservative_throttle(self):
+        cap = raceline_corner_throttle_cap(
+            steer=0.04,
+            track_position=0.60,
+            pursuit_error=0.05,
+            lateral_speed=3.2,
+            angle=0.11,
+        )
+
+        self.assertEqual(cap, 0.42)
 
     def test_moderate_line_miss_can_still_accelerate_when_under_target(self):
         accel, brake = calculate_raceline_pedals(
