@@ -80,6 +80,7 @@
       <attnum name="fovy-0-1" val="40"/>
       <attnum name="fovy-4-0" val="21"/>
       <attnum name="fovy-0-2" val="67.5"/>
+      <attnum name="fovy-3-0" val="67.5"/>
     </section>
 
   </section>

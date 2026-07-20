@@ -1,4 +1,5 @@
 from agents.random_agent import RandomAgent
+from agents.hybrid_ppo_agent import HybridPpoAgent
 from agents.map_aware_agent import MapAwareAgent
 from agents.rule_based_agent import RuleBasedAgent
 from runner.torcs_runner import TorcsRunner
@@ -41,11 +42,12 @@ def menu():
         print("[1] Random Agent")
         print("[2] Rule-Based Anti-Spin Agent")
         print("[3] Map-Aware Racing-Line Agent")
+        print("[4] Hybrid PPO Agent")
         print("[0] Exit\n")
 
         choice = input("Enter choice: ")
 
-        if choice in {"1", "2", "3"}:
+        if choice in {"1", "2", "3", "4"}:
 
             runner = TorcsRunner()
 
@@ -53,6 +55,7 @@ def menu():
                 "1": RandomAgent,
                 "2": RuleBasedAgent,
                 "3": MapAwareAgent,
+                "4": HybridPpoAgent,
             }
             agent = agents[choice]()
 
