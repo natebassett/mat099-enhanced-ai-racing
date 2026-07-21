@@ -20,6 +20,7 @@ from agents.hybrid_ppo_agent import (  # noqa: E402
     AGENT4_ACTION_VERSION,
     AGENT4_MODEL_FAMILY,
     AGENT4_OBSERVATION_VERSION,
+    DEFAULT_RESIDUAL_SCALE,
     DEFAULT_BEST_MODEL_PATH,
     DEFAULT_MODEL_PATH,
     FEATURE_NAMES,
@@ -39,7 +40,7 @@ DEFAULT_TRACK_NAME = "g-track-3"
 DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "models" / "checkpoints" / "agent4_hybrid_ppo"
 DEFAULT_TENSORBOARD_DIR = PROJECT_ROOT / "models" / "tensorboard" / "agent4_hybrid_ppo"
 DEFAULT_RUNS_DIR = PROJECT_ROOT / "models" / "training_runs" / "agent4_hybrid_ppo"
-REWARD_VERSION = "agent4_reward_v5_teacher_residual_racecraft"
+REWARD_VERSION = "agent4_reward_v6_terminal_discipline"
 REWARD_WEIGHTS = {
     "progress": 0.35,
     "pace": 0.14,
@@ -48,15 +49,17 @@ REWARD_WEIGHTS = {
     "aligned_speed": 0.06,
     "racing_line_error": 0.12,
     "large_racing_line_error": 0.25,
-    "overspeed": 0.18,
-    "lateral_slide": 0.08,
-    "residual_size": 0.035,
-    "safety_shield": 0.08,
-    "off_track": 8.0,
-    "crash": 10.0,
-    "backwards": 6.0,
-    "stuck": 5.0,
-    "lap_completed": 30.0,
+    "overspeed": 0.32,
+    "lateral_slide": 0.12,
+    "residual_size": 0.05,
+    "safety_shield": 0.12,
+    "edge_pressure": 0.18,
+    "off_track": 260.0,
+    "crash": 320.0,
+    "backwards": 260.0,
+    "stuck": 180.0,
+    "incomplete_lap_failure": 220.0,
+    "lap_completed": 450.0,
 }
 STUCK_SPEED_LIMIT_KMH = 5.0
 STUCK_PROGRESS_LIMIT_M = 0.20
@@ -300,6 +303,17 @@ def get_racing_line_context(telemetry, racing_line=None):
     }
 
 
+def calculate_lap_completion_fraction(episode_distance_m, racing_line=None):
+    if episode_distance_m is None:
+        return 0.0
+
+    track_length = getattr(racing_line, "track_length", None)
+    if not track_length:
+        return 0.0
+
+    return clamp(float(episode_distance_m) / float(track_length), 0.0, 1.0)
+
+
 def calculate_hybrid_reward(
     telemetry,
     action,
@@ -308,6 +322,7 @@ def calculate_hybrid_reward(
     previous_damage=0.0,
     racing_line=None,
     completed_lap=None,
+    episode_distance_m=None,
     stuck=False,
 ):
     track_sensors = get_track_sensors(telemetry)
@@ -360,18 +375,33 @@ def calculate_hybrid_reward(
     reward -= (clamp(overspeed / 70.0, 0.0, 1.0) ** 2) * REWARD_WEIGHTS["overspeed"]
     reward -= clamp(abs(lateral_speed) / 22.0, 0.0, 1.0) * REWARD_WEIGHTS["lateral_slide"]
     reward -= clamp(residual_pressure, 0.0, 1.0) * REWARD_WEIGHTS["residual_size"]
+    reward -= (
+        clamp((abs(track_position) - 0.92) / 0.16, 0.0, 1.0)
+        * REWARD_WEIGHTS["edge_pressure"]
+    )
 
     if action.get("agent4_safety_shield_active", False):
         reward -= REWARD_WEIGHTS["safety_shield"]
 
-    if min(track_sensors) < 0.0 or abs(track_position) > 1.05:
+    off_track = min(track_sensors) < 0.0 or abs(track_position) > 1.05
+    crashed = damage > previous_damage
+    backwards = math.cos(angle) < 0.0
+    failed_episode = off_track or crashed or backwards or stuck
+
+    if off_track:
         reward -= REWARD_WEIGHTS["off_track"]
-    if damage > previous_damage:
+    if crashed:
         reward -= REWARD_WEIGHTS["crash"]
-    if math.cos(angle) < 0.0:
+    if backwards:
         reward -= REWARD_WEIGHTS["backwards"]
     if stuck:
         reward -= REWARD_WEIGHTS["stuck"]
+    if failed_episode and completed_lap is None:
+        lap_fraction = calculate_lap_completion_fraction(
+            episode_distance_m,
+            racing_line,
+        )
+        reward -= (1.0 - lap_fraction) * REWARD_WEIGHTS["incomplete_lap_failure"]
     if completed_lap is not None:
         reward += REWARD_WEIGHTS["lap_completed"]
 
@@ -387,7 +417,7 @@ def make_training_env_class(gym, spaces):
             *,
             track_name=DEFAULT_TRACK_NAME,
             racing_line_path=DEFAULT_RACING_LINE_PATH,
-            residual_scale=1.0,
+            residual_scale=DEFAULT_RESIDUAL_SCALE,
             max_episode_steps=12000,
             target_laps=1,
             manual_start=False,
@@ -517,6 +547,11 @@ def make_training_env_class(gym, spaces):
                 self.stopped_seconds,
             )
             stuck = self.stopped_seconds >= STUCK_SECONDS_LIMIT
+            episode_distance_m = max(
+                0.0,
+                float(telemetry.get("distRaced", 0.0))
+                - self.episode_start_distance,
+            )
 
             reward = calculate_hybrid_reward(
                 telemetry,
@@ -525,6 +560,7 @@ def make_training_env_class(gym, spaces):
                 previous_damage=self.previous_damage,
                 racing_line=self.base_agent.racing_line,
                 completed_lap=completed_lap,
+                episode_distance_m=episode_distance_m,
                 stuck=stuck,
             )
             self.previous_damage = current_damage
@@ -571,10 +607,7 @@ def make_training_env_class(gym, spaces):
                 elif done:
                     reason = "torcs_done"
 
-                distance_m = (
-                    float(telemetry.get("distRaced", 0.0))
-                    - self.episode_start_distance
-                )
+                distance_m = episode_distance_m
                 duration_seconds = max(
                     0.0,
                     float(telemetry.get("curLapTime", 0.0))
@@ -826,7 +859,7 @@ def parse_args():
     parser.add_argument("--track", default=DEFAULT_TRACK_NAME)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--force-resume", action="store_true")
-    parser.add_argument("--residual-scale", type=float, default=1.0)
+    parser.add_argument("--residual-scale", type=float, default=DEFAULT_RESIDUAL_SCALE)
     parser.add_argument("--max-episode-steps", type=int, default=12_000)
     parser.add_argument("--target-laps", type=int, default=1)
     parser.add_argument("--run-dir", type=Path, default=None)

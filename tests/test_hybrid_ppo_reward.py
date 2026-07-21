@@ -157,6 +157,68 @@ class HybridPpoRewardTests(unittest.TestCase):
 
         self.assertGreater(reward_with_lap, reward_without_lap)
 
+    def test_off_track_failure_is_not_rewarded_like_fast_progress(self):
+        previous = make_telemetry(distRaced=100.0, curLapTime=1.0)
+        safe_fast = make_telemetry(
+            speedX=150.0,
+            distRaced=108.0,
+            distFromStart=108.0,
+            curLapTime=1.2,
+        )
+        failed_fast = make_telemetry(
+            speedX=150.0,
+            trackPos=1.12,
+            track=[-1.0] + [200.0] * 18,
+            distRaced=108.0,
+            distFromStart=108.0,
+            curLapTime=1.2,
+        )
+
+        safe_reward = train_hybrid_ppo_agent.calculate_hybrid_reward(
+            safe_fast,
+            make_action(),
+            previous_telemetry=previous,
+            racing_line=FakeRacingLine(),
+            episode_distance_m=8.0,
+        )
+        failed_reward = train_hybrid_ppo_agent.calculate_hybrid_reward(
+            failed_fast,
+            make_action(),
+            previous_telemetry=previous,
+            racing_line=FakeRacingLine(),
+            episode_distance_m=8.0,
+        )
+
+        self.assertLess(failed_reward, safe_reward - 400.0)
+
+    def test_incomplete_lap_failure_penalty_shrinks_with_progress(self):
+        previous = make_telemetry(distRaced=100.0, curLapTime=1.0)
+        failed = make_telemetry(
+            speedX=120.0,
+            trackPos=1.12,
+            track=[-1.0] + [200.0] * 18,
+            distRaced=104.0,
+            distFromStart=104.0,
+            curLapTime=1.2,
+        )
+
+        early_failure_reward = train_hybrid_ppo_agent.calculate_hybrid_reward(
+            failed,
+            make_action(),
+            previous_telemetry=previous,
+            racing_line=FakeRacingLine(),
+            episode_distance_m=100.0,
+        )
+        later_failure_reward = train_hybrid_ppo_agent.calculate_hybrid_reward(
+            failed,
+            make_action(),
+            previous_telemetry=previous,
+            racing_line=FakeRacingLine(),
+            episode_distance_m=800.0,
+        )
+
+        self.assertGreater(later_failure_reward, early_failure_reward)
+
     def test_stopped_car_time_accumulates_when_no_progress_is_made(self):
         previous = make_telemetry(speedX=0.0, distRaced=100.0, curLapTime=1.0)
         stopped = make_telemetry(speedX=0.0, distRaced=100.0, curLapTime=1.5)

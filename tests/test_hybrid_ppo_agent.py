@@ -12,6 +12,7 @@ from agents.hybrid_ppo_agent import (  # noqa: E402
     AGENT4_ACTION_VERSION,
     AGENT4_MODEL_FAMILY,
     AGENT4_OBSERVATION_VERSION,
+    DEFAULT_RESIDUAL_SCALE,
     FEATURE_NAMES,
     HybridPpoAgent,
     MAX_ACCEL_RESIDUAL,
@@ -183,6 +184,7 @@ class HybridPpoAgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             agent = HybridPpoAgent(
                 policy=FakePolicy([0.5, 0.0, 0.0]),
+                residual_scale=1.0,
                 base_telemetry_path=Path(directory) / "base.csv",
                 residual_telemetry_path=Path(directory) / "residual.csv",
             )
@@ -193,6 +195,41 @@ class HybridPpoAgentTests(unittest.TestCase):
 
         self.assertTrue(action["agent4_policy_loaded"])
         self.assertAlmostEqual(action["agent4_steer_residual"], MAX_STEER_RESIDUAL / 2)
+
+    def test_agent_uses_residual_scale_from_model_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "agent4_hybrid_ppo.zip"
+            policy_path.with_suffix(".metadata.json").write_text(
+                '{"residual_scale": 0.2}',
+                encoding="utf-8",
+            )
+            agent = HybridPpoAgent(
+                policy_path=policy_path,
+                base_telemetry_path=Path(directory) / "base.csv",
+                residual_telemetry_path=Path(directory) / "residual.csv",
+            )
+            try:
+                config = agent.config
+            finally:
+                agent.close()
+
+        self.assertTrue(config["policy_metadata_loaded"])
+        self.assertAlmostEqual(config["residual_scale"], 0.2)
+        self.assertAlmostEqual(config["residual_limits"]["steer"], MAX_STEER_RESIDUAL * 0.2)
+
+    def test_agent_uses_safe_default_residual_scale_without_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent = HybridPpoAgent(
+                policy_path=Path(directory) / "missing_model.zip",
+                base_telemetry_path=Path(directory) / "base.csv",
+                residual_telemetry_path=Path(directory) / "residual.csv",
+            )
+            try:
+                config = agent.config
+            finally:
+                agent.close()
+
+        self.assertAlmostEqual(config["residual_scale"], DEFAULT_RESIDUAL_SCALE)
 
     def test_agent_config_exposes_resume_compatibility_versions(self):
         with tempfile.TemporaryDirectory() as directory:

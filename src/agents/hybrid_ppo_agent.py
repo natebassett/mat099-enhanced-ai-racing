@@ -1,4 +1,5 @@
 import csv
+import json
 import math
 from pathlib import Path
 
@@ -29,6 +30,7 @@ AGENT4_ACTION_VERSION = "agent4_residual_action_v1"
 MAX_STEER_RESIDUAL = 0.080
 MAX_ACCEL_RESIDUAL = 0.180
 MAX_BRAKE_RESIDUAL = 0.220
+DEFAULT_RESIDUAL_SCALE = 0.3
 SAFE_TRACK_LIMIT = 0.84
 HARD_TRACK_LIMIT = 0.96
 FINITE_DEFAULT = 0.0
@@ -161,6 +163,38 @@ def resolve_default_policy_path():
     return DEFAULT_MODEL_PATH
 
 
+def metadata_path_for_policy(policy_path):
+    return Path(policy_path).with_suffix(".metadata.json")
+
+
+def read_policy_metadata(policy_path):
+    if policy_path is None:
+        return {}
+
+    metadata_path = metadata_path_for_policy(policy_path)
+    if not metadata_path.is_file():
+        return {}
+
+    try:
+        with metadata_path.open(encoding="utf-8") as handle:
+            metadata = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def resolve_residual_scale(policy_path, residual_scale=None):
+    if residual_scale is not None:
+        return max(0.0, finite_float(residual_scale, DEFAULT_RESIDUAL_SCALE))
+
+    metadata = read_policy_metadata(policy_path)
+    return max(
+        0.0,
+        finite_float(metadata.get("residual_scale"), DEFAULT_RESIDUAL_SCALE),
+    )
+
+
 def get_residual_limits(residual_scale=1.0):
     scale = max(0.0, float(residual_scale))
     return [
@@ -291,7 +325,7 @@ class HybridPpoAgent:
         racing_line_path=DEFAULT_RACING_LINE_PATH,
         policy_path=None,
         policy=None,
-        residual_scale=1.0,
+        residual_scale=None,
         base_telemetry_path=DEFAULT_BASE_TELEMETRY_PATH,
         residual_telemetry_path=DEFAULT_RESIDUAL_TELEMETRY_PATH,
         require_policy=False,
@@ -301,7 +335,8 @@ class HybridPpoAgent:
         self.policy_path = Path(policy_path) if policy_path is not None else None
         self.policy = policy
         self.policy_loaded = policy is not None
-        self.residual_scale = residual_scale
+        self.policy_metadata = read_policy_metadata(self.policy_path)
+        self.residual_scale = resolve_residual_scale(self.policy_path, residual_scale)
         self.base_agent = MapAwareAgent(
             racing_line_path=racing_line_path,
             telemetry_path=base_telemetry_path,
@@ -335,6 +370,7 @@ class HybridPpoAgent:
             "base_agent_type": self.base_agent.agent_type,
             "policy_path": policy_path,
             "policy_loaded": self.policy_loaded,
+            "policy_metadata_loaded": bool(self.policy_metadata),
             "residual_scale": self.residual_scale,
             "residual_limits": {
                 "steer": MAX_STEER_RESIDUAL * self.residual_scale,
