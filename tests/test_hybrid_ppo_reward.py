@@ -70,6 +70,31 @@ def make_action(**overrides):
 
 
 class HybridPpoRewardTests(unittest.TestCase):
+    def test_progress_line_summarises_training_status(self):
+        state = train_hybrid_ppo_agent.TrainingProgressState()
+        state.record_episode(
+            {
+                "episodes_seen": 3,
+                "termination_reason": "off_track",
+                "distance_m": 1200.0,
+                "reward": -140.0,
+                "laps_completed": 0,
+            }
+        )
+
+        line = train_hybrid_ppo_agent.format_training_progress_line(
+            50,
+            100,
+            10.0,
+            state,
+            width=10,
+        )
+
+        self.assertIn("50.0%", line)
+        self.assertIn("50/100 steps", line)
+        self.assertIn("ETA 00:00:10", line)
+        self.assertIn("ep 3 off_track 1200m R=-140 laps=0", line)
+
     def test_faster_progress_receives_higher_reward(self):
         previous = make_telemetry(distRaced=100.0, curLapTime=1.0)
         slow = make_telemetry(
@@ -218,6 +243,72 @@ class HybridPpoRewardTests(unittest.TestCase):
         )
 
         self.assertGreater(later_failure_reward, early_failure_reward)
+
+    def test_clean_edge_use_is_not_penalised_by_track_position_alone(self):
+        previous = make_telemetry(distRaced=100.0, curLapTime=1.0)
+        centre = make_telemetry(
+            speedX=120.0,
+            trackPos=0.0,
+            distRaced=104.0,
+            distFromStart=104.0,
+            curLapTime=1.2,
+        )
+        stable_edge = make_telemetry(
+            speedX=120.0,
+            trackPos=0.98,
+            speedY=0.0,
+            angle=0.0,
+            distRaced=104.0,
+            distFromStart=104.0,
+            curLapTime=1.2,
+        )
+
+        centre_reward = train_hybrid_ppo_agent.calculate_hybrid_reward(
+            centre,
+            make_action(),
+            previous_telemetry=previous,
+        )
+        stable_edge_reward = train_hybrid_ppo_agent.calculate_hybrid_reward(
+            stable_edge,
+            make_action(),
+            previous_telemetry=previous,
+        )
+
+        self.assertAlmostEqual(stable_edge_reward, centre_reward)
+
+    def test_unstable_outward_edge_exit_is_penalised(self):
+        previous = make_telemetry(distRaced=100.0, curLapTime=1.0)
+        stable_edge = make_telemetry(
+            speedX=120.0,
+            trackPos=0.98,
+            speedY=0.0,
+            angle=0.0,
+            distRaced=104.0,
+            distFromStart=104.0,
+            curLapTime=1.2,
+        )
+        unstable_edge = make_telemetry(
+            speedX=120.0,
+            trackPos=0.98,
+            speedY=8.5,
+            angle=0.38,
+            distRaced=104.0,
+            distFromStart=104.0,
+            curLapTime=1.2,
+        )
+
+        stable_reward = train_hybrid_ppo_agent.calculate_hybrid_reward(
+            stable_edge,
+            make_action(steer=0.0, accel=0.4),
+            previous_telemetry=previous,
+        )
+        unstable_reward = train_hybrid_ppo_agent.calculate_hybrid_reward(
+            unstable_edge,
+            make_action(steer=0.4, accel=0.8),
+            previous_telemetry=previous,
+        )
+
+        self.assertLess(unstable_reward, stable_reward)
 
     def test_stopped_car_time_accumulates_when_no_progress_is_made(self):
         previous = make_telemetry(speedX=0.0, distRaced=100.0, curLapTime=1.0)

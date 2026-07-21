@@ -1,9 +1,12 @@
 import argparse
+import contextlib
 import csv
 import importlib.util
+import io
 import json
 import math
 import random
+import shutil
 import sys
 import time
 from datetime import datetime, timezone
@@ -33,14 +36,16 @@ from agents.hybrid_ppo_agent import (  # noqa: E402
 )
 from agents.map_aware_agent import DEFAULT_RACING_LINE_PATH, MapAwareAgent  # noqa: E402
 from runner.lap_tracker import LapTracker, practice_finish_is_plausible  # noqa: E402
-from runner.torcs_runner import TorcsRunner  # noqa: E402
+with contextlib.redirect_stderr(io.StringIO()):
+    from runner.torcs_runner import TorcsRunner  # noqa: E402
 
 
 DEFAULT_TRACK_NAME = "g-track-3"
 DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "models" / "checkpoints" / "agent4_hybrid_ppo"
 DEFAULT_TENSORBOARD_DIR = PROJECT_ROOT / "models" / "tensorboard" / "agent4_hybrid_ppo"
 DEFAULT_RUNS_DIR = PROJECT_ROOT / "models" / "training_runs" / "agent4_hybrid_ppo"
-REWARD_VERSION = "agent4_reward_v6_terminal_discipline"
+DEFAULT_PROGRESS_INTERVAL_SECONDS = 1.0
+REWARD_VERSION = "agent4_reward_v7_track_width_safe_exit"
 REWARD_WEIGHTS = {
     "progress": 0.35,
     "pace": 0.14,
@@ -53,7 +58,7 @@ REWARD_WEIGHTS = {
     "lateral_slide": 0.12,
     "residual_size": 0.05,
     "safety_shield": 0.12,
-    "edge_pressure": 0.18,
+    "unsafe_edge_exit": 0.26,
     "off_track": 260.0,
     "crash": 320.0,
     "backwards": 260.0,
@@ -115,6 +120,87 @@ def write_json(path, payload):
         handle.write("\n")
 
 
+@contextlib.contextmanager
+def maybe_suppress_stdout(enabled):
+    if not enabled:
+        yield
+        return
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        yield
+
+
+def format_duration(seconds):
+    if seconds is None or not math.isfinite(float(seconds)):
+        return "--:--:--"
+
+    seconds = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+class TrainingProgressState:
+    def __init__(self):
+        self.episodes_seen = 0
+        self.last_episode = None
+        self.best_clean_lap_time = None
+
+    def record_episode(self, row):
+        self.episodes_seen = int(row.get("episodes_seen", self.episodes_seen))
+        self.last_episode = dict(row)
+
+    def record_best_clean_lap(self, lap_time):
+        self.best_clean_lap_time = float(lap_time)
+
+
+def format_training_progress_line(
+    completed_steps,
+    total_steps,
+    elapsed_seconds,
+    progress_state,
+    *,
+    width=28,
+):
+    total_steps = max(1, int(total_steps))
+    completed_steps = max(0, min(int(completed_steps), total_steps))
+    fraction = completed_steps / total_steps
+    filled = min(width, int(round(width * fraction)))
+    bar = "#" * filled + "-" * (width - filled)
+    percent = fraction * 100.0
+
+    if completed_steps > 0 and elapsed_seconds > 0.0:
+        steps_per_second = completed_steps / elapsed_seconds
+        eta_seconds = (total_steps - completed_steps) / max(steps_per_second, 1e-9)
+        eta = format_duration(eta_seconds)
+        rate = f"{steps_per_second:,.0f} step/s"
+    else:
+        eta = "--:--:--"
+        rate = "-- step/s"
+
+    last_episode = progress_state.last_episode
+    if last_episode is None:
+        episode_text = "episodes=0"
+    else:
+        episode_text = (
+            f"ep {progress_state.episodes_seen} "
+            f"{last_episode.get('termination_reason', 'running')} "
+            f"{float(last_episode.get('distance_m', 0.0)):.0f}m "
+            f"R={float(last_episode.get('reward', 0.0)):.0f} "
+            f"laps={int(last_episode.get('laps_completed', 0))}"
+        )
+
+    best_text = ""
+    if progress_state.best_clean_lap_time is not None:
+        best_text = f" | best={progress_state.best_clean_lap_time:.3f}s"
+
+    return (
+        f"Training [{bar}] {percent:5.1f}% | "
+        f"{completed_steps:,}/{total_steps:,} steps | {rate} | "
+        f"ETA {eta} | {episode_text}{best_text}"
+    )
+
+
 def tensorboard_is_available():
     return importlib.util.find_spec("tensorboard") is not None
 
@@ -161,6 +247,9 @@ def build_training_metadata(args, *, resumed_from=None):
         "checkpoint_freq": args.checkpoint_freq,
         "tensorboard_requested": not args.no_tensorboard,
         "tensorboard_available": tensorboard_is_available(),
+        "progress_bar_enabled": not args.no_progress_bar,
+        "verbose_training": args.verbose_training,
+        "show_torcs_reset_log": args.show_torcs_reset_log,
         "seed": args.seed,
         "model_path": str(args.model_path),
         "best_model_path": str(args.best_model_path),
@@ -314,6 +403,20 @@ def calculate_lap_completion_fraction(episode_distance_m, racing_line=None):
     return clamp(float(episode_distance_m) / float(track_length), 0.0, 1.0)
 
 
+def calculate_unsafe_edge_exit_pressure(track_position, lateral_speed, angle, action):
+    edge_amount = clamp((abs(track_position) - 0.92) / 0.16, 0.0, 1.0)
+    if edge_amount <= 0.0:
+        return 0.0
+
+    steering_outward = float(action.get("steer", 0.0)) * track_position > 0.03
+    unstable_at_edge = abs(lateral_speed) > 7.0 or abs(angle) > 0.34
+    if not steering_outward and not unstable_at_edge:
+        return 0.0
+
+    throttle_pressure = 1.25 if float(action.get("accel", 0.0)) > 0.70 else 1.0
+    return edge_amount * throttle_pressure
+
+
 def calculate_hybrid_reward(
     telemetry,
     action,
@@ -376,8 +479,13 @@ def calculate_hybrid_reward(
     reward -= clamp(abs(lateral_speed) / 22.0, 0.0, 1.0) * REWARD_WEIGHTS["lateral_slide"]
     reward -= clamp(residual_pressure, 0.0, 1.0) * REWARD_WEIGHTS["residual_size"]
     reward -= (
-        clamp((abs(track_position) - 0.92) / 0.16, 0.0, 1.0)
-        * REWARD_WEIGHTS["edge_pressure"]
+        calculate_unsafe_edge_exit_pressure(
+            track_position,
+            lateral_speed,
+            angle,
+            action,
+        )
+        * REWARD_WEIGHTS["unsafe_edge_exit"]
     )
 
     if action.get("agent4_safety_shield_active", False):
@@ -423,6 +531,7 @@ def make_training_env_class(gym, spaces):
             manual_start=False,
             relaunch_frequency=0,
             reset_retries=2,
+            quiet_reset_log=True,
         ):
             super().__init__()
             self.track_name = track_name
@@ -432,6 +541,7 @@ def make_training_env_class(gym, spaces):
             self.manual_start = manual_start
             self.relaunch_frequency = relaunch_frequency
             self.reset_retries = reset_retries
+            self.quiet_reset_log = quiet_reset_log
             self.runner = TorcsRunner()
             self.base_agent = MapAwareAgent(racing_line_path=racing_line_path)
             self.action_space = spaces.Box(
@@ -671,7 +781,8 @@ def make_training_env_class(gym, spaces):
             for attempt in range(self.reset_retries + 1):
                 try:
                     assert self.runner.env is not None
-                    return self.runner.env.reset(relaunch=relaunch)
+                    with maybe_suppress_stdout(self.quiet_reset_log):
+                        return self.runner.env.reset(relaunch=relaunch)
                 except Exception as error:
                     last_error = error
                     print(
@@ -713,9 +824,10 @@ def make_training_env_class(gym, spaces):
 
 def make_episode_summary_callback_class(BaseCallback):
     class EpisodeSummaryCallback(BaseCallback):
-        def __init__(self, run_dir, verbose=0):
+        def __init__(self, run_dir, progress_state=None, verbose=0):
             super().__init__(verbose=verbose)
             self.run_dir = Path(run_dir)
+            self.progress_state = progress_state
             self.csv_file = None
             self.writer = None
             self.episodes_seen = 0
@@ -764,6 +876,8 @@ def make_episode_summary_callback_class(BaseCallback):
                 }
                 self.writer.writerow(row)
                 self.csv_file.flush()
+                if self.progress_state is not None:
+                    self.progress_state.record_episode(row)
 
                 if self.verbose:
                     print(
@@ -787,10 +901,11 @@ def make_episode_summary_callback_class(BaseCallback):
 
 def make_best_clean_lap_callback_class(BaseCallback):
     class BestCleanLapCallback(BaseCallback):
-        def __init__(self, best_model_path, metadata, verbose=0):
+        def __init__(self, best_model_path, metadata, progress_state=None, verbose=0):
             super().__init__(verbose=verbose)
             self.best_model_path = Path(best_model_path)
             self.metadata = dict(metadata)
+            self.progress_state = progress_state
             self.best_lap_time = None
 
         def _on_step(self):
@@ -815,6 +930,8 @@ def make_best_clean_lap_callback_class(BaseCallback):
                     continue
 
                 self.best_lap_time = lap_time
+                if self.progress_state is not None:
+                    self.progress_state.record_best_clean_lap(lap_time)
                 self.best_model_path.parent.mkdir(parents=True, exist_ok=True)
                 self.model.save(str(self.best_model_path))
                 best_metadata = {
@@ -838,6 +955,67 @@ def make_best_clean_lap_callback_class(BaseCallback):
     return BestCleanLapCallback
 
 
+def make_console_progress_callback_class(BaseCallback):
+    class ConsoleProgressCallback(BaseCallback):
+        def __init__(
+            self,
+            total_timesteps,
+            progress_state,
+            *,
+            interval_seconds=DEFAULT_PROGRESS_INTERVAL_SECONDS,
+            verbose=0,
+        ):
+            super().__init__(verbose=verbose)
+            self.total_timesteps = int(total_timesteps)
+            self.progress_state = progress_state
+            self.interval_seconds = float(interval_seconds)
+            self.start_timestep = 0
+            self.start_time = 0.0
+            self.last_render_time = 0.0
+            self.previous_line_length = 0
+
+        def _on_training_start(self):
+            self.start_timestep = self.num_timesteps
+            self.start_time = time.monotonic()
+            self.last_render_time = 0.0
+            self._render(force=True)
+
+        def _on_step(self):
+            now = time.monotonic()
+            if now - self.last_render_time >= self.interval_seconds:
+                self._render(now=now)
+            return True
+
+        def _on_training_end(self):
+            self._render(force=True)
+            if self.previous_line_length:
+                print()
+
+        def _render(self, *, now=None, force=False):
+            now = time.monotonic() if now is None else now
+            if not force and now - self.last_render_time < self.interval_seconds:
+                return
+
+            completed_steps = self.num_timesteps - self.start_timestep
+            line = format_training_progress_line(
+                completed_steps,
+                self.total_timesteps,
+                now - self.start_time,
+                self.progress_state,
+            )
+            terminal_width = shutil.get_terminal_size((120, 20)).columns
+            max_width = max(60, terminal_width - 1)
+            if len(line) > max_width:
+                line = f"{line[: max_width - 3]}..."
+
+            padding = " " * max(0, self.previous_line_length - len(line))
+            print(f"\r{line}{padding}", end="", flush=True)
+            self.previous_line_length = len(line)
+            self.last_render_time = now
+
+    return ConsoleProgressCallback
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train Agent 4 as a PPO residual on top of Agent 3.",
@@ -855,6 +1033,21 @@ def parse_args():
             "Disable Stable-Baselines3 TensorBoard logging. TensorBoard is "
             "enabled by default when the package is installed."
         ),
+    )
+    parser.add_argument(
+        "--no-progress-bar",
+        action="store_true",
+        help="Disable the clean one-line console progress display.",
+    )
+    parser.add_argument(
+        "--verbose-training",
+        action="store_true",
+        help="Show Stable-Baselines3's detailed PPO training tables.",
+    )
+    parser.add_argument(
+        "--show-torcs-reset-log",
+        action="store_true",
+        help="Show TORCS reset countdown/socket logs instead of hiding them.",
     )
     parser.add_argument("--track", default=DEFAULT_TRACK_NAME)
     parser.add_argument("--resume", action="store_true")
@@ -936,6 +1129,7 @@ def main():
         manual_start=args.manual_start,
         relaunch_frequency=args.relaunch_frequency,
         reset_retries=args.reset_retries,
+        quiet_reset_log=not args.show_torcs_reset_log,
     )
     env.action_space.seed(args.seed)
     env.observation_space.seed(args.seed)
@@ -961,12 +1155,13 @@ def main():
             device=args.device,
             tensorboard_log=tensorboard_log,
         )
+        model.verbose = int(args.verbose_training)
         reset_num_timesteps = False
     else:
         model = PPO(
             "MlpPolicy",
             env,
-            verbose=1,
+            verbose=int(args.verbose_training),
             tensorboard_log=tensorboard_log,
             n_steps=args.n_steps,
             batch_size=args.batch_size,
@@ -988,6 +1183,7 @@ def main():
     write_json(run_dir / "training_metadata.json", metadata)
     write_json(metadata_path_for_model(args.model_path), metadata)
 
+    progress_state = TrainingProgressState()
     checkpoint_callback = CheckpointCallback(
         save_freq=args.checkpoint_freq,
         save_path=str(args.checkpoint_dir),
@@ -997,13 +1193,29 @@ def main():
     )
     EpisodeSummaryCallback = make_episode_summary_callback_class(BaseCallback)
     BestCleanLapCallback = make_best_clean_lap_callback_class(BaseCallback)
-    callback = CallbackList(
-        [
-            checkpoint_callback,
-            EpisodeSummaryCallback(run_dir, verbose=1),
-            BestCleanLapCallback(args.best_model_path, metadata, verbose=1),
-        ]
-    )
+    callbacks = [
+        checkpoint_callback,
+        EpisodeSummaryCallback(
+            run_dir,
+            progress_state=progress_state,
+            verbose=int(args.verbose_training),
+        ),
+        BestCleanLapCallback(
+            args.best_model_path,
+            metadata,
+            progress_state=progress_state,
+            verbose=int(args.verbose_training),
+        ),
+    ]
+    if not args.no_progress_bar and not args.verbose_training:
+        ConsoleProgressCallback = make_console_progress_callback_class(BaseCallback)
+        callbacks.append(
+            ConsoleProgressCallback(
+                args.total_timesteps,
+                progress_state,
+            )
+        )
+    callback = CallbackList(callbacks)
 
     try:
         model.learn(
