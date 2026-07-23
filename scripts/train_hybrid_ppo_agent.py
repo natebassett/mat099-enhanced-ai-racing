@@ -27,9 +27,19 @@ from agents.hybrid_ppo_agent import (  # noqa: E402
     DEFAULT_BEST_MODEL_PATH,
     DEFAULT_MODEL_PATH,
     FEATURE_NAMES,
+    CRITICAL_RISK_PRESSURE,
+    HIGH_RISK_PRESSURE,
+    LOW_SPEED_RECOVERY_ANGLE_LIMIT,
+    LOW_SPEED_RECOVERY_SLIDE_LIMIT,
+    LOW_SPEED_RECOVERY_SPEED_LIMIT,
+    LOW_SPEED_RECOVERY_TRACK_LIMIT,
     MAX_ACCEL_RESIDUAL,
     MAX_BRAKE_RESIDUAL,
     MAX_STEER_RESIDUAL,
+    RISK_ANGLE_LIMIT,
+    RISK_FRONT_SENSOR_LIMIT,
+    RISK_SLIDE_LIMIT,
+    RISK_TRACK_LIMIT,
     apply_hybrid_residual,
     build_hybrid_ppo_observation,
     get_track_sensors,
@@ -46,7 +56,8 @@ DEFAULT_TENSORBOARD_DIR = PROJECT_ROOT / "models" / "tensorboard" / "agent4_hybr
 DEFAULT_RUNS_DIR = PROJECT_ROOT / "models" / "training_runs" / "agent4_hybrid_ppo"
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 1.0
 DEFAULT_LOG_STD_INIT = -1.2
-REWARD_VERSION = "agent4_reward_v7_track_width_safe_exit"
+DEFAULT_CHECKPOINT_FREQ = 50_000
+REWARD_VERSION = "agent4_reward_v12_failure_pressure_recovery"
 REWARD_WEIGHTS = {
     "progress": 0.35,
     "pace": 0.14,
@@ -60,11 +71,13 @@ REWARD_WEIGHTS = {
     "residual_size": 0.05,
     "safety_shield": 0.12,
     "unsafe_edge_exit": 0.26,
+    "unsafe_residual": 0.35,
     "off_track": 260.0,
     "crash": 320.0,
     "backwards": 260.0,
-    "stuck": 180.0,
-    "incomplete_lap_failure": 220.0,
+    "stuck": 300.0,
+    "incomplete_lap_failure_floor": 180.0,
+    "incomplete_lap_failure": 260.0,
     "lap_completed": 450.0,
 }
 STUCK_SPEED_LIMIT_KMH = 5.0
@@ -72,6 +85,15 @@ STUCK_PROGRESS_LIMIT_M = 0.20
 STUCK_SECONDS_LIMIT = 3.0
 LINE_GUIDE_FREE_ERROR = 0.18
 LINE_GUIDE_LARGE_ERROR = 0.50
+TEACHER_CONFIDENCE_MIN = 0.35
+TEACHER_EDGE_START = 0.42
+TEACHER_EDGE_SPAN = 0.24
+TEACHER_LATERAL_ACCEL_START = 9.5
+TEACHER_LATERAL_ACCEL_SPAN = 4.0
+TEACHER_SPEED_RELAXATION_KMH = 45.0
+TEACHER_LOOKAHEAD_SPEED_RELAXATION_KMH = 25.0
+SPEED_LOOKAHEAD_DISTANCES_M = (35.0, 70.0, 105.0)
+SPEED_LOOKAHEAD_ALLOWANCES_KMH = (4.0, 14.0, 28.0)
 
 
 def import_training_dependencies():
@@ -292,6 +314,29 @@ def build_training_metadata(args, *, resumed_from=None):
             "role": "soft_teacher_prior_not_optimal_real_world_racing_line",
             "free_error": LINE_GUIDE_FREE_ERROR,
             "large_error": LINE_GUIDE_LARGE_ERROR,
+            "teacher_confidence_min": TEACHER_CONFIDENCE_MIN,
+            "teacher_edge_start": TEACHER_EDGE_START,
+            "teacher_lateral_accel_start": TEACHER_LATERAL_ACCEL_START,
+            "teacher_speed_relaxation_kmh": TEACHER_SPEED_RELAXATION_KMH,
+            "teacher_lookahead_speed_relaxation_kmh": (
+                TEACHER_LOOKAHEAD_SPEED_RELAXATION_KMH
+            ),
+            "speed_lookahead_distances_m": list(SPEED_LOOKAHEAD_DISTANCES_M),
+            "speed_lookahead_allowances_kmh": list(SPEED_LOOKAHEAD_ALLOWANCES_KMH),
+        },
+        "global_safety": {
+            "role": "whole-track PPO residual guardrail, not sector-specific hand-holding",
+            "risk_track_limit": RISK_TRACK_LIMIT,
+            "risk_angle_limit_rad": RISK_ANGLE_LIMIT,
+            "risk_slide_limit_kmh": RISK_SLIDE_LIMIT,
+            "risk_front_sensor_limit_m": RISK_FRONT_SENSOR_LIMIT,
+            "high_risk_pressure": HIGH_RISK_PRESSURE,
+            "critical_risk_pressure": CRITICAL_RISK_PRESSURE,
+            "low_speed_recovery_speed_limit_kmh": LOW_SPEED_RECOVERY_SPEED_LIMIT,
+            "low_speed_recovery_track_limit": LOW_SPEED_RECOVERY_TRACK_LIMIT,
+            "low_speed_recovery_angle_limit_rad": LOW_SPEED_RECOVERY_ANGLE_LIMIT,
+            "low_speed_recovery_slide_limit_kmh": LOW_SPEED_RECOVERY_SLIDE_LIMIT,
+            "shield_steps_count": "actual residual interventions, not every risky state",
         },
         "reward_weights": REWARD_WEIGHTS,
         "command": ORIGINAL_COMMAND,
@@ -398,17 +443,92 @@ def get_racing_line_context(telemetry, racing_line=None):
     if racing_line is None:
         return {
             "line_error": 0.0,
+            "target_track_pos": 0.0,
             "target_speed": 216.0,
+            "lookahead_target_speed": 216.0,
+            "reward_target_speed": 216.0,
             "curvature": 0.0,
+            "teacher_confidence": 1.0,
+            "teacher_lateral_accel_mps2": 0.0,
         }
 
-    waypoint = racing_line.lookup(float(telemetry.get("distFromStart", 0.0)))
-    return {
+    distance = float(telemetry.get("distFromStart", 0.0))
+    waypoint = racing_line.lookup(distance)
+    context = {
         "line_error": float(telemetry.get("trackPos", 0.0))
         - float(waypoint.get("target_track_pos", 0.0)),
+        "target_track_pos": float(waypoint.get("target_track_pos", 0.0)),
         "target_speed": float(waypoint.get("target_speed_kmh", 216.0)),
+        "lookahead_target_speed": calculate_lookahead_target_speed(
+            racing_line,
+            distance,
+            waypoint,
+        ),
         "curvature": float(waypoint.get("curvature", 0.0)),
     }
+    context["teacher_lateral_accel_mps2"] = calculate_teacher_lateral_accel(context)
+    context["teacher_confidence"] = calculate_teacher_confidence(context)
+    context["reward_target_speed"] = calculate_reward_target_speed(context)
+    return context
+
+
+def calculate_lookahead_target_speed(racing_line, distance, waypoint):
+    current_target = float(waypoint.get("target_speed_kmh", 216.0))
+    preview_limits = [current_target]
+    for lookahead_m, allowance_kmh in zip(
+        SPEED_LOOKAHEAD_DISTANCES_M,
+        SPEED_LOOKAHEAD_ALLOWANCES_KMH,
+    ):
+        preview = racing_line.lookup(float(distance) + lookahead_m)
+        preview_limits.append(
+            float(preview.get("target_speed_kmh", current_target)) + allowance_kmh
+        )
+    return max(40.0, min(preview_limits))
+
+
+def calculate_teacher_lateral_accel(line_context):
+    target_speed_mps = max(0.0, float(line_context["target_speed"]) / 3.6)
+    return target_speed_mps * target_speed_mps * abs(float(line_context["curvature"]))
+
+
+def calculate_teacher_confidence(line_context):
+    edge_pressure = clamp(
+        (abs(float(line_context["target_track_pos"])) - TEACHER_EDGE_START)
+        / TEACHER_EDGE_SPAN,
+        0.0,
+        1.0,
+    )
+    lateral_accel = float(
+        line_context.get("teacher_lateral_accel_mps2")
+        or calculate_teacher_lateral_accel(line_context)
+    )
+    lateral_pressure = clamp(
+        (lateral_accel - TEACHER_LATERAL_ACCEL_START)
+        / TEACHER_LATERAL_ACCEL_SPAN,
+        0.0,
+        1.0,
+    )
+    ambition_pressure = max(edge_pressure, lateral_pressure)
+    return clamp(
+        1.0 - (1.0 - TEACHER_CONFIDENCE_MIN) * ambition_pressure,
+        TEACHER_CONFIDENCE_MIN,
+        1.0,
+    )
+
+
+def calculate_reward_target_speed(line_context):
+    target_speed = float(line_context["target_speed"])
+    lookahead_target_speed = float(
+        line_context.get("lookahead_target_speed", target_speed)
+    )
+    teacher_confidence = float(line_context.get("teacher_confidence", 1.0))
+    local_target = target_speed - (1.0 - teacher_confidence) * (
+        TEACHER_SPEED_RELAXATION_KMH
+    )
+    preview_target = lookahead_target_speed - (1.0 - teacher_confidence) * (
+        TEACHER_LOOKAHEAD_SPEED_RELAXATION_KMH
+    )
+    return max(40.0, min(local_target, preview_target))
 
 
 def calculate_lap_completion_fraction(episode_distance_m, racing_line=None):
@@ -425,6 +545,7 @@ def calculate_lap_completion_fraction(episode_distance_m, racing_line=None):
 def build_episode_diagnostics(telemetry, episode_distance_m, racing_line=None):
     track_sensors = get_track_sensors(telemetry)
     min_track_sensor = min(track_sensors) if track_sensors else 0.0
+    line_context = get_racing_line_context(telemetry, racing_line)
     return {
         "lap_completion_fraction": calculate_lap_completion_fraction(
             episode_distance_m,
@@ -436,6 +557,14 @@ def build_episode_diagnostics(telemetry, episode_distance_m, racing_line=None):
         "final_speed_x_kmh": float(telemetry.get("speedX", 0.0)),
         "final_speed_y_kmh": float(telemetry.get("speedY", 0.0)),
         "final_min_track_sensor_m": float(min_track_sensor),
+        "final_teacher_target_pos": line_context["target_track_pos"],
+        "final_teacher_target_speed_kmh": line_context["target_speed"],
+        "final_teacher_lookahead_target_speed_kmh": line_context[
+            "lookahead_target_speed"
+        ],
+        "final_reward_target_speed_kmh": line_context["reward_target_speed"],
+        "final_teacher_confidence": line_context["teacher_confidence"],
+        "final_teacher_line_error": line_context["line_error"],
     }
 
 
@@ -451,6 +580,14 @@ def calculate_unsafe_edge_exit_pressure(track_position, lateral_speed, angle, ac
 
     throttle_pressure = 1.25 if float(action.get("accel", 0.0)) > 0.70 else 1.0
     return edge_amount * throttle_pressure
+
+
+def calculate_incomplete_lap_failure_penalty(lap_fraction):
+    remaining_lap = clamp(1.0 - float(lap_fraction), 0.0, 1.0)
+    return (
+        REWARD_WEIGHTS["incomplete_lap_failure_floor"]
+        + remaining_lap * REWARD_WEIGHTS["incomplete_lap_failure"]
+    )
 
 
 def calculate_hybrid_reward(
@@ -472,7 +609,8 @@ def calculate_hybrid_reward(
     damage = float(telemetry.get("damage", previous_damage))
     line_context = get_racing_line_context(telemetry, racing_line)
     line_error = abs(line_context["line_error"])
-    target_speed = max(40.0, line_context["target_speed"])
+    teacher_confidence = float(line_context["teacher_confidence"])
+    target_speed = max(40.0, line_context["reward_target_speed"])
     curvature_abs = abs(line_context["curvature"])
     progress_delta = calculate_progress_delta(
         previous_telemetry,
@@ -503,13 +641,17 @@ def calculate_hybrid_reward(
         / (target_speed + 15.0)
         * REWARD_WEIGHTS["aligned_speed"]
     )
+    free_line_error = LINE_GUIDE_FREE_ERROR + (1.0 - teacher_confidence) * 0.28
+    large_line_error = LINE_GUIDE_LARGE_ERROR + (1.0 - teacher_confidence) * 0.35
     reward -= (
-        max(0.0, line_error - LINE_GUIDE_FREE_ERROR)
+        max(0.0, line_error - free_line_error)
         * REWARD_WEIGHTS["racing_line_error"]
+        * teacher_confidence
     )
     reward -= (
-        max(0.0, line_error - LINE_GUIDE_LARGE_ERROR)
+        max(0.0, line_error - large_line_error)
         * REWARD_WEIGHTS["large_racing_line_error"]
+        * teacher_confidence
     )
     reward -= (clamp(overspeed / 70.0, 0.0, 1.0) ** 2) * REWARD_WEIGHTS["overspeed"]
     reward -= clamp(abs(lateral_speed) / 22.0, 0.0, 1.0) * REWARD_WEIGHTS["lateral_slide"]
@@ -522,6 +664,10 @@ def calculate_hybrid_reward(
             action,
         )
         * REWARD_WEIGHTS["unsafe_edge_exit"]
+    )
+    reward -= (
+        clamp(float(action.get("agent4_unsafe_residual_pressure", 0.0)), 0.0, 1.0)
+        * REWARD_WEIGHTS["unsafe_residual"]
     )
 
     if action.get("agent4_safety_shield_active", False):
@@ -545,7 +691,7 @@ def calculate_hybrid_reward(
             episode_distance_m,
             racing_line,
         )
-        reward -= (1.0 - lap_fraction) * REWARD_WEIGHTS["incomplete_lap_failure"]
+        reward -= calculate_incomplete_lap_failure_penalty(lap_fraction)
     if completed_lap is not None:
         reward += REWARD_WEIGHTS["lap_completed"]
 
@@ -606,6 +752,8 @@ def make_training_env_class(gym, spaces):
             self.episode_max_speed = 0.0
             self.episode_off_track_steps = 0
             self.episode_shield_steps = 0
+            self.episode_unsafe_residual_steps = 0
+            self.episode_max_unsafe_residual_pressure = 0.0
             self.stopped_seconds = 0.0
             self.episode_max_stopped_seconds = 0.0
             self.episodes_started = 0
@@ -643,6 +791,8 @@ def make_training_env_class(gym, spaces):
             self.episode_max_speed = float(self.current_telemetry.get("speedX", 0.0))
             self.episode_off_track_steps = 0
             self.episode_shield_steps = 0
+            self.episode_unsafe_residual_steps = 0
+            self.episode_max_unsafe_residual_pressure = 0.0
             self.stopped_seconds = 0.0
             self.episode_max_stopped_seconds = 0.0
             self.current_base_action = self.base_agent.act(
@@ -724,6 +874,15 @@ def make_training_env_class(gym, spaces):
                 self.episode_off_track_steps += 1
             if action.get("agent4_safety_shield_active", False):
                 self.episode_shield_steps += 1
+            unsafe_residual_pressure = float(
+                action.get("agent4_unsafe_residual_pressure", 0.0)
+            )
+            if unsafe_residual_pressure > 0.01:
+                self.episode_unsafe_residual_steps += 1
+            self.episode_max_unsafe_residual_pressure = max(
+                self.episode_max_unsafe_residual_pressure,
+                unsafe_residual_pressure,
+            )
 
             terminated = bool(done)
             terminated = terminated or off_track
@@ -780,6 +939,10 @@ def make_training_env_class(gym, spaces):
                     "best_lap_time_seconds": self.lap_tracker.best_lap_time,
                     "off_track_steps": self.episode_off_track_steps,
                     "safety_shield_steps": self.episode_shield_steps,
+                    "unsafe_residual_steps": self.episode_unsafe_residual_steps,
+                    "max_unsafe_residual_pressure": (
+                        self.episode_max_unsafe_residual_pressure
+                    ),
                     "max_stopped_seconds": self.episode_max_stopped_seconds,
                     "termination_reason": reason,
                     **diagnostics,
@@ -896,6 +1059,8 @@ def make_episode_summary_callback_class(BaseCallback):
                     "best_lap_time_seconds",
                     "off_track_steps",
                     "safety_shield_steps",
+                    "unsafe_residual_steps",
+                    "max_unsafe_residual_pressure",
                     "max_stopped_seconds",
                     "termination_reason",
                     "lap_completion_fraction",
@@ -905,6 +1070,12 @@ def make_episode_summary_callback_class(BaseCallback):
                     "final_speed_x_kmh",
                     "final_speed_y_kmh",
                     "final_min_track_sensor_m",
+                    "final_teacher_target_pos",
+                    "final_teacher_target_speed_kmh",
+                    "final_teacher_lookahead_target_speed_kmh",
+                    "final_reward_target_speed_kmh",
+                    "final_teacher_confidence",
+                    "final_teacher_line_error",
                 ],
             )
             self.writer.writeheader()
@@ -1070,7 +1241,7 @@ def parse_args():
         description="Train Agent 4 as a PPO residual on top of Agent 3.",
     )
     parser.add_argument("--total-timesteps", type=int, default=100_000)
-    parser.add_argument("--checkpoint-freq", type=int, default=10_000)
+    parser.add_argument("--checkpoint-freq", type=int, default=DEFAULT_CHECKPOINT_FREQ)
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--best-model-path", type=Path, default=DEFAULT_BEST_MODEL_PATH)
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
@@ -1135,7 +1306,7 @@ def parse_args():
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--clip-range", type=float, default=0.15)
-    parser.add_argument("--ent-coef", type=float, default=0.001)
+    parser.add_argument("--ent-coef", type=float, default=0.003)
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument(
         "--log-std-init",

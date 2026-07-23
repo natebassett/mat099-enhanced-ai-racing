@@ -34,6 +34,16 @@ DEFAULT_RESIDUAL_SCALE = 0.1
 SAFE_TRACK_LIMIT = 0.84
 HARD_TRACK_LIMIT = 0.96
 FINITE_DEFAULT = 0.0
+RISK_TRACK_LIMIT = 0.84
+RISK_ANGLE_LIMIT = 0.38
+RISK_SLIDE_LIMIT = 8.0
+RISK_FRONT_SENSOR_LIMIT = 22.0
+HIGH_RISK_PRESSURE = 0.55
+CRITICAL_RISK_PRESSURE = 0.75
+LOW_SPEED_RECOVERY_SPEED_LIMIT = 8.0
+LOW_SPEED_RECOVERY_TRACK_LIMIT = 0.98
+LOW_SPEED_RECOVERY_ANGLE_LIMIT = 0.70
+LOW_SPEED_RECOVERY_SLIDE_LIMIT = 4.0
 
 FEATURE_NAMES = [
     "speed_x",
@@ -81,6 +91,7 @@ RESIDUAL_TELEMETRY_COLUMNS = [
     "finalAccel",
     "finalBrake",
     "safetyShieldActive",
+    "lowSpeedRecoveryActive",
     "policyLoaded",
 ]
 
@@ -231,49 +242,170 @@ def decode_policy_residual(raw_residual, residual_scale=1.0):
 
 
 def safety_shield_is_active(telemetry):
+    return calculate_risk_pressure(telemetry) > 0.0
+
+
+def calculate_risk_pressure(telemetry):
     track_sensors = get_track_sensors(telemetry)
     front_sensor = track_sensors[9]
     min_track_sensor = min(track_sensors) if track_sensors else front_sensor
     track_position = finite_float(telemetry.get("trackPos", 0.0))
+    angle = finite_float(telemetry.get("angle", 0.0))
+    lateral_speed = finite_float(telemetry.get("speedY", 0.0))
 
+    return max(
+        1.0 if min_track_sensor < 0.0 else 0.0,
+        clamp((abs(track_position) - RISK_TRACK_LIMIT) / 0.24, 0.0, 1.0),
+        clamp((abs(angle) - RISK_ANGLE_LIMIT) / 0.28, 0.0, 1.0),
+        clamp((abs(lateral_speed) - RISK_SLIDE_LIMIT) / 12.0, 0.0, 1.0),
+        clamp(
+            (RISK_FRONT_SENSOR_LIMIT - front_sensor) / RISK_FRONT_SENSOR_LIMIT,
+            0.0,
+            1.0,
+        ),
+    )
+
+
+def low_speed_recovery_is_active(telemetry):
+    track_sensors = get_track_sensors(telemetry)
+    min_track_sensor = min(track_sensors) if track_sensors else 0.0
     return (
-        min_track_sensor < 0.0
-        or front_sensor < 22.0
-        or abs(track_position) > SAFE_TRACK_LIMIT
-        or abs(finite_float(telemetry.get("angle", 0.0))) > 0.52
-        or abs(finite_float(telemetry.get("speedY", 0.0))) > 13.0
+        abs(finite_float(telemetry.get("speedX", 0.0)))
+        < LOW_SPEED_RECOVERY_SPEED_LIMIT
+        and min_track_sensor >= 0.0
+        and abs(finite_float(telemetry.get("trackPos", 0.0)))
+        < LOW_SPEED_RECOVERY_TRACK_LIMIT
+        and abs(finite_float(telemetry.get("angle", 0.0)))
+        < LOW_SPEED_RECOVERY_ANGLE_LIMIT
+        and abs(finite_float(telemetry.get("speedY", 0.0)))
+        < LOW_SPEED_RECOVERY_SLIDE_LIMIT
+    )
+
+
+def residual_worsens_recovery_path(residual, telemetry):
+    steer_delta = finite_float(residual[0])
+    track_position = finite_float(telemetry.get("trackPos", 0.0))
+    angle = finite_float(telemetry.get("angle", 0.0))
+
+    if abs(track_position) > RISK_TRACK_LIMIT and steer_delta * track_position > 0.0:
+        return True
+    if abs(angle) > RISK_ANGLE_LIMIT and steer_delta * angle > 0.0:
+        return True
+    return False
+
+
+def calculate_unsafe_residual_pressure(base_action, residual, telemetry):
+    steer_delta, accel_delta, brake_delta = residual
+    track_position = finite_float(telemetry.get("trackPos", 0.0))
+    angle = finite_float(telemetry.get("angle", 0.0))
+    lateral_speed = finite_float(telemetry.get("speedY", 0.0))
+    risk_pressure = calculate_risk_pressure(telemetry)
+    base_brake = finite_float(base_action.get("brake", 0.0))
+    recovery_drive_allowed = (
+        low_speed_recovery_is_active(telemetry)
+        and not residual_worsens_recovery_path(residual, telemetry)
+    )
+
+    outward_edge_pressure = 0.0
+    if abs(track_position) > RISK_TRACK_LIMIT and steer_delta * track_position > 0.0:
+        outward_edge_pressure = clamp(
+            abs(steer_delta) / MAX_STEER_RESIDUAL,
+            0.0,
+            1.0,
+        )
+
+    heading_pressure = 0.0
+    if abs(angle) > RISK_ANGLE_LIMIT and steer_delta * angle > 0.0:
+        heading_pressure = clamp(abs(steer_delta) / MAX_STEER_RESIDUAL, 0.0, 1.0)
+
+    throttle_pressure = 0.0
+    if (
+        risk_pressure > HIGH_RISK_PRESSURE
+        and accel_delta > 0.0
+        and not recovery_drive_allowed
+    ):
+        throttle_pressure = clamp(accel_delta / MAX_ACCEL_RESIDUAL, 0.0, 1.0)
+
+    brake_release_pressure = 0.0
+    if (
+        risk_pressure > HIGH_RISK_PRESSURE
+        or base_brake > 0.08
+    ) and brake_delta < 0.0 and not recovery_drive_allowed:
+        brake_release_pressure = clamp(abs(brake_delta) / MAX_BRAKE_RESIDUAL, 0.0, 1.0)
+
+    slide_pressure = 0.0
+    if abs(lateral_speed) > RISK_SLIDE_LIMIT and accel_delta > 0.0:
+        slide_pressure = clamp(accel_delta / MAX_ACCEL_RESIDUAL, 0.0, 1.0)
+
+    return max(
+        outward_edge_pressure,
+        heading_pressure,
+        throttle_pressure,
+        brake_release_pressure,
+        slide_pressure,
     )
 
 
 def shield_residual_for_safety(base_action, residual, telemetry):
     """Prevent PPO corrections from fighting Agent 3 in risky states."""
 
+    original_residual = list(residual)
     steer_delta, accel_delta, brake_delta = residual
-    if not safety_shield_is_active(telemetry):
-        return residual, False
+    risk_pressure = calculate_risk_pressure(telemetry)
+    unsafe_pressure = calculate_unsafe_residual_pressure(
+        base_action,
+        residual,
+        telemetry,
+    )
+    recovery_drive_allowed = (
+        low_speed_recovery_is_active(telemetry)
+        and not residual_worsens_recovery_path(residual, telemetry)
+    )
+    if risk_pressure <= 0.0 and unsafe_pressure <= 0.0:
+        return residual, False, risk_pressure, unsafe_pressure, recovery_drive_allowed
 
     track_position = finite_float(telemetry.get("trackPos", 0.0))
+    angle = finite_float(telemetry.get("angle", 0.0))
 
-    if abs(track_position) > SAFE_TRACK_LIMIT and steer_delta * track_position > 0.0:
+    if abs(track_position) > RISK_TRACK_LIMIT and steer_delta * track_position > 0.0:
         steer_delta = 0.0
-    else:
+    elif abs(angle) > RISK_ANGLE_LIMIT and steer_delta * angle > 0.0:
         steer_delta *= 0.35
+    elif abs(track_position) > RISK_TRACK_LIMIT and steer_delta * track_position < 0.0:
+        steer_delta *= 1.0
+    elif abs(angle) > RISK_ANGLE_LIMIT and steer_delta * angle < 0.0:
+        steer_delta *= 1.0
+    else:
+        steer_delta *= clamp(1.0 - 0.45 * risk_pressure, 0.55, 1.0)
 
-    accel_delta = min(accel_delta, 0.0)
-    if finite_float(base_action.get("brake", 0.0)) > 0.0:
+    if (
+        risk_pressure > HIGH_RISK_PRESSURE or unsafe_pressure > 0.0
+    ) and not recovery_drive_allowed:
+        accel_delta = min(accel_delta, 0.0)
+    if (
+        finite_float(base_action.get("brake", 0.0)) > 0.08
+        or risk_pressure > CRITICAL_RISK_PRESSURE
+    ) and not recovery_drive_allowed:
         brake_delta = max(brake_delta, 0.0)
 
-    return [steer_delta, accel_delta, brake_delta], True
+    residual = [steer_delta, accel_delta, brake_delta]
+    shield_active = any(
+        abs(current - original) > 1e-12
+        for current, original in zip(residual, original_residual)
+    )
+    return residual, shield_active, risk_pressure, unsafe_pressure, recovery_drive_allowed
 
 
 def apply_hybrid_residual(base_action, raw_residual, telemetry, residual_scale=1.0):
     raw_values = coerce_policy_residual(raw_residual)
     residual = decode_policy_residual(raw_residual, residual_scale)
-    residual, shield_active = shield_residual_for_safety(
-        base_action,
+    (
         residual,
-        telemetry,
-    )
+        shield_active,
+        risk_pressure,
+        unsafe_pressure,
+        recovery_active,
+    ) = shield_residual_for_safety(base_action, residual, telemetry)
 
     action = dict(base_action)
     action["steer"] = finite_clamp(
@@ -307,6 +439,9 @@ def apply_hybrid_residual(base_action, raw_residual, telemetry, residual_scale=1
     action["agent4_accel_residual"] = residual[1]
     action["agent4_brake_residual"] = residual[2]
     action["agent4_safety_shield_active"] = shield_active
+    action["agent4_risk_pressure"] = risk_pressure
+    action["agent4_unsafe_residual_pressure"] = unsafe_pressure
+    action["agent4_low_speed_recovery_active"] = recovery_active
 
     return action
 
@@ -381,7 +516,16 @@ class HybridPpoAgent:
             "safety_shield": {
                 "safe_track_limit": SAFE_TRACK_LIMIT,
                 "hard_track_limit": HARD_TRACK_LIMIT,
-                "front_sensor_limit": 22.0,
+                "risk_track_limit": RISK_TRACK_LIMIT,
+                "risk_angle_limit": RISK_ANGLE_LIMIT,
+                "risk_slide_limit": RISK_SLIDE_LIMIT,
+                "risk_front_sensor_limit": RISK_FRONT_SENSOR_LIMIT,
+                "high_risk_pressure": HIGH_RISK_PRESSURE,
+                "critical_risk_pressure": CRITICAL_RISK_PRESSURE,
+                "low_speed_recovery_speed_limit": LOW_SPEED_RECOVERY_SPEED_LIMIT,
+                "low_speed_recovery_track_limit": LOW_SPEED_RECOVERY_TRACK_LIMIT,
+                "low_speed_recovery_angle_limit": LOW_SPEED_RECOVERY_ANGLE_LIMIT,
+                "low_speed_recovery_slide_limit": LOW_SPEED_RECOVERY_SLIDE_LIMIT,
             },
         }
 
@@ -494,6 +638,7 @@ class HybridPpoAgent:
                 action["accel"],
                 action["brake"],
                 action["agent4_safety_shield_active"],
+                action["agent4_low_speed_recovery_active"],
                 action["agent4_policy_loaded"],
             ]
         )

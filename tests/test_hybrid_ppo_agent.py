@@ -16,6 +16,7 @@ from agents.hybrid_ppo_agent import (  # noqa: E402
     FEATURE_NAMES,
     HybridPpoAgent,
     MAX_ACCEL_RESIDUAL,
+    MAX_BRAKE_RESIDUAL,
     MAX_STEER_RESIDUAL,
     apply_hybrid_residual,
     build_hybrid_ppo_observation,
@@ -157,6 +158,82 @@ class HybridPpoAgentTests(unittest.TestCase):
         self.assertEqual(action["brake"], 0.20)
         self.assertEqual(action["accel"], 0.0)
         self.assertTrue(action["agent4_safety_shield_active"])
+
+    def test_safety_shield_blocks_unsafe_residuals_away_from_track_edge(self):
+        base_action = {
+            "steer": 0.0,
+            "accel": 0.40,
+            "brake": 0.10,
+            "gear": 3,
+            "terminate": False,
+        }
+
+        action = apply_hybrid_residual(
+            base_action,
+            [1.0, 1.0, -1.0],
+            make_telemetry(angle=0.45, trackPos=0.0),
+        )
+
+        self.assertAlmostEqual(
+            action["agent4_steer_residual"],
+            MAX_STEER_RESIDUAL * 0.35,
+        )
+        self.assertEqual(action["agent4_accel_residual"], 0.0)
+        self.assertEqual(action["agent4_brake_residual"], 0.0)
+        self.assertEqual(action["brake"], 0.10)
+        self.assertGreater(action["agent4_unsafe_residual_pressure"], 0.0)
+        self.assertTrue(action["agent4_safety_shield_active"])
+
+    def test_safety_shield_allows_inward_edge_correction_without_intervention(self):
+        base_action = {
+            "steer": 0.0,
+            "accel": 0.50,
+            "brake": 0.0,
+            "gear": 3,
+            "terminate": False,
+        }
+
+        action = apply_hybrid_residual(
+            base_action,
+            [-1.0, 1.0, -1.0],
+            make_telemetry(trackPos=0.95),
+        )
+
+        self.assertAlmostEqual(action["agent4_steer_residual"], -MAX_STEER_RESIDUAL)
+        self.assertAlmostEqual(action["agent4_accel_residual"], MAX_ACCEL_RESIDUAL)
+        self.assertLess(action["agent4_brake_residual"], 0.0)
+        self.assertEqual(action["brake"], 0.0)
+        self.assertGreater(action["agent4_risk_pressure"], 0.0)
+        self.assertLess(action["agent4_risk_pressure"], 1.0)
+        self.assertFalse(action["agent4_safety_shield_active"])
+
+    def test_safety_shield_allows_low_speed_recovery_drive(self):
+        base_action = {
+            "steer": 0.0,
+            "accel": 0.0,
+            "brake": 0.20,
+            "gear": 1,
+            "terminate": False,
+        }
+
+        action = apply_hybrid_residual(
+            base_action,
+            [-1.0, 1.0, -1.0],
+            make_telemetry(
+                speedX=0.4,
+                angle=0.05,
+                trackPos=0.90,
+                track=[4.0] * 19,
+            ),
+        )
+
+        self.assertAlmostEqual(action["agent4_steer_residual"], -MAX_STEER_RESIDUAL)
+        self.assertAlmostEqual(action["agent4_accel_residual"], MAX_ACCEL_RESIDUAL)
+        self.assertAlmostEqual(action["agent4_brake_residual"], -MAX_BRAKE_RESIDUAL)
+        self.assertGreater(action["accel"], 0.0)
+        self.assertEqual(action["brake"], 0.0)
+        self.assertTrue(action["agent4_low_speed_recovery_active"])
+        self.assertFalse(action["agent4_safety_shield_active"])
 
     def test_untrained_agent_falls_back_to_zero_residual(self):
         with tempfile.TemporaryDirectory() as directory:
