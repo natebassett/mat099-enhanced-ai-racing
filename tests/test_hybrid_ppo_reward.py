@@ -95,6 +95,30 @@ class HybridPpoRewardTests(unittest.TestCase):
         self.assertIn("ETA 00:00:10", line)
         self.assertIn("ep 3 off_track 1200m R=-140 laps=0", line)
 
+    def test_episode_diagnostics_capture_failure_location_and_stability(self):
+        telemetry = make_telemetry(
+            speedX=132.0,
+            speedY=7.5,
+            angle=0.28,
+            trackPos=1.08,
+            track=[-1.0] + [200.0] * 18,
+            distFromStart=540.0,
+        )
+
+        diagnostics = train_hybrid_ppo_agent.build_episode_diagnostics(
+            telemetry,
+            episode_distance_m=250.0,
+            racing_line=FakeRacingLine(),
+        )
+
+        self.assertAlmostEqual(diagnostics["lap_completion_fraction"], 0.25)
+        self.assertEqual(diagnostics["final_dist_from_start_m"], 540.0)
+        self.assertEqual(diagnostics["final_track_pos"], 1.08)
+        self.assertEqual(diagnostics["final_angle_rad"], 0.28)
+        self.assertEqual(diagnostics["final_speed_x_kmh"], 132.0)
+        self.assertEqual(diagnostics["final_speed_y_kmh"], 7.5)
+        self.assertEqual(diagnostics["final_min_track_sensor_m"], -1.0)
+
     def test_faster_progress_receives_higher_reward(self):
         previous = make_telemetry(distRaced=100.0, curLapTime=1.0)
         slow = make_telemetry(

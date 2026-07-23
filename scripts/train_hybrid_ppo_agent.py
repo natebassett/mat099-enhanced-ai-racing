@@ -45,6 +45,7 @@ DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "models" / "checkpoints" / "agent4_hybri
 DEFAULT_TENSORBOARD_DIR = PROJECT_ROOT / "models" / "tensorboard" / "agent4_hybrid_ppo"
 DEFAULT_RUNS_DIR = PROJECT_ROOT / "models" / "training_runs" / "agent4_hybrid_ppo"
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 1.0
+DEFAULT_LOG_STD_INIT = -1.2
 REWARD_VERSION = "agent4_reward_v7_track_width_safe_exit"
 REWARD_WEIGHTS = {
     "progress": 0.35,
@@ -262,8 +263,26 @@ def build_training_metadata(args, *, resumed_from=None):
             "clip_range": args.clip_range,
             "ent_coef": args.ent_coef,
             "vf_coef": args.vf_coef,
+            "log_std_init": args.log_std_init,
             "device": args.device,
         },
+        "curriculum_recommendation": [
+            {
+                "phase": 1,
+                "residual_scale": 0.1,
+                "goal": "learn to survive and reach farther than Agent 3 baseline disruption",
+            },
+            {
+                "phase": 2,
+                "residual_scale": 0.2,
+                "goal": "resume once distance and failure location stabilize",
+            },
+            {
+                "phase": 3,
+                "residual_scale": 0.3,
+                "goal": "widen useful racecraft corrections after clean-lap reliability improves",
+            },
+        ],
         "stuck_detection": {
             "speed_limit_kmh": STUCK_SPEED_LIMIT_KMH,
             "progress_limit_m": STUCK_PROGRESS_LIMIT_M,
@@ -401,6 +420,23 @@ def calculate_lap_completion_fraction(episode_distance_m, racing_line=None):
         return 0.0
 
     return clamp(float(episode_distance_m) / float(track_length), 0.0, 1.0)
+
+
+def build_episode_diagnostics(telemetry, episode_distance_m, racing_line=None):
+    track_sensors = get_track_sensors(telemetry)
+    min_track_sensor = min(track_sensors) if track_sensors else 0.0
+    return {
+        "lap_completion_fraction": calculate_lap_completion_fraction(
+            episode_distance_m,
+            racing_line,
+        ),
+        "final_dist_from_start_m": float(telemetry.get("distFromStart", 0.0)),
+        "final_track_pos": float(telemetry.get("trackPos", 0.0)),
+        "final_angle_rad": float(telemetry.get("angle", 0.0)),
+        "final_speed_x_kmh": float(telemetry.get("speedX", 0.0)),
+        "final_speed_y_kmh": float(telemetry.get("speedY", 0.0)),
+        "final_min_track_sensor_m": float(min_track_sensor),
+    }
 
 
 def calculate_unsafe_edge_exit_pressure(track_position, lateral_speed, angle, action):
@@ -728,6 +764,11 @@ def make_training_env_class(gym, spaces):
                     if duration_seconds > 0.0
                     else 0.0
                 )
+                diagnostics = build_episode_diagnostics(
+                    telemetry,
+                    distance_m,
+                    self.base_agent.racing_line,
+                )
                 info["episode_summary"] = {
                     "steps": self.steps,
                     "reward": self.episode_reward,
@@ -741,6 +782,7 @@ def make_training_env_class(gym, spaces):
                     "safety_shield_steps": self.episode_shield_steps,
                     "max_stopped_seconds": self.episode_max_stopped_seconds,
                     "termination_reason": reason,
+                    **diagnostics,
                 }
 
             if not terminated and not truncated:
@@ -856,6 +898,13 @@ def make_episode_summary_callback_class(BaseCallback):
                     "safety_shield_steps",
                     "max_stopped_seconds",
                     "termination_reason",
+                    "lap_completion_fraction",
+                    "final_dist_from_start_m",
+                    "final_track_pos",
+                    "final_angle_rad",
+                    "final_speed_x_kmh",
+                    "final_speed_y_kmh",
+                    "final_min_track_sensor_m",
                 ],
             )
             self.writer.writeheader()
@@ -1086,8 +1135,17 @@ def parse_args():
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--clip-range", type=float, default=0.15)
-    parser.add_argument("--ent-coef", type=float, default=0.005)
+    parser.add_argument("--ent-coef", type=float, default=0.001)
     parser.add_argument("--vf-coef", type=float, default=0.5)
+    parser.add_argument(
+        "--log-std-init",
+        type=float,
+        default=DEFAULT_LOG_STD_INIT,
+        help=(
+            "Initial PPO policy log standard deviation for new models. Lower "
+            "values make early residual exploration gentler."
+        ),
+    )
     parser.add_argument("--device", default="auto")
     return parser.parse_args()
 
@@ -1156,6 +1214,7 @@ def main():
             tensorboard_log=tensorboard_log,
         )
         model.verbose = int(args.verbose_training)
+        model.ent_coef = args.ent_coef
         reset_num_timesteps = False
     else:
         model = PPO(
@@ -1171,6 +1230,7 @@ def main():
             clip_range=args.clip_range,
             ent_coef=args.ent_coef,
             vf_coef=args.vf_coef,
+            policy_kwargs={"log_std_init": args.log_std_init},
             seed=args.seed,
             device=args.device,
         )
