@@ -314,6 +314,27 @@ class HybridPpoRewardTests(unittest.TestCase):
 
         self.assertLess(failed_reward, safe_reward - 400.0)
 
+    def test_mid_lap_off_track_failure_has_strong_terminal_penalty(self):
+        previous = make_telemetry(distRaced=500.0, curLapTime=20.0)
+        failed = make_telemetry(
+            speedX=70.0,
+            trackPos=1.08,
+            track=[-1.0] + [200.0] * 18,
+            distRaced=504.0,
+            distFromStart=504.0,
+            curLapTime=20.2,
+        )
+
+        reward = train_hybrid_ppo_agent.calculate_hybrid_reward(
+            failed,
+            make_action(),
+            previous_telemetry=previous,
+            racing_line=FakeRacingLine(),
+            episode_distance_m=500.0,
+        )
+
+        self.assertLess(reward, -450.0)
+
     def test_incomplete_lap_failure_penalty_shrinks_with_progress(self):
         previous = make_telemetry(distRaced=100.0, curLapTime=1.0)
         failed = make_telemetry(

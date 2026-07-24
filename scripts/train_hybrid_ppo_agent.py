@@ -56,8 +56,8 @@ DEFAULT_TENSORBOARD_DIR = PROJECT_ROOT / "models" / "tensorboard" / "agent4_hybr
 DEFAULT_RUNS_DIR = PROJECT_ROOT / "models" / "training_runs" / "agent4_hybrid_ppo"
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 1.0
 DEFAULT_LOG_STD_INIT = -1.2
-DEFAULT_CHECKPOINT_FREQ = 50_000
-REWARD_VERSION = "agent4_reward_v12_failure_pressure_recovery"
+DEFAULT_CHECKPOINT_FREQ = 100_000
+REWARD_VERSION = "agent4_reward_v13_offtrack_pressure"
 REWARD_WEIGHTS = {
     "progress": 0.35,
     "pace": 0.14,
@@ -72,7 +72,7 @@ REWARD_WEIGHTS = {
     "safety_shield": 0.12,
     "unsafe_edge_exit": 0.26,
     "unsafe_residual": 0.35,
-    "off_track": 260.0,
+    "off_track": 340.0,
     "crash": 320.0,
     "backwards": 260.0,
     "stuck": 300.0,
