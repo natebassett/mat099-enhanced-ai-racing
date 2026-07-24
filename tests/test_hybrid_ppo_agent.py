@@ -3,11 +3,13 @@ import tempfile
 import unittest
 import math
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+import agents.hybrid_ppo_agent as hybrid_ppo_agent  # noqa: E402
 from agents.hybrid_ppo_agent import (  # noqa: E402
     AGENT4_ACTION_VERSION,
     AGENT4_MODEL_FAMILY,
@@ -307,6 +309,65 @@ class HybridPpoAgentTests(unittest.TestCase):
                 agent.close()
 
         self.assertAlmostEqual(config["residual_scale"], DEFAULT_RESIDUAL_SCALE)
+
+    def test_default_policy_path_prefers_curriculum_winners_then_final_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            final_model_path = root / "agent4_hybrid_ppo.zip"
+            best_progress_pace_model_path = (
+                root / "agent4_hybrid_ppo_best_progress_pace.zip"
+            )
+            best_distance_model_path = root / "agent4_hybrid_ppo_best_distance.zip"
+            best_clean_model_path = root / "agent4_hybrid_ppo_best.zip"
+
+            patches = [
+                patch.object(hybrid_ppo_agent, "DEFAULT_MODEL_PATH", final_model_path),
+                patch.object(
+                    hybrid_ppo_agent,
+                    "DEFAULT_BEST_PROGRESS_PACE_MODEL_PATH",
+                    best_progress_pace_model_path,
+                ),
+                patch.object(
+                    hybrid_ppo_agent,
+                    "DEFAULT_BEST_DISTANCE_MODEL_PATH",
+                    best_distance_model_path,
+                ),
+                patch.object(
+                    hybrid_ppo_agent,
+                    "DEFAULT_BEST_MODEL_PATH",
+                    best_clean_model_path,
+                ),
+            ]
+            for patcher in patches:
+                patcher.start()
+                self.addCleanup(patcher.stop)
+
+            final_model_path.write_text("final", encoding="utf-8")
+            self.assertEqual(
+                hybrid_ppo_agent.resolve_default_policy_path(),
+                final_model_path,
+            )
+
+            best_distance_model_path.write_text("distance", encoding="utf-8")
+            self.assertEqual(
+                hybrid_ppo_agent.resolve_default_policy_path(),
+                best_distance_model_path,
+            )
+
+            best_progress_pace_model_path.write_text(
+                "progress pace",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                hybrid_ppo_agent.resolve_default_policy_path(),
+                best_progress_pace_model_path,
+            )
+
+            best_clean_model_path.write_text("clean", encoding="utf-8")
+            self.assertEqual(
+                hybrid_ppo_agent.resolve_default_policy_path(),
+                best_clean_model_path,
+            )
 
     def test_agent_config_exposes_resume_compatibility_versions(self):
         with tempfile.TemporaryDirectory() as directory:

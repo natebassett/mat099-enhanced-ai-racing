@@ -23,8 +23,11 @@ from agents.hybrid_ppo_agent import (  # noqa: E402
     AGENT4_ACTION_VERSION,
     AGENT4_MODEL_FAMILY,
     AGENT4_OBSERVATION_VERSION,
+    DEFAULT_BEST_DISTANCE_MODEL_PATH,
+    DEFAULT_BEST_PROGRESS_PACE_MODEL_PATH,
     DEFAULT_RESIDUAL_SCALE,
     DEFAULT_BEST_MODEL_PATH,
+    DEFAULT_BEST_REWARD_MODEL_PATH,
     DEFAULT_MODEL_PATH,
     FEATURE_NAMES,
     CRITICAL_RISK_PRESSURE,
@@ -56,7 +59,15 @@ DEFAULT_TENSORBOARD_DIR = PROJECT_ROOT / "models" / "tensorboard" / "agent4_hybr
 DEFAULT_RUNS_DIR = PROJECT_ROOT / "models" / "training_runs" / "agent4_hybrid_ppo"
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 1.0
 DEFAULT_LOG_STD_INIT = -1.2
-DEFAULT_CHECKPOINT_FREQ = 100_000
+DEFAULT_CHECKPOINT_FREQ = 250_000
+RESUME_SOURCE_CHOICES = (
+    "auto",
+    "final",
+    "best-clean",
+    "best-progress-pace",
+    "best-distance",
+    "best-reward",
+)
 REWARD_VERSION = "agent4_reward_v13_offtrack_pressure"
 REWARD_WEIGHTS = {
     "progress": 0.35,
@@ -143,6 +154,76 @@ def write_json(path, payload):
         handle.write("\n")
 
 
+def finite_summary_value(summary, key, default=0.0):
+    try:
+        value = float(summary.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(value):
+        return float(default)
+    return value
+
+
+def calculate_progress_pace_score(summary, *, target_laps=1):
+    distance_m = max(0.0, finite_summary_value(summary, "distance_m"))
+    average_speed_kmh = max(0.0, finite_summary_value(summary, "average_speed_kmh"))
+    lap_fraction = clamp(
+        finite_summary_value(summary, "lap_completion_fraction"),
+        0.0,
+        1.0,
+    )
+    laps_completed = int(max(0.0, finite_summary_value(summary, "laps_completed")))
+    target_laps = max(1, int(target_laps))
+    termination_reason = str(summary.get("termination_reason", ""))
+
+    off_track_steps = max(0.0, finite_summary_value(summary, "off_track_steps"))
+    safety_shield_steps = max(0.0, finite_summary_value(summary, "safety_shield_steps"))
+    unsafe_residual_steps = max(
+        0.0,
+        finite_summary_value(summary, "unsafe_residual_steps"),
+    )
+    stopped_seconds = max(0.0, finite_summary_value(summary, "max_stopped_seconds"))
+    stability_penalty = (
+        off_track_steps * 1.5
+        + safety_shield_steps * 0.04
+        + unsafe_residual_steps * 0.12
+        + stopped_seconds * 45.0
+    )
+
+    completed_target = (
+        laps_completed >= target_laps
+        or termination_reason == "target_laps_completed"
+    )
+    if completed_target:
+        lap_time = finite_summary_value(summary, "best_lap_time_seconds", default=0.0)
+        if lap_time <= 0.0:
+            lap_time = finite_summary_value(summary, "duration_seconds", default=0.0)
+        if lap_time <= 0.0:
+            lap_time = 9999.0
+
+        return (
+            1_000_000.0
+            + laps_completed * 50_000.0
+            - lap_time * 120.0
+            + average_speed_kmh * 15.0
+            - stability_penalty
+        )
+
+    failure_penalty = {
+        "stuck": 300.0,
+        "backwards": 450.0,
+        "crashed": 550.0,
+    }.get(termination_reason, 0.0)
+
+    return (
+        distance_m * 10.0
+        + average_speed_kmh * 2.0
+        + lap_fraction * 500.0
+        - stability_penalty
+        - failure_penalty
+    )
+
+
 @contextlib.contextmanager
 def maybe_suppress_stdout(enabled):
     if not enabled:
@@ -168,6 +249,9 @@ class TrainingProgressState:
         self.episodes_seen = 0
         self.last_episode = None
         self.best_clean_lap_time = None
+        self.best_progress_pace = None
+        self.best_distance_m = None
+        self.best_reward = None
 
     def record_episode(self, row):
         self.episodes_seen = int(row.get("episodes_seen", self.episodes_seen))
@@ -175,6 +259,30 @@ class TrainingProgressState:
 
     def record_best_clean_lap(self, lap_time):
         self.best_clean_lap_time = float(lap_time)
+
+    def record_best_progress_pace(
+        self,
+        score,
+        distance_m,
+        average_speed_kmh,
+        laps_completed,
+        lap_time_seconds=None,
+    ):
+        self.best_progress_pace = {
+            "score": float(score),
+            "distance_m": float(distance_m),
+            "average_speed_kmh": float(average_speed_kmh),
+            "laps_completed": int(laps_completed),
+            "lap_time_seconds": (
+                float(lap_time_seconds) if lap_time_seconds is not None else None
+            ),
+        }
+
+    def record_best_distance(self, distance_m):
+        self.best_distance_m = float(distance_m)
+
+    def record_best_reward(self, reward):
+        self.best_reward = float(reward)
 
 
 def format_training_progress_line(
@@ -213,9 +321,32 @@ def format_training_progress_line(
             f"laps={int(last_episode.get('laps_completed', 0))}"
         )
 
-    best_text = ""
+    best_parts = []
+    if progress_state.best_progress_pace is not None:
+        best_progress_pace = progress_state.best_progress_pace
+        if int(best_progress_pace.get("laps_completed", 0)) > 0:
+            lap_time_seconds = best_progress_pace.get("lap_time_seconds")
+            if lap_time_seconds is None:
+                lap_time_seconds = 0.0
+            best_parts.append(
+                "best_pp="
+                f"{float(lap_time_seconds):.1f}s/"
+                f"{float(best_progress_pace.get('average_speed_kmh', 0.0)):.0f}kph"
+            )
+        else:
+            best_parts.append(
+                "best_pp="
+                f"{float(best_progress_pace.get('distance_m', 0.0)):.0f}m/"
+                f"{float(best_progress_pace.get('average_speed_kmh', 0.0)):.0f}kph"
+            )
+    if progress_state.best_distance_m is not None:
+        best_parts.append(f"best_dist={progress_state.best_distance_m:.0f}m")
+    if progress_state.best_reward is not None:
+        best_parts.append(f"best_R={progress_state.best_reward:.0f}")
     if progress_state.best_clean_lap_time is not None:
-        best_text = f" | best={progress_state.best_clean_lap_time:.3f}s"
+        best_parts.append(f"best_lap={progress_state.best_clean_lap_time:.3f}s")
+
+    best_text = f" | {' '.join(best_parts)}" if best_parts else ""
 
     return (
         f"Training [{bar}] {percent:5.1f}% | "
@@ -266,6 +397,7 @@ def build_training_metadata(args, *, resumed_from=None):
         "manual_start": args.manual_start,
         "relaunch_frequency": args.relaunch_frequency,
         "reset_retries": args.reset_retries,
+        "resume_source": args.resume_source,
         "total_timesteps_requested": args.total_timesteps,
         "checkpoint_freq": args.checkpoint_freq,
         "tensorboard_requested": not args.no_tensorboard,
@@ -276,6 +408,46 @@ def build_training_metadata(args, *, resumed_from=None):
         "seed": args.seed,
         "model_path": str(args.model_path),
         "best_model_path": str(args.best_model_path),
+        "best_progress_pace_model_path": str(args.best_progress_pace_model_path),
+        "best_distance_model_path": str(args.best_distance_model_path),
+        "best_reward_model_path": str(args.best_reward_model_path),
+        "long_run_model_preservation": {
+            "checkpoint_freq": args.checkpoint_freq,
+            "checkpoint_dir": str(args.checkpoint_dir),
+            "best_clean_lap_model": str(args.best_model_path),
+            "best_progress_pace_model": str(args.best_progress_pace_model_path),
+            "best_distance_model": str(args.best_distance_model_path),
+            "best_reward_model": str(args.best_reward_model_path),
+            "runtime_default_order": [
+                "best_clean_lap_model",
+                "best_progress_pace_model",
+                "best_distance_model",
+                "final_model",
+            ],
+        },
+        "progress_pace_selection": {
+            "purpose": (
+                "pre-lap model selection prioritises progress first, pace second; "
+                "completed laps switch the score into lap-time optimisation"
+            ),
+            "pre_lap_score": (
+                "distance_m * 10 + average_speed_kmh * 2 + "
+                "lap_completion_fraction * 500 - stability/failure penalties"
+            ),
+            "completed_lap_score": (
+                "1,000,000 + laps_completed * 50,000 - lap_time_seconds * 120 + "
+                "average_speed_kmh * 15 - stability penalties"
+            ),
+            "stability_penalties": {
+                "off_track_steps": 1.5,
+                "safety_shield_steps": 0.04,
+                "unsafe_residual_steps": 0.12,
+                "max_stopped_seconds": 45.0,
+                "stuck_failure": 300.0,
+                "backwards_failure": 450.0,
+                "crash_failure": 550.0,
+            },
+        },
         "ppo_hyperparameters": {
             "n_steps": args.n_steps,
             "batch_size": args.batch_size,
@@ -388,6 +560,28 @@ def validate_resume_metadata(model_path, *, force_resume=False):
         )
 
     return metadata
+
+
+def resolve_resume_model_path(args):
+    candidates_by_source = {
+        "best-clean": [args.best_model_path],
+        "best-progress-pace": [args.best_progress_pace_model_path],
+        "best-distance": [args.best_distance_model_path],
+        "best-reward": [args.best_reward_model_path],
+        "final": [args.model_path],
+        "auto": [
+            args.best_model_path,
+            args.best_progress_pace_model_path,
+            args.best_distance_model_path,
+            args.model_path,
+        ],
+    }
+    candidates = candidates_by_source[args.resume_source]
+    for candidate in candidates:
+        candidate = Path(candidate)
+        if candidate.is_file():
+            return candidate
+    return Path(args.model_path)
 
 
 def calculate_progress_delta(previous_telemetry, telemetry, track_length=None):
@@ -1119,6 +1313,175 @@ def make_episode_summary_callback_class(BaseCallback):
     return EpisodeSummaryCallback
 
 
+def make_best_episode_model_callback_class(BaseCallback):
+    class BestEpisodeModelCallback(BaseCallback):
+        def __init__(
+            self,
+            best_progress_pace_model_path,
+            best_distance_model_path,
+            best_reward_model_path,
+            metadata,
+            target_laps=1,
+            progress_state=None,
+            verbose=0,
+        ):
+            super().__init__(verbose=verbose)
+            self.best_progress_pace_model_path = Path(best_progress_pace_model_path)
+            self.best_distance_model_path = Path(best_distance_model_path)
+            self.best_reward_model_path = Path(best_reward_model_path)
+            self.metadata = dict(metadata)
+            self.target_laps = max(1, int(target_laps))
+            self.progress_state = progress_state
+            self.best_progress_pace_score = None
+            self.best_distance_m = None
+            self.best_reward = None
+            self.episodes_seen = 0
+
+        @staticmethod
+        def _finite_summary_value(summary, key):
+            value = finite_summary_value(summary, key, default=math.nan)
+            return value if math.isfinite(value) else None
+
+        def _save_best_model(self, model_path, metadata_key, payload):
+            model_path.parent.mkdir(parents=True, exist_ok=True)
+            self.model.save(str(model_path))
+            best_metadata = {
+                **self.metadata,
+                metadata_key: {
+                    "saved_at": datetime.now(timezone.utc).isoformat(),
+                    "global_timestep": self.num_timesteps,
+                    "episodes_seen": self.episodes_seen,
+                    **payload,
+                },
+            }
+            write_json(metadata_path_for_model(model_path), best_metadata)
+
+        def _on_step(self):
+            infos = self.locals.get("infos", [])
+            for info in infos:
+                summary = info.get("episode_summary") if isinstance(info, dict) else None
+                if summary is None:
+                    continue
+
+                self.episodes_seen += 1
+                distance_m = self._finite_summary_value(summary, "distance_m")
+                reward = self._finite_summary_value(summary, "reward")
+                average_speed_kmh = self._finite_summary_value(
+                    summary,
+                    "average_speed_kmh",
+                )
+                laps_completed = int(
+                    max(0.0, finite_summary_value(summary, "laps_completed"))
+                )
+                lap_time = self._finite_summary_value(summary, "best_lap_time_seconds")
+                if lap_time is None:
+                    lap_time = self._finite_summary_value(summary, "duration_seconds")
+                progress_pace_score = calculate_progress_pace_score(
+                    summary,
+                    target_laps=self.target_laps,
+                )
+
+                if (
+                    self.best_progress_pace_score is None
+                    or progress_pace_score > self.best_progress_pace_score
+                ):
+                    self.best_progress_pace_score = progress_pace_score
+                    if self.progress_state is not None:
+                        self.progress_state.record_best_progress_pace(
+                            progress_pace_score,
+                            distance_m if distance_m is not None else 0.0,
+                            (
+                                average_speed_kmh
+                                if average_speed_kmh is not None
+                                else 0.0
+                            ),
+                            laps_completed,
+                            lap_time,
+                        )
+                    self._save_best_model(
+                        self.best_progress_pace_model_path,
+                        "best_progress_pace_episode",
+                        {
+                            "selection_reason": (
+                                "progress-first, pace-aware curriculum selector"
+                            ),
+                            "score": progress_pace_score,
+                            "distance_m": distance_m,
+                            "average_speed_kmh": average_speed_kmh,
+                            "laps_completed": laps_completed,
+                            "lap_time_seconds": lap_time,
+                            "lap_completion_fraction": self._finite_summary_value(
+                                summary,
+                                "lap_completion_fraction",
+                            ),
+                            "termination_reason": summary.get("termination_reason"),
+                            "episode_summary": summary,
+                        },
+                    )
+                    if self.verbose:
+                        print(
+                            "Saved new best progress+pace Agent 4 model "
+                            f"(score={progress_pace_score:.1f}) to "
+                            f"{self.best_progress_pace_model_path}"
+                        )
+
+                if distance_m is not None and (
+                    self.best_distance_m is None or distance_m > self.best_distance_m
+                ):
+                    self.best_distance_m = distance_m
+                    if self.progress_state is not None:
+                        self.progress_state.record_best_distance(distance_m)
+                    self._save_best_model(
+                        self.best_distance_model_path,
+                        "best_distance_episode",
+                        {
+                            "selection_reason": "furthest distance reached in training",
+                            "distance_m": distance_m,
+                            "lap_completion_fraction": self._finite_summary_value(
+                                summary,
+                                "lap_completion_fraction",
+                            ),
+                            "termination_reason": summary.get("termination_reason"),
+                            "episode_summary": summary,
+                        },
+                    )
+                    if self.verbose:
+                        print(
+                            "Saved new furthest-distance Agent 4 model "
+                            f"({distance_m:.1f}m) to {self.best_distance_model_path}"
+                        )
+
+                if reward is not None and (
+                    self.best_reward is None or reward > self.best_reward
+                ):
+                    self.best_reward = reward
+                    if self.progress_state is not None:
+                        self.progress_state.record_best_reward(reward)
+                    self._save_best_model(
+                        self.best_reward_model_path,
+                        "best_reward_episode",
+                        {
+                            "selection_reason": "highest shaped episode reward",
+                            "reward": reward,
+                            "distance_m": distance_m,
+                            "lap_completion_fraction": self._finite_summary_value(
+                                summary,
+                                "lap_completion_fraction",
+                            ),
+                            "termination_reason": summary.get("termination_reason"),
+                            "episode_summary": summary,
+                        },
+                    )
+                    if self.verbose:
+                        print(
+                            "Saved new highest-reward Agent 4 model "
+                            f"(R={reward:.2f}) to {self.best_reward_model_path}"
+                        )
+            return True
+
+    return BestEpisodeModelCallback
+
+
 def make_best_clean_lap_callback_class(BaseCallback):
     class BestCleanLapCallback(BaseCallback):
         def __init__(self, best_model_path, metadata, progress_state=None, verbose=0):
@@ -1244,6 +1607,21 @@ def parse_args():
     parser.add_argument("--checkpoint-freq", type=int, default=DEFAULT_CHECKPOINT_FREQ)
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--best-model-path", type=Path, default=DEFAULT_BEST_MODEL_PATH)
+    parser.add_argument(
+        "--best-progress-pace-model-path",
+        type=Path,
+        default=DEFAULT_BEST_PROGRESS_PACE_MODEL_PATH,
+    )
+    parser.add_argument(
+        "--best-distance-model-path",
+        type=Path,
+        default=DEFAULT_BEST_DISTANCE_MODEL_PATH,
+    )
+    parser.add_argument(
+        "--best-reward-model-path",
+        type=Path,
+        default=DEFAULT_BEST_REWARD_MODEL_PATH,
+    )
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
     parser.add_argument("--tensorboard-dir", type=Path, default=DEFAULT_TENSORBOARD_DIR)
     parser.add_argument(
@@ -1271,6 +1649,16 @@ def parse_args():
     )
     parser.add_argument("--track", default=DEFAULT_TRACK_NAME)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--resume-source",
+        choices=RESUME_SOURCE_CHOICES,
+        default="auto",
+        help=(
+            "Which saved policy to continue from when --resume is used. Auto "
+            "prefers clean-lap best, then progress+pace best, then distance "
+            "best, then final."
+        ),
+    )
     parser.add_argument("--force-resume", action="store_true")
     parser.add_argument("--residual-scale", type=float, default=DEFAULT_RESIDUAL_SCALE)
     parser.add_argument("--max-episode-steps", type=int, default=12_000)
@@ -1365,6 +1753,9 @@ def main():
 
     args.model_path.parent.mkdir(parents=True, exist_ok=True)
     args.best_model_path.parent.mkdir(parents=True, exist_ok=True)
+    args.best_progress_pace_model_path.parent.mkdir(parents=True, exist_ok=True)
+    args.best_distance_model_path.parent.mkdir(parents=True, exist_ok=True)
+    args.best_reward_model_path.parent.mkdir(parents=True, exist_ok=True)
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     args.tensorboard_dir.mkdir(parents=True, exist_ok=True)
     tensorboard_log = resolve_tensorboard_log_dir(
@@ -1373,13 +1764,20 @@ def main():
     )
     resumed_metadata = None
 
-    if args.resume and args.model_path.is_file():
-        resumed_metadata = validate_resume_metadata(
-            args.model_path,
+    resume_model_path = resolve_resume_model_path(args)
+    if args.resume and resume_model_path.is_file():
+        resume_model_metadata = validate_resume_metadata(
+            resume_model_path,
             force_resume=args.force_resume,
         )
+        resumed_metadata = {
+            "resume_source": args.resume_source,
+            "model_path": str(resume_model_path),
+            "metadata": resume_model_metadata,
+        }
+        print(f"Resuming Agent 4 PPO from {resume_model_path}")
         model = PPO.load(
-            str(args.model_path),
+            str(resume_model_path),
             env=env,
             device=args.device,
             tensorboard_log=tensorboard_log,
@@ -1423,11 +1821,21 @@ def main():
         save_vecnormalize=False,
     )
     EpisodeSummaryCallback = make_episode_summary_callback_class(BaseCallback)
+    BestEpisodeModelCallback = make_best_episode_model_callback_class(BaseCallback)
     BestCleanLapCallback = make_best_clean_lap_callback_class(BaseCallback)
     callbacks = [
         checkpoint_callback,
         EpisodeSummaryCallback(
             run_dir,
+            progress_state=progress_state,
+            verbose=int(args.verbose_training),
+        ),
+        BestEpisodeModelCallback(
+            args.best_progress_pace_model_path,
+            args.best_distance_model_path,
+            args.best_reward_model_path,
+            metadata,
+            target_laps=args.target_laps,
             progress_state=progress_state,
             verbose=int(args.verbose_training),
         ),

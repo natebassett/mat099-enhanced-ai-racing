@@ -16,6 +16,15 @@ from agents.map_aware_agent import (
 
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "agent4_hybrid_ppo.zip"
 DEFAULT_BEST_MODEL_PATH = PROJECT_ROOT / "models" / "agent4_hybrid_ppo_best.zip"
+DEFAULT_BEST_PROGRESS_PACE_MODEL_PATH = (
+    PROJECT_ROOT / "models" / "agent4_hybrid_ppo_best_progress_pace.zip"
+)
+DEFAULT_BEST_DISTANCE_MODEL_PATH = (
+    PROJECT_ROOT / "models" / "agent4_hybrid_ppo_best_distance.zip"
+)
+DEFAULT_BEST_REWARD_MODEL_PATH = (
+    PROJECT_ROOT / "models" / "agent4_hybrid_ppo_best_reward.zip"
+)
 DEFAULT_BASE_TELEMETRY_PATH = (
     PROJECT_ROOT / "data" / "generated" / "hybrid_ppo_base_telemetry.csv"
 )
@@ -171,6 +180,10 @@ def build_hybrid_ppo_observation(telemetry, base_action, track_length=None):
 def resolve_default_policy_path():
     if DEFAULT_BEST_MODEL_PATH.is_file():
         return DEFAULT_BEST_MODEL_PATH
+    if DEFAULT_BEST_PROGRESS_PACE_MODEL_PATH.is_file():
+        return DEFAULT_BEST_PROGRESS_PACE_MODEL_PATH
+    if DEFAULT_BEST_DISTANCE_MODEL_PATH.is_file():
+        return DEFAULT_BEST_DISTANCE_MODEL_PATH
     return DEFAULT_MODEL_PATH
 
 

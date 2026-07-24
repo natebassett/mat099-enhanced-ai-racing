@@ -1,5 +1,7 @@
 import importlib.util
+import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -24,6 +26,23 @@ spec = importlib.util.spec_from_file_location(
 )
 train_hybrid_ppo_agent = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(train_hybrid_ppo_agent)
+
+
+class FakeBaseCallback:
+    def __init__(self, verbose=0):
+        self.verbose = verbose
+        self.locals = {}
+        self.model = None
+        self.num_timesteps = 0
+
+
+class FakeModel:
+    def __init__(self):
+        self.saved_paths = []
+
+    def save(self, path):
+        self.saved_paths.append(Path(path))
+        Path(path).write_text("fake model", encoding="utf-8")
 
 
 class FakeRacingLine:
@@ -103,6 +122,9 @@ class HybridPpoRewardTests(unittest.TestCase):
                 "laps_completed": 0,
             }
         )
+        state.record_best_distance(1432.4)
+        state.record_best_reward(-12.0)
+        state.record_best_progress_pace(14500.0, 1432.4, 118.0, 0)
 
         line = train_hybrid_ppo_agent.format_training_progress_line(
             50,
@@ -116,6 +138,166 @@ class HybridPpoRewardTests(unittest.TestCase):
         self.assertIn("50/100 steps", line)
         self.assertIn("ETA 00:00:10", line)
         self.assertIn("ep 3 off_track 1200m R=-140 laps=0", line)
+        self.assertIn("best_pp=1432m/118kph", line)
+        self.assertIn("best_dist=1432m", line)
+        self.assertIn("best_R=-12", line)
+
+    def test_progress_pace_score_prioritises_distance_before_lap_completion(self):
+        shorter_faster = {
+            "distance_m": 1200.0,
+            "average_speed_kmh": 180.0,
+            "lap_completion_fraction": 0.42,
+            "termination_reason": "off_track",
+        }
+        farther_slower = {
+            "distance_m": 1300.0,
+            "average_speed_kmh": 120.0,
+            "lap_completion_fraction": 0.46,
+            "termination_reason": "off_track",
+        }
+
+        self.assertGreater(
+            train_hybrid_ppo_agent.calculate_progress_pace_score(farther_slower),
+            train_hybrid_ppo_agent.calculate_progress_pace_score(shorter_faster),
+        )
+
+    def test_progress_pace_score_switches_to_pace_after_lap_completion(self):
+        pre_lap_best = {
+            "distance_m": 2000.0,
+            "average_speed_kmh": 170.0,
+            "lap_completion_fraction": 0.70,
+            "termination_reason": "off_track",
+        }
+        completed_slow_lap = {
+            "distance_m": 2800.0,
+            "average_speed_kmh": 110.0,
+            "laps_completed": 1,
+            "best_lap_time_seconds": 95.0,
+            "termination_reason": "target_laps_completed",
+        }
+        completed_fast_lap = {
+            "distance_m": 2800.0,
+            "average_speed_kmh": 130.0,
+            "laps_completed": 1,
+            "best_lap_time_seconds": 88.0,
+            "termination_reason": "target_laps_completed",
+        }
+
+        self.assertGreater(
+            train_hybrid_ppo_agent.calculate_progress_pace_score(completed_slow_lap),
+            train_hybrid_ppo_agent.calculate_progress_pace_score(pre_lap_best),
+        )
+        self.assertGreater(
+            train_hybrid_ppo_agent.calculate_progress_pace_score(completed_fast_lap),
+            train_hybrid_ppo_agent.calculate_progress_pace_score(completed_slow_lap),
+        )
+
+    def test_auto_resume_prefers_clean_then_progress_pace_then_distance_then_final(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = types.SimpleNamespace(
+                resume_source="auto",
+                best_model_path=root / "best_clean.zip",
+                best_progress_pace_model_path=root / "best_progress_pace.zip",
+                best_distance_model_path=root / "best_distance.zip",
+                best_reward_model_path=root / "best_reward.zip",
+                model_path=root / "final.zip",
+            )
+
+            args.model_path.write_text("final", encoding="utf-8")
+            self.assertEqual(
+                train_hybrid_ppo_agent.resolve_resume_model_path(args),
+                args.model_path,
+            )
+
+            args.best_distance_model_path.write_text("distance", encoding="utf-8")
+            self.assertEqual(
+                train_hybrid_ppo_agent.resolve_resume_model_path(args),
+                args.best_distance_model_path,
+            )
+
+            args.best_progress_pace_model_path.write_text(
+                "progress pace",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                train_hybrid_ppo_agent.resolve_resume_model_path(args),
+                args.best_progress_pace_model_path,
+            )
+
+            args.best_model_path.write_text("clean", encoding="utf-8")
+            self.assertEqual(
+                train_hybrid_ppo_agent.resolve_resume_model_path(args),
+                args.best_model_path,
+            )
+
+    def test_best_episode_callback_saves_progress_pace_distance_and_reward_models(self):
+        CallbackClass = train_hybrid_ppo_agent.make_best_episode_model_callback_class(
+            FakeBaseCallback
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            progress_pace_path = root / "best_progress_pace.zip"
+            distance_path = root / "best_distance.zip"
+            reward_path = root / "best_reward.zip"
+            callback = CallbackClass(
+                progress_pace_path,
+                distance_path,
+                reward_path,
+                {"model_family": "agent4_hybrid_ppo_residual"},
+            )
+            callback.model = FakeModel()
+            callback.num_timesteps = 1234
+            callback.locals = {
+                "infos": [
+                    {
+                        "episode_summary": {
+                            "distance_m": 1400.0,
+                            "reward": -45.0,
+                            "lap_completion_fraction": 0.49,
+                            "termination_reason": "off_track",
+                        },
+                    }
+                ]
+            }
+
+            self.assertTrue(callback._on_step())
+
+            self.assertTrue(progress_pace_path.is_file())
+            self.assertTrue(distance_path.is_file())
+            self.assertTrue(reward_path.is_file())
+            self.assertEqual(
+                callback.model.saved_paths,
+                [progress_pace_path, distance_path, reward_path],
+            )
+
+            progress_pace_metadata = json.loads(
+                progress_pace_path.with_suffix(".metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            distance_metadata = json.loads(
+                distance_path.with_suffix(".metadata.json").read_text(encoding="utf-8")
+            )
+            reward_metadata = json.loads(
+                reward_path.with_suffix(".metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                progress_pace_metadata["best_progress_pace_episode"]["distance_m"],
+                1400.0,
+            )
+            self.assertGreater(
+                progress_pace_metadata["best_progress_pace_episode"]["score"],
+                0.0,
+            )
+            self.assertEqual(
+                distance_metadata["best_distance_episode"]["distance_m"],
+                1400.0,
+            )
+            self.assertEqual(
+                reward_metadata["best_reward_episode"]["reward"],
+                -45.0,
+            )
 
     def test_episode_diagnostics_capture_failure_location_and_stability(self):
         telemetry = make_telemetry(
