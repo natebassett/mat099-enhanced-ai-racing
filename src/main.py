@@ -1,6 +1,7 @@
 from agents.random_agent import RandomAgent
 from agents.map_aware_agent import MapAwareAgent
 from agents.rule_based_agent import RuleBasedAgent
+from agents.hybrid_sac_agent import HybridSacAgent
 from runner.torcs_runner import TorcsRunner
 from storage import RaceRepository
 
@@ -41,11 +42,12 @@ def menu():
         print("[1] Random Agent")
         print("[2] Rule-Based Anti-Spin Agent")
         print("[3] Map-Aware Racing-Line Agent")
+        print("[4] Hybrid SAC Residual Agent")
         print("[0] Exit\n")
 
         choice = input("Enter choice: ")
 
-        if choice in {"1", "2", "3"}:
+        if choice in {"1", "2", "3", "4"}:
 
             runner = TorcsRunner()
 
@@ -53,6 +55,7 @@ def menu():
                 "1": RandomAgent,
                 "2": RuleBasedAgent,
                 "3": MapAwareAgent,
+                "4": HybridSacAgent,
             }
             agent = agents[choice]()
 
