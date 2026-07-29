@@ -46,6 +46,7 @@ try:
         format_value,
         summarize_run_explanation,
     )
+    from .track_view import RoadSensorWidget, TrackPositionWidget
 except ImportError:
     from project_discovery import (
         AgentOption,
@@ -67,6 +68,7 @@ except ImportError:
         format_value,
         summarize_run_explanation,
     )
+    from track_view import RoadSensorWidget, TrackPositionWidget
 
 
 @dataclass(frozen=True)
@@ -99,10 +101,16 @@ class MainWindow(QMainWindow):
         self.explanation_box = QTextEdit()
         self.run_history_table = QTableWidget(0, 8)
         self.run_history_source_label = QLabel()
+        self.track_position_widget = TrackPositionWidget()
+        self.road_sensor_widget = RoadSensorWidget()
         self.race_thread: QThread | None = None
         self.race_worker: RaceWorker | None = None
         self.telemetry_history = TelemetryHistory()
         self.metric_value_labels: dict[str, QLabel] = {}
+        self.chart_window_seconds = 90.0
+        self.speed_plot: pg.PlotWidget | None = None
+        self.steer_plot: pg.PlotWidget | None = None
+        self.pedal_plot: pg.PlotWidget | None = None
         self.speed_curve: Any = None
         self.steer_curve: Any = None
         self.throttle_curve: Any = None
@@ -192,7 +200,7 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
 
-        title = QLabel("Live Telemetry")
+        title = QLabel("Live Driver Dashboard")
         title.setFont(_section_font())
         layout.addWidget(title)
 
@@ -215,40 +223,52 @@ class MainWindow(QMainWindow):
             )
         layout.addLayout(metric_grid)
 
+        road_row = QHBoxLayout()
+        road_row.addWidget(self._visual_group("Road Position", self.track_position_widget))
+        road_row.addWidget(self._visual_group("Road Ahead", self.road_sensor_widget))
+        layout.addLayout(road_row)
+
         chart_row = QHBoxLayout()
-        speed_plot = self._build_plot("Speed", "km/h")
-        self.speed_curve = speed_plot.plot(
+        self.speed_plot = self._build_plot("Speed", "km/h")
+        self.speed_plot.setYRange(0.0, 220.0)
+        self.speed_curve = self.speed_plot.plot(
             [],
             [],
             pen=pg.mkPen("#2f80ed", width=2),
         )
-        chart_row.addWidget(speed_plot)
+        chart_row.addWidget(self.speed_plot)
 
-        steering_plot = self._build_plot("Steering", "steer")
-        steering_plot.setYRange(-1.0, 1.0)
-        self.steer_curve = steering_plot.plot(
+        self.steer_plot = self._build_plot("Steering", "steer")
+        self.steer_plot.setYRange(-1.0, 1.0)
+        self.steer_curve = self.steer_plot.plot(
             [],
             [],
             pen=pg.mkPen("#8e5cf7", width=2),
         )
-        chart_row.addWidget(steering_plot)
+        chart_row.addWidget(self.steer_plot)
         layout.addLayout(chart_row)
 
-        pedal_plot = self._build_plot("Throttle / Brake", "%")
-        pedal_plot.setYRange(0.0, 100.0)
-        self.throttle_curve = pedal_plot.plot(
+        self.pedal_plot = self._build_plot("Throttle / Brake", "%")
+        self.pedal_plot.setYRange(0.0, 100.0)
+        self.throttle_curve = self.pedal_plot.plot(
             [],
             [],
             pen=pg.mkPen("#27ae60", width=2),
-            name="Throttle",
         )
-        self.brake_curve = pedal_plot.plot(
+        self.brake_curve = self.pedal_plot.plot(
             [],
             [],
             pen=pg.mkPen("#c0392b", width=2),
-            name="Brake",
         )
-        layout.addWidget(pedal_plot)
+        layout.addWidget(
+            self._chart_legend(
+                [
+                    ("Throttle", "#27ae60"),
+                    ("Brake", "#c0392b"),
+                ]
+            )
+        )
+        layout.addWidget(self.pedal_plot)
 
         return panel
 
@@ -319,6 +339,31 @@ class MainWindow(QMainWindow):
         layout.addWidget(combo)
         return group
 
+    def _visual_group(self, label: str, widget: QWidget) -> QGroupBox:
+        group = QGroupBox(label)
+        layout = QVBoxLayout(group)
+        layout.addWidget(widget)
+        return group
+
+    def _chart_legend(self, items: list[tuple[str, str]]) -> QWidget:
+        legend = QWidget()
+        layout = QHBoxLayout(legend)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addStretch(1)
+
+        for label, color in items:
+            swatch = QLabel()
+            swatch.setFixedSize(10, 10)
+            swatch.setStyleSheet(
+                f"background-color: {color}; border: 1px solid #202020;"
+            )
+            text = QLabel(label)
+            layout.addWidget(swatch)
+            layout.addWidget(text)
+
+        return legend
+
     def _metric_card(self, metric: MetricSpec) -> QFrame:
         card = QFrame()
         card.setFrameShape(QFrame.StyledPanel)
@@ -342,9 +387,12 @@ class MainWindow(QMainWindow):
         plot.setTitle(title)
         plot.setBackground("w")
         plot.setLabel("left", left_axis_label)
-        plot.setLabel("bottom", "step")
+        plot.setLabel("bottom", "lap time", units="s")
         plot.showGrid(x=True, y=True, alpha=0.25)
-        plot.setMinimumHeight(190)
+        plot.hideButtons()
+        plot.setMenuEnabled(False)
+        plot.setMouseEnabled(x=False, y=False)
+        plot.setMinimumHeight(170)
         return plot
 
     def _connect_signals(self) -> None:
@@ -533,6 +581,8 @@ class MainWindow(QMainWindow):
 
         self.telemetry_history.append(snapshot)
         self._update_metric_values(snapshot)
+        self.track_position_widget.set_snapshot(snapshot)
+        self.road_sensor_widget.set_snapshot(snapshot)
         self._update_telemetry_charts()
         explanation_frame = build_explanation_frame(snapshot)
         self._set_explanation_current(
@@ -607,6 +657,8 @@ class MainWindow(QMainWindow):
         for key, label in self.metric_value_labels.items():
             unit = _metric_unit(key)
             label.setText("--" if not unit else f"-- {unit}")
+        self.track_position_widget.set_snapshot(None)
+        self.road_sensor_widget.set_snapshot(None)
         self._update_telemetry_charts()
         self._set_explanation_current(
             "Idle",
@@ -633,18 +685,47 @@ class MainWindow(QMainWindow):
         label.setText(value if not unit else f"{value} {unit}")
 
     def _update_telemetry_charts(self) -> None:
-        steps = self.telemetry_history.steps()
+        x_values, speed_values = self.telemetry_history.windowed_series(
+            "speed_kmh",
+            self.chart_window_seconds,
+        )
         if self.speed_curve is not None:
-            self.speed_curve.setData(steps, self.telemetry_history.values("speed_kmh"))
+            self.speed_curve.setData(x_values, speed_values)
+            self._apply_chart_x_range(self.speed_plot, x_values)
+
+        x_values, steer_values = self.telemetry_history.windowed_series(
+            "steer",
+            self.chart_window_seconds,
+        )
         if self.steer_curve is not None:
-            self.steer_curve.setData(steps, self.telemetry_history.values("steer"))
+            self.steer_curve.setData(x_values, steer_values)
+            self._apply_chart_x_range(self.steer_plot, x_values)
+
+        x_values, throttle_values = self.telemetry_history.windowed_series(
+            "throttle_pct",
+            self.chart_window_seconds,
+        )
         if self.throttle_curve is not None:
-            self.throttle_curve.setData(
-                steps,
-                self.telemetry_history.values("throttle_pct"),
-            )
+            self.throttle_curve.setData(x_values, throttle_values)
+
+        x_values, brake_values = self.telemetry_history.windowed_series(
+            "brake_pct",
+            self.chart_window_seconds,
+        )
         if self.brake_curve is not None:
-            self.brake_curve.setData(steps, self.telemetry_history.values("brake_pct"))
+            self.brake_curve.setData(x_values, brake_values)
+            self._apply_chart_x_range(self.pedal_plot, x_values)
+
+    def _apply_chart_x_range(
+        self,
+        plot: pg.PlotWidget | None,
+        x_values: list[float],
+    ) -> None:
+        if plot is None or not x_values:
+            return
+        right = max(self.chart_window_seconds, x_values[-1])
+        left = max(0.0, right - self.chart_window_seconds)
+        plot.setXRange(left, right, padding=0.0)
 
     def _handle_worker_explanation(self, message: str) -> None:
         if len(self.telemetry_history) == 0:

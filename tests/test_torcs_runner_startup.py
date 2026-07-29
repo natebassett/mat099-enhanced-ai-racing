@@ -98,6 +98,13 @@ class TorcsRunnerStartupTests(unittest.TestCase):
         self.assertEqual(TorcsRunner._lap_time_seconds({"curLapTime": None}), 0.0)
         self.assertEqual(TorcsRunner._lap_time_seconds({"curLapTime": "bad"}), 0.0)
 
+    def test_track_sensor_values_are_normalized_for_sampled_telemetry(self):
+        sensors = TorcsRunner._track_sensor_values(
+            {"track": [str(value) for value in range(25)]}
+        )
+
+        self.assertEqual(sensors, [float(value) for value in range(19)])
+
 
 if __name__ == "__main__":
     unittest.main()

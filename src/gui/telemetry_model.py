@@ -10,6 +10,8 @@ from typing import Any, Mapping
 class TelemetrySnapshot:
     step: int
     speed_kmh: float | None
+    speed_y_kmh: float | None
+    angle: float | None
     gear: int | None
     throttle_pct: float | None
     brake_pct: float | None
@@ -20,6 +22,7 @@ class TelemetrySnapshot:
     off_track: bool
     front_sensor: float | None
     min_track_sensor: float | None
+    track_sensors: tuple[float, ...]
     cur_lap_time: float | None
     last_lap_time: float | None
 
@@ -28,6 +31,8 @@ class TelemetrySnapshot:
         return cls(
             step=_to_int(sample.get("step")) or 0,
             speed_kmh=_to_float(sample.get("speed_x")),
+            speed_y_kmh=_to_float(sample.get("speed_y")),
+            angle=_to_float(sample.get("angle")),
             gear=_to_int(sample.get("gear")),
             throttle_pct=_scale_percent(sample.get("accel")),
             brake_pct=_scale_percent(sample.get("brake")),
@@ -38,6 +43,7 @@ class TelemetrySnapshot:
             off_track=bool(sample.get("off_track", False)),
             front_sensor=_to_float(sample.get("front_sensor")),
             min_track_sensor=_to_float(sample.get("min_track_sensor")),
+            track_sensors=_to_float_tuple(sample.get("track_sensors", ())),
             cur_lap_time=_to_float(sample.get("cur_lap_time")),
             last_lap_time=_to_float(sample.get("last_lap_time")),
         )
@@ -71,6 +77,44 @@ class TelemetryHistory:
             value = getattr(snapshot, attribute)
             values.append(float(value) if value is not None else math.nan)
         return values
+
+    def chart_times(self) -> list[float]:
+        snapshots = self.snapshots()
+        has_lap_time = any(
+            snapshot.cur_lap_time is not None and snapshot.cur_lap_time >= 0.0
+            for snapshot in snapshots
+        )
+        if not has_lap_time:
+            return [float(index) for index, _snapshot in enumerate(snapshots)]
+
+        times = []
+        for index, snapshot in enumerate(snapshots):
+            if snapshot.cur_lap_time is not None and snapshot.cur_lap_time >= 0.0:
+                times.append(snapshot.cur_lap_time)
+            else:
+                times.append(float(index))
+        return times
+
+    def windowed_series(
+        self,
+        attribute: str,
+        window_seconds: float,
+    ) -> tuple[list[float], list[float]]:
+        times = self.chart_times()
+        values = self.values(attribute)
+        if not times:
+            return [], []
+
+        cutoff = times[-1] - max(0.0, window_seconds)
+        points = [
+            (time_value, data_value)
+            for time_value, data_value in zip(times, values)
+            if time_value >= cutoff
+        ]
+        if not points:
+            return [], []
+        x_values, y_values = zip(*points)
+        return list(x_values), list(y_values)
 
     def snapshots(self) -> list[TelemetrySnapshot]:
         return list(self._snapshots)
@@ -375,6 +419,19 @@ def _to_float(value: Any) -> float | None:
     if math.isnan(numeric) or math.isinf(numeric):
         return None
     return numeric
+
+
+def _to_float_tuple(values: Any) -> tuple[float, ...]:
+    if values is None or (isinstance(values, str) and values == ""):
+        return ()
+    try:
+        return tuple(
+            numeric
+            for value in values
+            if (numeric := _to_float(value)) is not None
+        )
+    except TypeError:
+        return ()
 
 
 def _to_int(value: Any) -> int | None:

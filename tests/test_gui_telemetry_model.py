@@ -29,6 +29,8 @@ class TelemetryModelTests(unittest.TestCase):
             {
                 "step": "12",
                 "speed_x": "87.5",
+                "speed_y": "1.25",
+                "angle": "-0.05",
                 "gear": "3",
                 "accel": "0.42",
                 "brake": "0.18",
@@ -39,6 +41,7 @@ class TelemetryModelTests(unittest.TestCase):
                 "off_track": 0,
                 "front_sensor": "30",
                 "min_track_sensor": "12",
+                "track_sensors": [str(value) for value in range(19)],
                 "cur_lap_time": "14.25",
                 "last_lap_time": "",
             }
@@ -46,10 +49,13 @@ class TelemetryModelTests(unittest.TestCase):
 
         self.assertEqual(snapshot.step, 12)
         self.assertEqual(snapshot.speed_kmh, 87.5)
+        self.assertEqual(snapshot.speed_y_kmh, 1.25)
+        self.assertEqual(snapshot.angle, -0.05)
         self.assertEqual(snapshot.gear, 3)
         self.assertEqual(snapshot.throttle_pct, 42.0)
         self.assertEqual(snapshot.brake_pct, 18.0)
         self.assertEqual(snapshot.steer, -0.125)
+        self.assertEqual(snapshot.track_sensors, tuple(float(value) for value in range(19)))
         self.assertIsNone(snapshot.last_lap_time)
 
     def test_history_keeps_bounded_chart_series(self):
@@ -61,6 +67,29 @@ class TelemetryModelTests(unittest.TestCase):
         self.assertEqual(history.steps(), [2, 3])
         self.assertEqual(history.values("speed_kmh")[0], 20.0)
         self.assertTrue(math.isnan(history.values("speed_kmh")[1]))
+
+    def test_history_uses_lap_time_for_rolling_chart_series(self):
+        history = TelemetryHistory()
+        history.append(
+            TelemetrySnapshot.from_sample(
+                {"step": 1, "speed_x": 50, "cur_lap_time": 5.0}
+            )
+        )
+        history.append(
+            TelemetrySnapshot.from_sample(
+                {"step": 2, "speed_x": 80, "cur_lap_time": 20.0}
+            )
+        )
+        history.append(
+            TelemetrySnapshot.from_sample(
+                {"step": 3, "speed_x": 100, "cur_lap_time": 95.0}
+            )
+        )
+
+        x_values, y_values = history.windowed_series("speed_kmh", 80.0)
+
+        self.assertEqual(x_values, [20.0, 95.0])
+        self.assertEqual(y_values, [80.0, 100.0])
 
     def test_explanation_calls_out_edge_and_braking(self):
         snapshot = TelemetrySnapshot.from_sample(

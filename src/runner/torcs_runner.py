@@ -594,9 +594,9 @@ class TorcsRunner:
         reward,
         off_track,
     ):
-        track = telemetry.get("track", [])
-        front_sensor = track[9] if len(track) > 9 else None
-        min_track_sensor = min(track) if track else None
+        track_sensors = self._track_sensor_values(telemetry)
+        front_sensor = track_sensors[9] if len(track_sensors) > 9 else None
+        min_track_sensor = min(track_sensors) if track_sensors else None
         results["telemetry_samples"].append(
             {
                 "step": results["steps"],
@@ -615,7 +615,18 @@ class TorcsRunner:
                 "off_track": off_track,
                 "front_sensor": front_sensor,
                 "min_track_sensor": min_track_sensor,
+                "track_sensors": track_sensors,
                 "cur_lap_time": telemetry.get("curLapTime"),
                 "last_lap_time": telemetry.get("lastLapTime"),
             }
         )
+
+    @staticmethod
+    def _track_sensor_values(telemetry):
+        track = telemetry.get("track")
+        if track is None:
+            return []
+        try:
+            return [float(value) for value in list(track)[:19]]
+        except (TypeError, ValueError):
+            return []
