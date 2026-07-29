@@ -38,11 +38,13 @@ try:
     )
     from .race_worker import RaceWorker
     from .telemetry_model import (
+        ExplanationFrame,
         TelemetryHistory,
         TelemetrySnapshot,
-        explanation_event_key,
+        build_explanation_frame,
         format_explanation_entry,
         format_value,
+        summarize_run_explanation,
     )
 except ImportError:
     from project_discovery import (
@@ -57,11 +59,13 @@ except ImportError:
     )
     from race_worker import RaceWorker
     from telemetry_model import (
+        ExplanationFrame,
         TelemetryHistory,
         TelemetrySnapshot,
-        explanation_event_key,
+        build_explanation_frame,
         format_explanation_entry,
         format_value,
+        summarize_run_explanation,
     )
 
 
@@ -89,6 +93,9 @@ class MainWindow(QMainWindow):
         self.start_button = QPushButton("Start")
         self.stop_button = QPushButton("Stop")
         self.status_label = QLabel("Idle")
+        self.explanation_status_label = QLabel("Idle")
+        self.explanation_state_label = QLabel("Telemetry idle.")
+        self.explanation_reason_label = QLabel("- No live sample yet.")
         self.explanation_box = QTextEdit()
         self.run_history_table = QTableWidget(0, 8)
         self.run_history_source_label = QLabel()
@@ -100,8 +107,10 @@ class MainWindow(QMainWindow):
         self.steer_curve: Any = None
         self.throttle_curve: Any = None
         self.brake_curve: Any = None
-        self.explanation_interval_steps = 200
+        self.explanation_interval_seconds = 10.0
+        self.explanation_interval_steps = 500
         self._last_explanation_step: int | None = None
+        self._last_explanation_lap_time: float | None = None
         self._last_explanation_event_key: str | None = None
 
         self._configure_controls()
@@ -118,12 +127,20 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.status_label.setObjectName("statusLabel")
 
+        self.explanation_status_label.setObjectName("explanationStatus")
+        self.explanation_status_label.setAlignment(Qt.AlignCenter)
+        self.explanation_status_label.setMinimumHeight(28)
+        self.explanation_state_label.setWordWrap(True)
+        self.explanation_reason_label.setWordWrap(True)
+        self.explanation_reason_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._set_explanation_current(
+            "Idle",
+            "Telemetry idle.",
+            ["No live sample yet."],
+        )
         self.explanation_box.setReadOnly(True)
         self.explanation_box.document().setMaximumBlockCount(240)
-        self.explanation_box.setText(
-            "Project discovery is connected. Live race explanations will appear "
-            "here once telemetry is connected."
-        )
+        self.explanation_box.setText("Race log idle.")
 
     def _build_ui(self) -> None:
         tabs = QTabWidget()
@@ -242,7 +259,22 @@ class MainWindow(QMainWindow):
         title = QLabel("What The Car Is Doing")
         title.setFont(_section_font())
         layout.addWidget(title)
-        layout.addWidget(self.explanation_box)
+
+        current_group = QGroupBox("Current State")
+        current_layout = QVBoxLayout(current_group)
+        current_layout.addWidget(self.explanation_status_label)
+        current_layout.addWidget(self.explanation_state_label)
+        layout.addWidget(current_group)
+
+        reason_group = QGroupBox("Why")
+        reason_layout = QVBoxLayout(reason_group)
+        reason_layout.addWidget(self.explanation_reason_label)
+        layout.addWidget(reason_group)
+
+        log_group = QGroupBox("Event Log")
+        log_layout = QVBoxLayout(log_group)
+        log_layout.addWidget(self.explanation_box)
+        layout.addWidget(log_group, 1)
 
         return panel
 
@@ -337,9 +369,13 @@ class MainWindow(QMainWindow):
         self._reset_live_telemetry()
         self.status_label.setText("Starting race...")
         self.statusBar().showMessage("Starting TORCS worker thread")
-        self.explanation_box.setText(
-            f"Starting {agent.name} on {track.track_id} with {car.car_id}."
+        setup_message = f"Starting {agent.name} on {track.track_id} with {car.car_id}."
+        self._set_explanation_current(
+            "Normal",
+            setup_message,
+            ["Waiting for the first live telemetry sample."],
         )
+        self.explanation_box.setText(f"[setup] {setup_message}")
 
         self.race_thread = QThread(self)
         self.race_worker = RaceWorker(agent, track, car)
@@ -498,8 +534,16 @@ class MainWindow(QMainWindow):
         self.telemetry_history.append(snapshot)
         self._update_metric_values(snapshot)
         self._update_telemetry_charts()
-        if self._should_append_explanation(snapshot):
-            self._append_explanation(format_explanation_entry(snapshot))
+        explanation_frame = build_explanation_frame(snapshot)
+        self._set_explanation_current(
+            explanation_frame.severity,
+            explanation_frame.headline,
+            explanation_frame.reasons,
+        )
+        if self._should_append_explanation(snapshot, explanation_frame):
+            self._append_explanation(
+                format_explanation_entry(snapshot, explanation_frame)
+            )
 
     def _handle_run_saved(self, run_id: int) -> None:
         self._reload_run_history()
@@ -507,23 +551,32 @@ class MainWindow(QMainWindow):
 
     def _handle_race_finished(self, payload: object) -> None:
         if not isinstance(payload, dict):
-            self.explanation_box.setText("Race finished.")
+            self._set_explanation_current(
+                "Normal",
+                "Race finished.",
+                ["No structured run summary was returned."],
+            )
+            self._append_explanation("Race finished.")
             return
 
         results = payload.get("results", {}) or {}
         run_id = payload.get("run_id")
         termination = results.get("termination_reason", "finished")
-        laps = results.get("laps_completed", 0)
-        best_lap = results.get("best_lap_time_seconds")
-        saved_text = f" Saved as run #{run_id}." if run_id is not None else ""
-        lap_text = (
-            f" Best lap: {best_lap:.3f}s."
-            if isinstance(best_lap, (int, float))
-            else ""
+        summary = summarize_run_explanation(
+            self.telemetry_history.snapshots(),
+            results,
+            run_id=run_id,
         )
-        self._append_explanation(
-            f"Race ended by {termination}. Laps completed: {laps}.{lap_text}{saved_text}"
+        self._set_explanation_current(
+            _completion_status(termination),
+            (
+                "Race complete."
+                if termination == "target_laps_completed"
+                else f"Race ended by {termination}."
+            ),
+            summary.splitlines(),
         )
+        self._append_explanation(summary)
 
     def _handle_race_failed(self, traceback_text: str) -> None:
         summary = (
@@ -533,6 +586,11 @@ class MainWindow(QMainWindow):
         )
         self.status_label.setText("Race failed")
         self.statusBar().showMessage(summary)
+        self._set_explanation_current(
+            "At Risk",
+            "Race failed.",
+            [summary],
+        )
         self.explanation_box.setText(traceback_text)
         QMessageBox.critical(self, "Race Failed", summary)
 
@@ -544,11 +602,18 @@ class MainWindow(QMainWindow):
     def _reset_live_telemetry(self) -> None:
         self.telemetry_history.clear()
         self._last_explanation_step = None
+        self._last_explanation_lap_time = None
         self._last_explanation_event_key = None
         for key, label in self.metric_value_labels.items():
             unit = _metric_unit(key)
             label.setText("--" if not unit else f"-- {unit}")
         self._update_telemetry_charts()
+        self._set_explanation_current(
+            "Idle",
+            "Telemetry idle.",
+            ["No live sample yet."],
+        )
+        self.explanation_box.setText("Race log idle.")
 
     def _update_metric_values(self, snapshot: TelemetrySnapshot) -> None:
         self._set_metric("speed", format_value(snapshot.speed_kmh, ".1f"))
@@ -583,40 +648,78 @@ class MainWindow(QMainWindow):
 
     def _handle_worker_explanation(self, message: str) -> None:
         if len(self.telemetry_history) == 0:
+            self._set_explanation_current(
+                "Normal",
+                message,
+                ["Waiting for the first live telemetry sample."],
+            )
             self.explanation_box.setText(message)
             return
         self._append_explanation(message)
 
-    def _should_append_explanation(self, snapshot: TelemetrySnapshot) -> bool:
-        event_key = explanation_event_key(snapshot)
+    def _should_append_explanation(
+        self,
+        snapshot: TelemetrySnapshot,
+        explanation_frame: ExplanationFrame,
+    ) -> bool:
+        event_key = explanation_frame.event_key
         first_entry = self._last_explanation_step is None
-        step_delta = (
-            self.explanation_interval_steps
-            if self._last_explanation_step is None
-            else snapshot.step - self._last_explanation_step
-        )
+        previous_event_key = self._last_explanation_event_key
         important_change = (
-            self._last_explanation_event_key is not None
-            and event_key != self._last_explanation_event_key
-            and event_key
-            in {
-                "off_track",
-                "damage",
-                "very_limited_road",
-                "track_edge",
-                "braking",
-            }
+            previous_event_key is not None
+            and event_key != previous_event_key
+            and (
+                event_key in {
+                    "off_track",
+                    "damage",
+                    "stuck",
+                    "very_limited_road",
+                    "track_edge",
+                    "heavy_braking",
+                }
+                or previous_event_key
+                in {
+                    "off_track",
+                    "damage",
+                    "stuck",
+                    "very_limited_road",
+                    "track_edge",
+                    "heavy_braking",
+                }
+            )
         )
+        periodic_update = self._explanation_interval_elapsed(snapshot)
 
-        if (
-            first_entry
-            or important_change
-            or step_delta >= self.explanation_interval_steps
-        ):
+        if first_entry or important_change or periodic_update:
             self._last_explanation_step = snapshot.step
+            self._last_explanation_lap_time = snapshot.cur_lap_time
             self._last_explanation_event_key = event_key
             return True
         return False
+
+    def _explanation_interval_elapsed(self, snapshot: TelemetrySnapshot) -> bool:
+        if self._last_explanation_step is None:
+            return True
+        if (
+            snapshot.cur_lap_time is not None
+            and self._last_explanation_lap_time is not None
+        ):
+            return (
+                snapshot.cur_lap_time - self._last_explanation_lap_time
+                >= self.explanation_interval_seconds
+            )
+        return snapshot.step - self._last_explanation_step >= self.explanation_interval_steps
+
+    def _set_explanation_current(
+        self,
+        severity: str,
+        headline: str,
+        reasons: tuple[str, ...] | list[str],
+    ) -> None:
+        self.explanation_status_label.setText(severity)
+        self.explanation_status_label.setStyleSheet(_severity_style(severity))
+        self.explanation_state_label.setText(headline)
+        self.explanation_reason_label.setText(_format_reason_lines(reasons))
 
     def _append_explanation(self, message: str) -> None:
         scroll_bar = self.explanation_box.verticalScrollBar()
@@ -681,6 +784,41 @@ def _metric_unit(key: str) -> str:
         "brake": "%",
         "lap_time": "s",
     }.get(key, "")
+
+
+def _completion_status(termination: object) -> str:
+    if termination in {"stuck", "launch_stuck"}:
+        return "Stuck"
+    if termination in {"crashed", "off_track", "torcs_closed"}:
+        return "At Risk"
+    if termination == "stopped":
+        return "Caution"
+    return "Normal"
+
+
+def _format_reason_lines(reasons: tuple[str, ...] | list[str]) -> str:
+    if not reasons:
+        return "- No active reason."
+    return "\n".join(f"- {reason}" for reason in reasons)
+
+
+def _severity_style(severity: str) -> str:
+    palette = {
+        "Idle": ("#3b3b3b", "#d0d0d0"),
+        "Normal": ("#1f7a4d", "#ffffff"),
+        "Correcting": ("#265d97", "#ffffff"),
+        "Caution": ("#8a5a00", "#ffffff"),
+        "At Risk": ("#9f1f18", "#ffffff"),
+        "Stuck": ("#6f1d1b", "#ffffff"),
+    }
+    background, foreground = palette.get(severity, palette["Idle"])
+    return (
+        f"background-color: {background}; "
+        f"color: {foreground}; "
+        "border-radius: 4px; "
+        "font-weight: 700; "
+        "padding: 4px 8px;"
+    )
 
 
 def _format_seconds(value: float | None) -> str:

@@ -15,9 +15,11 @@ if str(SRC_DIR) not in sys.path:
 from gui.telemetry_model import (  # noqa: E402
     TelemetryHistory,
     TelemetrySnapshot,
+    build_explanation_frame,
     explain_snapshot,
     explanation_event_key,
     format_explanation_entry,
+    summarize_run_explanation,
 )
 
 
@@ -109,6 +111,60 @@ class TelemetryModelTests(unittest.TestCase):
         )
 
         self.assertEqual(explanation_event_key(snapshot), "very_limited_road")
+
+    def test_explanation_frame_marks_stuck_risk_after_launch(self):
+        snapshot = TelemetrySnapshot.from_sample(
+            {
+                "step": 820,
+                "speed_x": 1.5,
+                "brake": 0.12,
+                "track_pos": -0.1,
+                "front_sensor": 18,
+                "cur_lap_time": 16.0,
+            }
+        )
+
+        frame = build_explanation_frame(snapshot)
+
+        self.assertEqual(frame.severity, "Stuck")
+        self.assertEqual(frame.event_key, "stuck")
+        self.assertIn("near zero", frame.headline)
+
+    def test_run_summary_calls_out_stable_completion(self):
+        snapshots = [
+            TelemetrySnapshot.from_sample(
+                {
+                    "step": 1,
+                    "speed_x": 0,
+                    "accel": 0.8,
+                    "cur_lap_time": 0.0,
+                }
+            ),
+            TelemetrySnapshot.from_sample(
+                {
+                    "step": 100,
+                    "speed_x": 120,
+                    "accel": 0.4,
+                    "track_pos": 0.12,
+                    "front_sensor": 80,
+                    "cur_lap_time": 20.0,
+                }
+            ),
+        ]
+
+        summary = summarize_run_explanation(
+            snapshots,
+            {
+                "termination_reason": "target_laps_completed",
+                "laps_completed": 1,
+                "best_lap_time_seconds": 92.564,
+            },
+            run_id=78,
+        )
+
+        self.assertIn("Completed lap in 92.564s", summary)
+        self.assertIn("Mostly stable", summary)
+        self.assertIn("Saved as run #78", summary)
 
 
 if __name__ == "__main__":
