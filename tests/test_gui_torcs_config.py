@@ -15,9 +15,11 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from gui.torcs_config import (  # noqa: E402
+    BACKUP_SUFFIX,
     TorcsRaceSetup,
     TorcsRuntimeConfig,
     apply_runtime_config,
+    restore_stale_runtime_backups,
 )
 
 
@@ -87,12 +89,45 @@ class TorcsConfigTests(unittest.TestCase):
                     scr_server_path.read_text(encoding="utf-8"),
                     original_scr_server,
                 )
+                self.assertTrue(self._backup_path(practice_path).exists())
+                self.assertTrue(self._backup_path(scr_server_path).exists())
 
             self.assertEqual(practice_path.read_text(encoding="utf-8"), original_practice)
             self.assertEqual(
                 scr_server_path.read_text(encoding="utf-8"),
                 original_scr_server,
             )
+            self.assertFalse(self._backup_path(practice_path).exists())
+            self.assertFalse(self._backup_path(scr_server_path).exists())
+
+    def test_stale_runtime_backups_are_restored_before_a_new_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project_root = Path(directory)
+            practice_path, scr_server_path = self._copy_config_files(project_root)
+            original_practice = practice_path.read_text(encoding="utf-8")
+            original_scr_server = scr_server_path.read_text(encoding="utf-8")
+
+            self._backup_path(practice_path).write_text(
+                original_practice,
+                encoding="utf-8",
+            )
+            self._backup_path(scr_server_path).write_text(
+                original_scr_server,
+                encoding="utf-8",
+            )
+            practice_path.write_text("<broken />", encoding="utf-8")
+            scr_server_path.write_text("<broken />", encoding="utf-8")
+
+            restored_paths = restore_stale_runtime_backups(project_root)
+
+            self.assertEqual(set(restored_paths), {practice_path, scr_server_path})
+            self.assertEqual(practice_path.read_text(encoding="utf-8"), original_practice)
+            self.assertEqual(
+                scr_server_path.read_text(encoding="utf-8"),
+                original_scr_server,
+            )
+            self.assertFalse(self._backup_path(practice_path).exists())
+            self.assertFalse(self._backup_path(scr_server_path).exists())
 
     def _copy_config_files(self, project_root: Path) -> tuple[Path, Path]:
         practice_path = project_root / "torcs" / "config" / "raceman" / "practice.xml"
@@ -110,6 +145,9 @@ class TorcsConfigTests(unittest.TestCase):
             scr_server_path,
         )
         return practice_path, scr_server_path
+
+    def _backup_path(self, path: Path) -> Path:
+        return path.with_name(f"{path.name}{BACKUP_SUFFIX}")
 
     def _find_section(self, parent: ET.Element, name: str) -> ET.Element:
         return next(

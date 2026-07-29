@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+BACKUP_SUFFIX = ".codex-runtime.bak"
 
 
 @dataclass(frozen=True)
@@ -31,19 +32,60 @@ class TorcsRuntimeConfig:
         self.scr_server_path = (
             self.project_root / "torcs" / "drivers" / "scr_server" / "scr_server.xml"
         )
-        self._original_files: dict[Path, str] = {}
+        self._config_paths = [self.practice_path, self.scr_server_path]
 
     def __enter__(self) -> "TorcsRuntimeConfig":
-        self._original_files = {
-            self.practice_path: self.practice_path.read_text(encoding="utf-8"),
-            self.scr_server_path: self.scr_server_path.read_text(encoding="utf-8"),
-        }
-        apply_runtime_config(self.practice_path, self.scr_server_path, self.setup)
+        restore_stale_runtime_backups(self.project_root)
+        self._create_runtime_backups()
+
+        try:
+            apply_runtime_config(self.practice_path, self.scr_server_path, self.setup)
+        except Exception:
+            self._restore_runtime_backups()
+            raise
+
         return self
 
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
-        for path, original_text in self._original_files.items():
-            path.write_text(original_text, encoding="utf-8")
+        self._restore_runtime_backups()
+
+    def _create_runtime_backups(self) -> None:
+        for path in self._config_paths:
+            _backup_path(path).write_text(
+                path.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+
+    def _restore_runtime_backups(self) -> None:
+        for path in self._config_paths:
+            backup_path = _backup_path(path)
+            if not backup_path.exists():
+                continue
+            path.write_text(backup_path.read_text(encoding="utf-8"), encoding="utf-8")
+            backup_path.unlink()
+
+
+def restore_stale_runtime_backups(project_root: Path = PROJECT_ROOT) -> list[Path]:
+    restored_paths = []
+    for path in _runtime_config_paths(Path(project_root)):
+        backup_path = _backup_path(path)
+        if not backup_path.exists():
+            continue
+        path.write_text(backup_path.read_text(encoding="utf-8"), encoding="utf-8")
+        backup_path.unlink()
+        restored_paths.append(path)
+    return restored_paths
+
+
+def _runtime_config_paths(project_root: Path) -> list[Path]:
+    return [
+        project_root / "torcs" / "config" / "raceman" / "practice.xml",
+        project_root / "torcs" / "drivers" / "scr_server" / "scr_server.xml",
+    ]
+
+
+def _backup_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}{BACKUP_SUFFIX}")
 
 
 def apply_runtime_config(

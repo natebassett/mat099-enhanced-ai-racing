@@ -10,9 +10,11 @@ from PySide6.QtCore import QObject, Signal, Slot
 
 try:
     from .project_discovery import AgentOption, CarOption, TrackOption
+    from .telemetry_model import TelemetrySnapshot
     from .torcs_config import TorcsRaceSetup, TorcsRuntimeConfig
 except ImportError:
     from project_discovery import AgentOption, CarOption, TrackOption
+    from telemetry_model import TelemetrySnapshot
     from torcs_config import TorcsRaceSetup, TorcsRuntimeConfig
 
 
@@ -26,6 +28,7 @@ if str(SRC_DIR) not in sys.path:
 class RaceWorker(QObject):
     status_changed = Signal(str)
     explanation_changed = Signal(str)
+    telemetry_received = Signal(object)
     run_saved = Signal(int)
     race_finished = Signal(object)
     race_failed = Signal(str)
@@ -44,6 +47,7 @@ class RaceWorker(QObject):
         self._stop_requested = False
         self._runner: Any = None
         self._agent: Any = None
+        self._telemetry_interval_seconds = 1.0
 
     @Slot()
     def run(self) -> None:
@@ -90,6 +94,8 @@ class RaceWorker(QObject):
                 results = self._runner.run(
                     self._agent,
                     stop_requested=self._should_stop,
+                    telemetry_callback=self._handle_telemetry_sample,
+                    telemetry_interval_seconds=self._telemetry_interval_seconds,
                 )
 
             self.status_changed.emit("Saving race results...")
@@ -145,6 +151,9 @@ class RaceWorker(QObject):
 
     def _should_stop(self) -> bool:
         return self._stop_requested
+
+    def _handle_telemetry_sample(self, sample: dict[str, Any]) -> None:
+        self.telemetry_received.emit(TelemetrySnapshot.from_sample(sample))
 
     def _create_agent(self) -> Any:
         agent_class = _load_class(self.agent_option.class_path)

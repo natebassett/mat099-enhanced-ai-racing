@@ -21,6 +21,7 @@ data/map_aware_replay_eval_run*.csv
 data/map_aware_replay_run*.svg
 data/map_aware_tracking_run*.svg
 torcs/results/practice/results-*.xml
+*.codex-runtime.bak
 
 # OS / editor
 .DS_Store

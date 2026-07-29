@@ -28,6 +28,9 @@ class TorcsRunner:
     SERVER_PORT = 3001
     SERVER_START_TIMEOUT = 25.0
     MANUAL_START_TIMEOUT = 120.0
+    STUCK_SPEED_THRESHOLD = 0.08
+    STUCK_STEP_LIMIT = 250
+    STUCK_MIN_LAP_TIME_SECONDS = 8.0
 
     def __init__(self):
         self.env: Optional[TorcsEnv] = None
@@ -315,11 +318,23 @@ class TorcsRunner:
             reward = -1.0
         return raw_observation, reward, server_stopped, {}
 
-    def run(self, agent, *, stop_requested=None, telemetry_callback=None):
+    def run(
+        self,
+        agent,
+        *,
+        stop_requested=None,
+        telemetry_callback=None,
+        telemetry_interval_steps=1,
+        telemetry_interval_seconds=None,
+    ):
         assert self.env is not None, "Call connect() before run()"
         started_at = datetime.now(timezone.utc).isoformat()
         started_timer = time.perf_counter()
         observation = self.env.reset(relaunch=False)
+        telemetry_interval_seconds = self._normalise_telemetry_interval_seconds(
+            telemetry_interval_seconds
+        )
+        next_telemetry_sample_at = started_timer
 
         agent.reset()
 
@@ -426,15 +441,30 @@ class TorcsRunner:
                 if off_track:
                     results["off_track"] += 1
 
-                self._record_telemetry_sample(
-                    results,
-                    self.env.client.S.d,
-                    action_snapshot,
-                    reward,
-                    off_track,
+                now = time.perf_counter()
+                should_sample_telemetry = self._should_emit_telemetry_sample(
+                    results["steps"],
+                    telemetry_interval_steps,
+                    now=now,
+                    next_sample_at=(
+                        next_telemetry_sample_at
+                        if telemetry_interval_seconds is not None
+                        else None
+                    ),
                 )
-                if telemetry_callback is not None:
-                    telemetry_callback(results["telemetry_samples"][-1])
+                if should_sample_telemetry:
+                    self._record_telemetry_sample(
+                        results,
+                        self.env.client.S.d,
+                        action_snapshot,
+                        reward,
+                        off_track,
+                    )
+                    telemetry_sample = results["telemetry_samples"][-1]
+                    if telemetry_callback is not None:
+                        telemetry_callback(telemetry_sample)
+                    if telemetry_interval_seconds is not None:
+                        next_telemetry_sample_at = now + telemetry_interval_seconds
 
                 completed_lap = lap_tracker.update(self.env.client.S.d)
                 if (
@@ -465,6 +495,19 @@ class TorcsRunner:
                         results["termination_reason"] = "target_laps_completed"
                         break
 
+                if self._is_stuck_speed(speed):
+                    stuck_counter += 1
+                else:
+                    stuck_counter = 0
+
+                if self._should_stop_for_stuck(
+                    stuck_counter,
+                    self._lap_time_seconds(self.env.client.S.d),
+                ):
+                    results["termination_reason"] = "stuck"
+                    print("\nAgent became stuck.")
+                    break
+
                 if uses_full_control:
                     if done:
                         results["termination_reason"] = "race_finished"
@@ -485,17 +528,6 @@ class TorcsRunner:
                     print("\nAgent crashed.")
                     break
 
-                # 0.1 normalised speed is 5 km/h.
-                if speed < 0.1:
-                    stuck_counter += 1
-                else:
-                    stuck_counter = 0
-
-                if stuck_counter > 100:
-                    results["termination_reason"] = "stuck"
-                    print("\nAgent became stuck.")
-                    break
-
                 if done:
                     results["termination_reason"] = "finished"
                     print("\nRace finished.")
@@ -510,6 +542,49 @@ class TorcsRunner:
             self.shutdown()
 
         return results
+
+    @staticmethod
+    def _should_emit_telemetry_sample(
+        step,
+        interval_steps=None,
+        *,
+        now=None,
+        next_sample_at=None,
+    ):
+        if step == 1:
+            return True
+
+        if next_sample_at is not None:
+            if now is None:
+                raise ValueError("now is required for time-based telemetry sampling")
+            return now >= next_sample_at
+
+        interval = max(1, int(interval_steps or 1))
+        return step % interval == 0
+
+    @staticmethod
+    def _normalise_telemetry_interval_seconds(interval_seconds):
+        if interval_seconds is None:
+            return None
+        return max(0.0, float(interval_seconds))
+
+    @classmethod
+    def _is_stuck_speed(cls, speed):
+        return speed < cls.STUCK_SPEED_THRESHOLD
+
+    @classmethod
+    def _should_stop_for_stuck(cls, stuck_counter, lap_time_seconds):
+        return (
+            stuck_counter > cls.STUCK_STEP_LIMIT
+            and lap_time_seconds >= cls.STUCK_MIN_LAP_TIME_SECONDS
+        )
+
+    @staticmethod
+    def _lap_time_seconds(telemetry):
+        try:
+            return float(telemetry.get("curLapTime") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _record_telemetry_sample(
         self,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QThread
@@ -36,6 +37,13 @@ try:
         load_project_options,
     )
     from .race_worker import RaceWorker
+    from .telemetry_model import (
+        TelemetryHistory,
+        TelemetrySnapshot,
+        explanation_event_key,
+        format_explanation_entry,
+        format_value,
+    )
 except ImportError:
     from project_discovery import (
         AgentOption,
@@ -48,10 +56,18 @@ except ImportError:
         load_project_options,
     )
     from race_worker import RaceWorker
+    from telemetry_model import (
+        TelemetryHistory,
+        TelemetrySnapshot,
+        explanation_event_key,
+        format_explanation_entry,
+        format_value,
+    )
 
 
 @dataclass(frozen=True)
 class MetricSpec:
+    key: str
     label: str
     value: str
     unit: str = ""
@@ -78,6 +94,15 @@ class MainWindow(QMainWindow):
         self.run_history_source_label = QLabel()
         self.race_thread: QThread | None = None
         self.race_worker: RaceWorker | None = None
+        self.telemetry_history = TelemetryHistory()
+        self.metric_value_labels: dict[str, QLabel] = {}
+        self.speed_curve: Any = None
+        self.steer_curve: Any = None
+        self.throttle_curve: Any = None
+        self.brake_curve: Any = None
+        self.explanation_interval_steps = 200
+        self._last_explanation_step: int | None = None
+        self._last_explanation_event_key: str | None = None
 
         self._configure_controls()
         self._build_ui()
@@ -94,6 +119,7 @@ class MainWindow(QMainWindow):
         self.status_label.setObjectName("statusLabel")
 
         self.explanation_box.setReadOnly(True)
+        self.explanation_box.document().setMaximumBlockCount(240)
         self.explanation_box.setText(
             "Project discovery is connected. Live race explanations will appear "
             "here once telemetry is connected."
@@ -154,14 +180,14 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
 
         metrics = [
-            MetricSpec("Speed", "--", "km/h"),
-            MetricSpec("Gear", "--"),
-            MetricSpec("Throttle", "--", "%"),
-            MetricSpec("Brake", "--", "%"),
-            MetricSpec("Steer", "--"),
-            MetricSpec("Track Pos", "--"),
-            MetricSpec("Lap Time", "--", "s"),
-            MetricSpec("Damage", "--"),
+            MetricSpec("speed", "Speed", "--", "km/h"),
+            MetricSpec("gear", "Gear", "--"),
+            MetricSpec("throttle", "Throttle", "--", "%"),
+            MetricSpec("brake", "Brake", "--", "%"),
+            MetricSpec("steer", "Steer", "--"),
+            MetricSpec("track_pos", "Track Pos", "--"),
+            MetricSpec("lap_time", "Lap Time", "--", "s"),
+            MetricSpec("damage", "Damage", "--"),
         ]
         metric_grid = QGridLayout()
         for index, metric in enumerate(metrics):
@@ -173,11 +199,38 @@ class MainWindow(QMainWindow):
         layout.addLayout(metric_grid)
 
         chart_row = QHBoxLayout()
-        chart_row.addWidget(self._placeholder_plot("Speed"))
-        chart_row.addWidget(self._placeholder_plot("Steering"))
+        speed_plot = self._build_plot("Speed", "km/h")
+        self.speed_curve = speed_plot.plot(
+            [],
+            [],
+            pen=pg.mkPen("#2f80ed", width=2),
+        )
+        chart_row.addWidget(speed_plot)
+
+        steering_plot = self._build_plot("Steering", "steer")
+        steering_plot.setYRange(-1.0, 1.0)
+        self.steer_curve = steering_plot.plot(
+            [],
+            [],
+            pen=pg.mkPen("#8e5cf7", width=2),
+        )
+        chart_row.addWidget(steering_plot)
         layout.addLayout(chart_row)
 
-        pedal_plot = self._placeholder_plot("Throttle / Brake")
+        pedal_plot = self._build_plot("Throttle / Brake", "%")
+        pedal_plot.setYRange(0.0, 100.0)
+        self.throttle_curve = pedal_plot.plot(
+            [],
+            [],
+            pen=pg.mkPen("#27ae60", width=2),
+            name="Throttle",
+        )
+        self.brake_curve = pedal_plot.plot(
+            [],
+            [],
+            pen=pg.mkPen("#c0392b", width=2),
+            name="Brake",
+        )
         layout.addWidget(pedal_plot)
 
         return panel
@@ -246,18 +299,20 @@ class MainWindow(QMainWindow):
         value = QLabel(metric.value if not metric.unit else f"{metric.value} {metric.unit}")
         value.setObjectName("metricValue")
         value.setAlignment(Qt.AlignBottom | Qt.AlignLeft)
+        self.metric_value_labels[metric.key] = value
 
         layout.addWidget(label)
         layout.addWidget(value)
         return card
 
-    def _placeholder_plot(self, title: str) -> pg.PlotWidget:
+    def _build_plot(self, title: str, left_axis_label: str) -> pg.PlotWidget:
         plot = pg.PlotWidget()
         plot.setTitle(title)
         plot.setBackground("w")
+        plot.setLabel("left", left_axis_label)
+        plot.setLabel("bottom", "step")
         plot.showGrid(x=True, y=True, alpha=0.25)
         plot.setMinimumHeight(190)
-        plot.plot([0, 1, 2, 3, 4], [0, 0, 0, 0, 0], pen=pg.mkPen("#4f6f8f", width=2))
         return plot
 
     def _connect_signals(self) -> None:
@@ -279,6 +334,7 @@ class MainWindow(QMainWindow):
             return
 
         self._set_race_controls_enabled(False)
+        self._reset_live_telemetry()
         self.status_label.setText("Starting race...")
         self.statusBar().showMessage("Starting TORCS worker thread")
         self.explanation_box.setText(
@@ -291,7 +347,8 @@ class MainWindow(QMainWindow):
 
         self.race_thread.started.connect(self.race_worker.run)
         self.race_worker.status_changed.connect(self._handle_worker_status)
-        self.race_worker.explanation_changed.connect(self.explanation_box.setText)
+        self.race_worker.explanation_changed.connect(self._handle_worker_explanation)
+        self.race_worker.telemetry_received.connect(self._handle_telemetry_received)
         self.race_worker.run_saved.connect(self._handle_run_saved)
         self.race_worker.race_finished.connect(self._handle_race_finished)
         self.race_worker.race_failed.connect(self._handle_race_failed)
@@ -434,6 +491,16 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
         self.statusBar().showMessage(message)
 
+    def _handle_telemetry_received(self, snapshot: object) -> None:
+        if not isinstance(snapshot, TelemetrySnapshot):
+            return
+
+        self.telemetry_history.append(snapshot)
+        self._update_metric_values(snapshot)
+        self._update_telemetry_charts()
+        if self._should_append_explanation(snapshot):
+            self._append_explanation(format_explanation_entry(snapshot))
+
     def _handle_run_saved(self, run_id: int) -> None:
         self._reload_run_history()
         self.statusBar().showMessage(f"Saved race run #{run_id}")
@@ -454,7 +521,7 @@ class MainWindow(QMainWindow):
             if isinstance(best_lap, (int, float))
             else ""
         )
-        self.explanation_box.setText(
+        self._append_explanation(
             f"Race ended by {termination}. Laps completed: {laps}.{lap_text}{saved_text}"
         )
 
@@ -473,6 +540,94 @@ class MainWindow(QMainWindow):
         self.race_thread = None
         self.race_worker = None
         self._reset_race_controls()
+
+    def _reset_live_telemetry(self) -> None:
+        self.telemetry_history.clear()
+        self._last_explanation_step = None
+        self._last_explanation_event_key = None
+        for key, label in self.metric_value_labels.items():
+            unit = _metric_unit(key)
+            label.setText("--" if not unit else f"-- {unit}")
+        self._update_telemetry_charts()
+
+    def _update_metric_values(self, snapshot: TelemetrySnapshot) -> None:
+        self._set_metric("speed", format_value(snapshot.speed_kmh, ".1f"))
+        self._set_metric("gear", "--" if snapshot.gear is None else str(snapshot.gear))
+        self._set_metric("throttle", format_value(snapshot.throttle_pct, ".0f"))
+        self._set_metric("brake", format_value(snapshot.brake_pct, ".0f"))
+        self._set_metric("steer", format_value(snapshot.steer, ".3f"))
+        self._set_metric("track_pos", format_value(snapshot.track_pos, ".3f"))
+        self._set_metric("lap_time", format_value(snapshot.cur_lap_time, ".2f"))
+        self._set_metric("damage", format_value(snapshot.damage, ".0f"))
+
+    def _set_metric(self, key: str, value: str) -> None:
+        label = self.metric_value_labels.get(key)
+        if label is None:
+            return
+        unit = _metric_unit(key)
+        label.setText(value if not unit else f"{value} {unit}")
+
+    def _update_telemetry_charts(self) -> None:
+        steps = self.telemetry_history.steps()
+        if self.speed_curve is not None:
+            self.speed_curve.setData(steps, self.telemetry_history.values("speed_kmh"))
+        if self.steer_curve is not None:
+            self.steer_curve.setData(steps, self.telemetry_history.values("steer"))
+        if self.throttle_curve is not None:
+            self.throttle_curve.setData(
+                steps,
+                self.telemetry_history.values("throttle_pct"),
+            )
+        if self.brake_curve is not None:
+            self.brake_curve.setData(steps, self.telemetry_history.values("brake_pct"))
+
+    def _handle_worker_explanation(self, message: str) -> None:
+        if len(self.telemetry_history) == 0:
+            self.explanation_box.setText(message)
+            return
+        self._append_explanation(message)
+
+    def _should_append_explanation(self, snapshot: TelemetrySnapshot) -> bool:
+        event_key = explanation_event_key(snapshot)
+        first_entry = self._last_explanation_step is None
+        step_delta = (
+            self.explanation_interval_steps
+            if self._last_explanation_step is None
+            else snapshot.step - self._last_explanation_step
+        )
+        important_change = (
+            self._last_explanation_event_key is not None
+            and event_key != self._last_explanation_event_key
+            and event_key
+            in {
+                "off_track",
+                "damage",
+                "very_limited_road",
+                "track_edge",
+                "braking",
+            }
+        )
+
+        if (
+            first_entry
+            or important_change
+            or step_delta >= self.explanation_interval_steps
+        ):
+            self._last_explanation_step = snapshot.step
+            self._last_explanation_event_key = event_key
+            return True
+        return False
+
+    def _append_explanation(self, message: str) -> None:
+        scroll_bar = self.explanation_box.verticalScrollBar()
+        was_at_bottom = scroll_bar.value() >= scroll_bar.maximum() - 4
+
+        if self.explanation_box.toPlainText().strip():
+            self.explanation_box.append("")
+        self.explanation_box.append(message)
+
+        if was_at_bottom:
+            scroll_bar.setValue(scroll_bar.maximum())
 
     def _set_race_controls_enabled(self, enabled: bool) -> None:
         self.agent_combo.setEnabled(enabled)
@@ -517,6 +672,15 @@ def _section_font() -> QFont:
 
 def _format_optional(value: object) -> str:
     return "--" if value is None else str(value)
+
+
+def _metric_unit(key: str) -> str:
+    return {
+        "speed": "km/h",
+        "throttle": "%",
+        "brake": "%",
+        "lap_time": "s",
+    }.get(key, "")
 
 
 def _format_seconds(value: float | None) -> str:
