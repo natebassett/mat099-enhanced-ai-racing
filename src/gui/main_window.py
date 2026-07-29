@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, QThread
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QThread, QTimer
+from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -722,15 +722,17 @@ class MainWindow(QMainWindow):
         self.explanation_reason_label.setText(_format_reason_lines(reasons))
 
     def _append_explanation(self, message: str) -> None:
-        scroll_bar = self.explanation_box.verticalScrollBar()
-        was_at_bottom = scroll_bar.value() >= scroll_bar.maximum() - 4
-
         if self.explanation_box.toPlainText().strip():
             self.explanation_box.append("")
         self.explanation_box.append(message)
+        self._scroll_explanation_to_latest()
+        QTimer.singleShot(0, self._scroll_explanation_to_latest)
 
-        if was_at_bottom:
-            scroll_bar.setValue(scroll_bar.maximum())
+    def _scroll_explanation_to_latest(self) -> None:
+        self.explanation_box.moveCursor(QTextCursor.MoveOperation.End)
+        self.explanation_box.ensureCursorVisible()
+        scroll_bar = self.explanation_box.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
 
     def _set_race_controls_enabled(self, enabled: bool) -> None:
         self.agent_combo.setEnabled(enabled)
