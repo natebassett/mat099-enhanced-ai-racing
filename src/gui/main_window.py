@@ -23,6 +23,27 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+try:
+    from .project_discovery import (
+        AgentOption,
+        CarOption,
+        ProjectOptions,
+        RunSummary,
+        TrackOption,
+        compatible_tracks_for_agent,
+        load_project_options,
+    )
+except ImportError:
+    from project_discovery import (
+        AgentOption,
+        CarOption,
+        ProjectOptions,
+        RunSummary,
+        TrackOption,
+        compatible_tracks_for_agent,
+        load_project_options,
+    )
+
 
 @dataclass(frozen=True)
 class MetricSpec:
@@ -32,12 +53,14 @@ class MetricSpec:
 
 
 class MainWindow(QMainWindow):
-    """Stage 1 GUI shell with placeholder controls and telemetry surfaces."""
+    """Desktop GUI shell with real project option discovery."""
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Enhanced AI Racing Telemetry Dashboard")
         self.resize(1280, 760)
+
+        self.project_options: ProjectOptions = load_project_options()
 
         self.agent_combo = QComboBox()
         self.track_combo = QComboBox()
@@ -46,43 +69,27 @@ class MainWindow(QMainWindow):
         self.stop_button = QPushButton("Stop")
         self.status_label = QLabel("Idle")
         self.explanation_box = QTextEdit()
+        self.run_history_table = QTableWidget(0, 8)
+        self.run_history_source_label = QLabel()
 
         self._configure_controls()
         self._build_ui()
         self._connect_signals()
+        self._update_selection_details()
 
     def _configure_controls(self) -> None:
-        self.agent_combo.addItems(
-            [
-                "Map-Aware Racing-Line Agent",
-                "Rule-Based Anti-Spin Agent",
-                "Random Agent",
-            ]
-        )
-        self.track_combo.addItems(
-            [
-                "g-track-3",
-                "corkscrew",
-                "e-track-1",
-                "e-track-2",
-                "forza",
-            ]
-        )
-        self.car_combo.addItems(
-            [
-                "car1-ow1",
-                "car1-trb1",
-                "car2-trb1",
-                "155-DTM",
-                "acura-nsx-sz",
-            ]
-        )
+        self._populate_combo(self.agent_combo, self.project_options.agents)
+        self._refresh_track_options(preferred_track_id="g-track-3")
+        self._populate_combo(self.car_combo, self.project_options.cars)
+        self._select_combo_item(self.car_combo, "car_id", "car1-ow1")
+
         self.stop_button.setEnabled(False)
         self.status_label.setObjectName("statusLabel")
 
         self.explanation_box.setReadOnly(True)
         self.explanation_box.setText(
-            "Race explanation will appear here once live telemetry is connected."
+            "Project discovery is connected. Live race explanations will appear "
+            "here once telemetry is connected."
         )
 
     def _build_ui(self) -> None:
@@ -91,7 +98,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_run_history_tab(), "Run History")
 
         self.setCentralWidget(tabs)
-        self.statusBar().showMessage("Stage 1 GUI shell loaded")
+        self.statusBar().showMessage(self._discovery_summary())
 
     def _build_dashboard_tab(self) -> QWidget:
         page = QWidget()
@@ -187,10 +194,15 @@ class MainWindow(QMainWindow):
         title.setFont(_section_font())
         layout.addWidget(title)
 
-        table = QTableWidget(0, 7)
-        table.setHorizontalHeaderLabels(
+        self.run_history_source_label.setText(
+            f"Source: {self.project_options.run_history_source}"
+        )
+        layout.addWidget(self.run_history_source_label)
+
+        self.run_history_table.setHorizontalHeaderLabels(
             [
                 "Run",
+                "Started",
                 "Agent",
                 "Track",
                 "Best Lap",
@@ -199,22 +211,14 @@ class MainWindow(QMainWindow):
                 "Result",
             ]
         )
-        table.horizontalHeader().setStretchLastSection(True)
-        table.setAlternatingRowColors(True)
-        table.setEditTriggers(QTableWidget.NoEditTriggers)
-        table.setSelectionBehavior(QTableWidget.SelectRows)
-        table.setMinimumHeight(420)
+        self.run_history_table.horizontalHeader().setStretchLastSection(True)
+        self.run_history_table.setAlternatingRowColors(True)
+        self.run_history_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.run_history_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.run_history_table.setMinimumHeight(420)
+        self._populate_run_history_table(self.project_options.runs)
 
-        placeholder_rows = [
-            ["--", "Map-Aware Racing-Line Agent", "g-track-3", "--", "--", "--", "Waiting for saved runs"],
-            ["--", "Rule-Based Anti-Spin Agent", "corkscrew", "--", "--", "--", "Stage 2 will load real data"],
-        ]
-        table.setRowCount(len(placeholder_rows))
-        for row_index, row in enumerate(placeholder_rows):
-            for column_index, value in enumerate(row):
-                table.setItem(row_index, column_index, QTableWidgetItem(value))
-
-        layout.addWidget(table)
+        layout.addWidget(self.run_history_table)
         return page
 
     def _combo_group(self, label: str, combo: QComboBox) -> QGroupBox:
@@ -252,27 +256,165 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.start_button.clicked.connect(self._handle_start_clicked)
         self.stop_button.clicked.connect(self._handle_stop_clicked)
+        self.agent_combo.currentIndexChanged.connect(self._handle_agent_changed)
+        self.track_combo.currentIndexChanged.connect(self._update_selection_details)
+        self.car_combo.currentIndexChanged.connect(self._update_selection_details)
 
     def _handle_start_clicked(self) -> None:
+        agent = self.selected_agent()
+        track = self.selected_track()
+        car = self.selected_car()
+        if agent is None or track is None or car is None:
+            self.status_label.setText("No compatible race setup selected.")
+            return
+
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.status_label.setText(
-            f"Ready to run {self.agent_combo.currentText()} on "
-            f"{self.track_combo.currentText()} with {self.car_combo.currentText()}."
+            f"Ready to run {agent.name} on {track.track_id} with {car.car_id}."
         )
-        self.statusBar().showMessage("Stage 1 placeholder start clicked")
+        self.statusBar().showMessage("Stage 2 placeholder start clicked")
         self.explanation_box.setText(
-            "Stage 1 only confirms the GUI flow. TORCS launch and live telemetry "
-            "will be wired in later stages."
+            "Stage 2 uses real project selections. TORCS launch and live telemetry "
+            "will be wired in Stage 3."
         )
 
     def _handle_stop_clicked(self) -> None:
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.status_label.setText("Idle")
-        self.statusBar().showMessage("Stage 1 placeholder stop clicked")
+        self.statusBar().showMessage("Stage 2 placeholder stop clicked")
         self.explanation_box.setText(
-            "Race explanation will appear here once live telemetry is connected."
+            "Project discovery is connected. Live race explanations will appear "
+            "here once telemetry is connected."
+        )
+        self._update_selection_details()
+
+    def selected_agent(self) -> AgentOption | None:
+        return self.agent_combo.currentData(Qt.UserRole)
+
+    def selected_track(self) -> TrackOption | None:
+        return self.track_combo.currentData(Qt.UserRole)
+
+    def selected_car(self) -> CarOption | None:
+        return self.car_combo.currentData(Qt.UserRole)
+
+    def _populate_combo(self, combo: QComboBox, options: list[object]) -> None:
+        combo.clear()
+        for option in options:
+            combo.addItem(option.label, option)
+
+    def _select_combo_item(self, combo: QComboBox, attribute: str, value: str) -> bool:
+        for index in range(combo.count()):
+            option = combo.itemData(index, Qt.UserRole)
+            if getattr(option, attribute, None) == value:
+                combo.setCurrentIndex(index)
+                return True
+        return False
+
+    def _handle_agent_changed(self) -> None:
+        previous_track = self.selected_track()
+        self._refresh_track_options(
+            preferred_track_id=previous_track.track_id if previous_track else None
+        )
+        self._update_selection_details()
+
+    def _refresh_track_options(self, preferred_track_id: str | None = None) -> None:
+        agent = self.selected_agent()
+        tracks = self.project_options.tracks
+        if agent is not None:
+            tracks = compatible_tracks_for_agent(agent, tracks)
+
+        self.track_combo.blockSignals(True)
+        self.track_combo.clear()
+        for track in tracks:
+            self.track_combo.addItem(_track_label(track), track)
+
+        selected = False
+        if preferred_track_id:
+            selected = self._select_combo_item(
+                self.track_combo,
+                "track_id",
+                preferred_track_id,
+            )
+        if not selected and agent is not None and agent.requires_racing_line:
+            selected = self._select_combo_item(
+                self.track_combo,
+                "track_id",
+                "g-track-3",
+            )
+        if not selected and self.track_combo.count() > 0:
+            self.track_combo.setCurrentIndex(0)
+
+        self.track_combo.blockSignals(False)
+        self.start_button.setEnabled(self.track_combo.count() > 0)
+
+    def _populate_run_history_table(self, runs: list[RunSummary]) -> None:
+        self.run_history_table.setRowCount(max(1, len(runs)))
+        if not runs:
+            values = ["--", "--", "--", "--", "--", "--", "--", "No saved runs found"]
+            for column_index, value in enumerate(values):
+                self.run_history_table.setItem(
+                    0,
+                    column_index,
+                    QTableWidgetItem(value),
+                )
+            return
+
+        for row_index, run in enumerate(runs):
+            values = [
+                str(run.run_id),
+                _short_datetime(run.started_at),
+                run.agent_name,
+                run.track,
+                _format_seconds(run.best_lap_time_seconds),
+                _format_speed(run.avg_speed),
+                "--" if run.off_track_count is None else str(run.off_track_count),
+                run.termination_reason,
+            ]
+            for column_index, value in enumerate(values):
+                self.run_history_table.setItem(
+                    row_index,
+                    column_index,
+                    QTableWidgetItem(value),
+                )
+
+        self.run_history_table.resizeColumnsToContents()
+
+    def _update_selection_details(self) -> None:
+        agent = self.selected_agent()
+        track = self.selected_track()
+        car = self.selected_car()
+        if agent is None or track is None or car is None:
+            return
+
+        self.statusBar().showMessage(
+            f"{self._discovery_summary()} Selected: {agent.agent_type} / "
+            f"{track.track_id} / {car.car_id}. "
+            f"{self.track_combo.count()} compatible tracks shown."
+        )
+        self.agent_combo.setToolTip(
+            f"{agent.class_path}\n"
+            f"Full control: {'yes' if agent.uses_full_control else 'no'}\n"
+            f"Requires racing line: {'yes' if agent.requires_racing_line else 'no'}\n"
+            f"Target laps: {_format_optional(agent.target_laps)}"
+        )
+        self.track_combo.setToolTip(
+            f"{track.track_id}\n"
+            f"Category: {track.category}\n"
+            f"Racing line: {_format_path(track.racing_line_path)}\n"
+            f"{track.path}"
+        )
+        self.car_combo.setToolTip(
+            f"{car.car_id}\nCategory: {car.category}\n{car.path}"
+        )
+
+    def _discovery_summary(self) -> str:
+        return (
+            f"Discovered {len(self.project_options.agents)} agents, "
+            f"{len(self.project_options.tracks)} tracks, "
+            f"{len(self.project_options.cars)} cars, "
+            f"{len(self.project_options.runs)} saved runs."
         )
 
 
@@ -281,3 +423,32 @@ def _section_font() -> QFont:
     font.setPointSize(13)
     font.setBold(True)
     return font
+
+
+def _format_optional(value: object) -> str:
+    return "--" if value is None else str(value)
+
+
+def _format_seconds(value: float | None) -> str:
+    return "--" if value is None else f"{value:.3f}s"
+
+
+def _format_speed(value: float | None) -> str:
+    if value is None:
+        return "--"
+    return f"{value * 50.0:.1f} km/h"
+
+
+def _format_path(value: object) -> str:
+    return "not generated" if value is None else str(value)
+
+
+def _track_label(track: TrackOption) -> str:
+    suffix = " - raceline ready" if track.has_racing_line else ""
+    return f"{track.label}{suffix}"
+
+
+def _short_datetime(value: str) -> str:
+    if not value:
+        return "--"
+    return value.replace("T", " ").replace("+00:00", " UTC")[:19]
