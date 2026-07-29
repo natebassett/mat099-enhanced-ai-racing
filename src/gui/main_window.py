@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import pyqtgraph as pg
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QComboBox,
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSplitter,
     QTableWidget,
@@ -31,8 +32,10 @@ try:
         RunSummary,
         TrackOption,
         compatible_tracks_for_agent,
+        discover_run_history,
         load_project_options,
     )
+    from .race_worker import RaceWorker
 except ImportError:
     from project_discovery import (
         AgentOption,
@@ -41,8 +44,10 @@ except ImportError:
         RunSummary,
         TrackOption,
         compatible_tracks_for_agent,
+        discover_run_history,
         load_project_options,
     )
+    from race_worker import RaceWorker
 
 
 @dataclass(frozen=True)
@@ -71,6 +76,8 @@ class MainWindow(QMainWindow):
         self.explanation_box = QTextEdit()
         self.run_history_table = QTableWidget(0, 8)
         self.run_history_source_label = QLabel()
+        self.race_thread: QThread | None = None
+        self.race_worker: RaceWorker | None = None
 
         self._configure_controls()
         self._build_ui()
@@ -261,6 +268,9 @@ class MainWindow(QMainWindow):
         self.car_combo.currentIndexChanged.connect(self._update_selection_details)
 
     def _handle_start_clicked(self) -> None:
+        if self.race_thread is not None:
+            return
+
         agent = self.selected_agent()
         track = self.selected_track()
         car = self.selected_car()
@@ -268,27 +278,38 @@ class MainWindow(QMainWindow):
             self.status_label.setText("No compatible race setup selected.")
             return
 
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self.status_label.setText(
-            f"Ready to run {agent.name} on {track.track_id} with {car.car_id}."
-        )
-        self.statusBar().showMessage("Stage 2 placeholder start clicked")
+        self._set_race_controls_enabled(False)
+        self.status_label.setText("Starting race...")
+        self.statusBar().showMessage("Starting TORCS worker thread")
         self.explanation_box.setText(
-            "Stage 2 uses real project selections. TORCS launch and live telemetry "
-            "will be wired in Stage 3."
+            f"Starting {agent.name} on {track.track_id} with {car.car_id}."
         )
 
+        self.race_thread = QThread(self)
+        self.race_worker = RaceWorker(agent, track, car)
+        self.race_worker.moveToThread(self.race_thread)
+
+        self.race_thread.started.connect(self.race_worker.run)
+        self.race_worker.status_changed.connect(self._handle_worker_status)
+        self.race_worker.explanation_changed.connect(self.explanation_box.setText)
+        self.race_worker.run_saved.connect(self._handle_run_saved)
+        self.race_worker.race_finished.connect(self._handle_race_finished)
+        self.race_worker.race_failed.connect(self._handle_race_failed)
+        self.race_worker.completed.connect(self.race_thread.quit)
+        self.race_worker.completed.connect(self.race_worker.deleteLater)
+        self.race_thread.finished.connect(self.race_thread.deleteLater)
+        self.race_thread.finished.connect(self._clear_race_thread)
+        self.race_thread.start()
+
     def _handle_stop_clicked(self) -> None:
-        self.start_button.setEnabled(True)
+        if self.race_worker is None:
+            self._reset_race_controls()
+            return
+
         self.stop_button.setEnabled(False)
-        self.status_label.setText("Idle")
-        self.statusBar().showMessage("Stage 2 placeholder stop clicked")
-        self.explanation_box.setText(
-            "Project discovery is connected. Live race explanations will appear "
-            "here once telemetry is connected."
-        )
-        self._update_selection_details()
+        self.status_label.setText("Stopping race...")
+        self.statusBar().showMessage("Stop requested")
+        self.race_worker.request_stop()
 
     def selected_agent(self) -> AgentOption | None:
         return self.agent_combo.currentData(Qt.UserRole)
@@ -408,6 +429,75 @@ class MainWindow(QMainWindow):
         self.car_combo.setToolTip(
             f"{car.car_id}\nCategory: {car.category}\n{car.path}"
         )
+
+    def _handle_worker_status(self, message: str) -> None:
+        self.status_label.setText(message)
+        self.statusBar().showMessage(message)
+
+    def _handle_run_saved(self, run_id: int) -> None:
+        self._reload_run_history()
+        self.statusBar().showMessage(f"Saved race run #{run_id}")
+
+    def _handle_race_finished(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            self.explanation_box.setText("Race finished.")
+            return
+
+        results = payload.get("results", {}) or {}
+        run_id = payload.get("run_id")
+        termination = results.get("termination_reason", "finished")
+        laps = results.get("laps_completed", 0)
+        best_lap = results.get("best_lap_time_seconds")
+        saved_text = f" Saved as run #{run_id}." if run_id is not None else ""
+        lap_text = (
+            f" Best lap: {best_lap:.3f}s."
+            if isinstance(best_lap, (int, float))
+            else ""
+        )
+        self.explanation_box.setText(
+            f"Race ended by {termination}. Laps completed: {laps}.{lap_text}{saved_text}"
+        )
+
+    def _handle_race_failed(self, traceback_text: str) -> None:
+        summary = (
+            traceback_text.strip().splitlines()[-1]
+            if traceback_text
+            else "Unknown error"
+        )
+        self.status_label.setText("Race failed")
+        self.statusBar().showMessage(summary)
+        self.explanation_box.setText(traceback_text)
+        QMessageBox.critical(self, "Race Failed", summary)
+
+    def _clear_race_thread(self) -> None:
+        self.race_thread = None
+        self.race_worker = None
+        self._reset_race_controls()
+
+    def _set_race_controls_enabled(self, enabled: bool) -> None:
+        self.agent_combo.setEnabled(enabled)
+        self.track_combo.setEnabled(enabled)
+        self.car_combo.setEnabled(enabled)
+        self.start_button.setEnabled(enabled and self.track_combo.count() > 0)
+        self.stop_button.setEnabled(not enabled)
+
+    def _reset_race_controls(self) -> None:
+        self._set_race_controls_enabled(True)
+        if self.status_label.text() in {"Stopping race...", "Starting race..."}:
+            self.status_label.setText("Idle")
+        self._update_selection_details()
+
+    def _reload_run_history(self) -> None:
+        runs, source = discover_run_history()
+        self.project_options = ProjectOptions(
+            agents=self.project_options.agents,
+            tracks=self.project_options.tracks,
+            cars=self.project_options.cars,
+            runs=runs,
+            run_history_source=source,
+        )
+        self.run_history_source_label.setText(f"Source: {source}")
+        self._populate_run_history_table(runs)
 
     def _discovery_summary(self) -> str:
         return (

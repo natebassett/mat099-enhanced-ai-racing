@@ -315,7 +315,7 @@ class TorcsRunner:
             reward = -1.0
         return raw_observation, reward, server_stopped, {}
 
-    def run(self, agent):
+    def run(self, agent, *, stop_requested=None, telemetry_callback=None):
         assert self.env is not None, "Call connect() before run()"
         started_at = datetime.now(timezone.utc).isoformat()
         started_timer = time.perf_counter()
@@ -350,6 +350,10 @@ class TorcsRunner:
 
         try:
             for _ in range(max_steps):
+                if stop_requested is not None and stop_requested():
+                    results["termination_reason"] = "stopped"
+                    break
+
                 if self.torcs_process is not None and self.torcs_process.poll() is not None:
                     results["termination_reason"] = "torcs_closed"
                     print("\nTORCS closed unexpectedly.")
@@ -429,6 +433,8 @@ class TorcsRunner:
                     reward,
                     off_track,
                 )
+                if telemetry_callback is not None:
+                    telemetry_callback(results["telemetry_samples"][-1])
 
                 completed_lap = lap_tracker.update(self.env.client.S.d)
                 if (
