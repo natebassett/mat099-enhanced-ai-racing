@@ -27,6 +27,16 @@ from PySide6.QtWidgets import (
 )
 
 try:
+    from .comparison_model import (
+        compare_runs,
+        comparison_finish_time,
+        moment_comparison_reasons,
+        moment_panel_text,
+        nearest_snapshot_index,
+        run_combo_label,
+        run_title,
+        snapshot_times,
+    )
     from .project_discovery import (
         AgentOption,
         CarOption,
@@ -49,6 +59,16 @@ try:
     )
     from .track_view import RoadSensorWidget, TrackPositionWidget
 except ImportError:
+    from comparison_model import (
+        compare_runs,
+        comparison_finish_time,
+        moment_comparison_reasons,
+        moment_panel_text,
+        nearest_snapshot_index,
+        run_combo_label,
+        run_title,
+        snapshot_times,
+    )
     from project_discovery import (
         AgentOption,
         CarOption,
@@ -104,6 +124,7 @@ class MainWindow(QMainWindow):
         self.run_history_source_label = QLabel()
         self.tabs: QTabWidget | None = None
         self.review_tab_index = 0
+        self.compare_tab_index = 0
         self.review_title_label = QLabel("No run selected")
         self.review_status_label = QLabel("Idle")
         self.review_summary_box = QTextEdit()
@@ -116,14 +137,41 @@ class MainWindow(QMainWindow):
         self.review_moment_status_label = QLabel("Idle")
         self.review_moment_state_label = QLabel("Select a run to review.")
         self.review_moment_reason_label = QLabel("- No replay sample selected.")
+        self.compare_track_combo = QComboBox()
+        self.compare_run_a_combo = QComboBox()
+        self.compare_run_b_combo = QComboBox()
+        self.compare_button = QPushButton("Compare")
+        self.compare_summary_label = QLabel("No comparison loaded")
+        self.compare_summary_box = QTextEdit()
+        self.compare_play_button = QPushButton("Play")
+        self.compare_slider = QSlider(Qt.Horizontal)
+        self.compare_time_label = QLabel("Select two saved runs.")
+        self.compare_delta_label = QLabel("- No comparison loaded.")
+        self.compare_a_title_label = QLabel("Run A")
+        self.compare_b_title_label = QLabel("Run B")
+        self.compare_a_status_label = QLabel("Idle")
+        self.compare_b_status_label = QLabel("Idle")
+        self.compare_a_state_label = QLabel("No run selected.")
+        self.compare_b_state_label = QLabel("No run selected.")
+        self.compare_a_values_label = QLabel("-")
+        self.compare_b_values_label = QLabel("-")
         self.track_position_widget = TrackPositionWidget()
         self.road_sensor_widget = RoadSensorWidget()
         self.race_thread: QThread | None = None
         self.race_worker: RaceWorker | None = None
         self.review_timer = QTimer(self)
+        self.compare_timer = QTimer(self)
         self.review_snapshots: list[TelemetrySnapshot] = []
         self.review_run: dict[str, Any] | None = None
         self.review_current_index = 0
+        self.compare_runs: list[dict[str, Any]] = []
+        self.compare_run_a: dict[str, Any] | None = None
+        self.compare_run_b: dict[str, Any] | None = None
+        self.compare_snapshots_a: list[TelemetrySnapshot] = []
+        self.compare_snapshots_b: list[TelemetrySnapshot] = []
+        self.compare_times_a: list[float] = []
+        self.compare_times_b: list[float] = []
+        self.compare_current_time = 0.0
         self.telemetry_history = TelemetryHistory()
         self.metric_value_labels: dict[str, QLabel] = {}
         self.chart_window_seconds = 90.0
@@ -140,6 +188,10 @@ class MainWindow(QMainWindow):
         self.review_speed_marker: Any = None
         self.review_steer_marker: Any = None
         self.review_pedal_marker: Any = None
+        self.compare_speed_plot: pg.PlotWidget | None = None
+        self.compare_speed_curve_a: Any = None
+        self.compare_speed_curve_b: Any = None
+        self.compare_speed_marker: Any = None
         self.speed_curve: Any = None
         self.steer_curve: Any = None
         self.throttle_curve: Any = None
@@ -152,6 +204,7 @@ class MainWindow(QMainWindow):
 
         self._configure_controls()
         self._build_ui()
+        self._refresh_compare_options()
         self._connect_signals()
         self._update_selection_details()
 
@@ -198,11 +251,35 @@ class MainWindow(QMainWindow):
         )
         self.review_timer.setInterval(250)
 
+        self.compare_summary_label.setFont(_section_font())
+        self.compare_summary_box.setReadOnly(True)
+        self.compare_summary_box.setMaximumHeight(128)
+        self.compare_summary_box.setText("Awaiting same-track saved runs.")
+        self.compare_slider.setEnabled(False)
+        self.compare_play_button.setEnabled(False)
+        self.compare_button.setEnabled(False)
+        self.compare_delta_label.setWordWrap(True)
+        for label in (
+            self.compare_a_title_label,
+            self.compare_b_title_label,
+            self.compare_a_state_label,
+            self.compare_b_state_label,
+            self.compare_a_values_label,
+            self.compare_b_values_label,
+        ):
+            label.setWordWrap(True)
+        for label in (self.compare_a_status_label, self.compare_b_status_label):
+            label.setAlignment(Qt.AlignCenter)
+            label.setMinimumHeight(28)
+            label.setStyleSheet(_severity_style("Idle"))
+        self.compare_timer.setInterval(250)
+
     def _build_ui(self) -> None:
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_dashboard_tab(), "Dashboard")
         self.tabs.addTab(self._build_run_history_tab(), "Run History")
         self.review_tab_index = self.tabs.addTab(self._build_review_tab(), "Review")
+        self.compare_tab_index = self.tabs.addTab(self._build_compare_tab(), "Compare")
 
         self.setCentralWidget(self.tabs)
         self.statusBar().showMessage(self._discovery_summary())
@@ -510,6 +587,133 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         return panel
 
+    def _build_compare_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QHBoxLayout(page)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self._build_compare_replay_panel())
+        splitter.addWidget(self._build_compare_moment_panel())
+        splitter.setSizes([850, 360])
+        layout.addWidget(splitter)
+
+        return page
+
+    def _build_compare_replay_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        title = QLabel("Compare Saved Runs")
+        title.setFont(_section_font())
+        layout.addWidget(title)
+
+        controls_group = QGroupBox("Selection")
+        controls_layout = QGridLayout(controls_group)
+        controls_layout.addWidget(QLabel("Track"), 0, 0)
+        controls_layout.addWidget(QLabel("Run A"), 0, 1)
+        controls_layout.addWidget(QLabel("Run B"), 0, 2)
+        controls_layout.addWidget(self.compare_track_combo, 1, 0)
+        controls_layout.addWidget(self.compare_run_a_combo, 1, 1)
+        controls_layout.addWidget(self.compare_run_b_combo, 1, 2)
+        controls_layout.addWidget(self.compare_button, 1, 3)
+        controls_layout.setColumnStretch(0, 1)
+        controls_layout.setColumnStretch(1, 2)
+        controls_layout.setColumnStretch(2, 2)
+        layout.addWidget(controls_group)
+
+        summary_group = QGroupBox("Comparison Summary")
+        summary_layout = QVBoxLayout(summary_group)
+        summary_layout.addWidget(self.compare_summary_label)
+        summary_layout.addWidget(self.compare_summary_box)
+        layout.addWidget(summary_group)
+
+        replay_group = QGroupBox("Synced Replay")
+        replay_layout = QHBoxLayout(replay_group)
+        replay_layout.addWidget(self.compare_play_button)
+        replay_layout.addWidget(self.compare_slider, 1)
+        replay_layout.addWidget(self.compare_time_label)
+        layout.addWidget(replay_group)
+
+        self.compare_speed_plot = self._build_plot("Speed Comparison", "km/h")
+        self.compare_speed_plot.setMinimumHeight(280)
+        self.compare_speed_plot.setYRange(0.0, 220.0)
+        self.compare_speed_curve_a = self.compare_speed_plot.plot(
+            [],
+            [],
+            pen=pg.mkPen("#2f80ed", width=2),
+        )
+        self.compare_speed_curve_b = self.compare_speed_plot.plot(
+            [],
+            [],
+            pen=pg.mkPen("#d97706", width=2),
+        )
+        self.compare_speed_marker = _add_review_marker(self.compare_speed_plot)
+
+        layout.addWidget(
+            self._chart_legend(
+                [
+                    ("Run A", "#2f80ed"),
+                    ("Run B", "#d97706"),
+                ]
+            )
+        )
+        layout.addWidget(self.compare_speed_plot)
+        layout.addStretch(1)
+
+        return panel
+
+    def _build_compare_moment_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        title = QLabel("Same Moment")
+        title.setFont(_section_font())
+        layout.addWidget(title)
+
+        difference_group = QGroupBox("Difference")
+        difference_layout = QVBoxLayout(difference_group)
+        difference_layout.addWidget(self.compare_delta_label)
+        layout.addWidget(difference_group)
+
+        layout.addWidget(
+            self._build_compare_side_group(
+                "Run A",
+                self.compare_a_title_label,
+                self.compare_a_status_label,
+                self.compare_a_state_label,
+                self.compare_a_values_label,
+            )
+        )
+        layout.addWidget(
+            self._build_compare_side_group(
+                "Run B",
+                self.compare_b_title_label,
+                self.compare_b_status_label,
+                self.compare_b_state_label,
+                self.compare_b_values_label,
+            )
+        )
+
+        layout.addStretch(1)
+        return panel
+
+    def _build_compare_side_group(
+        self,
+        title: str,
+        run_label: QLabel,
+        status_label: QLabel,
+        state_label: QLabel,
+        values_label: QLabel,
+    ) -> QGroupBox:
+        group = QGroupBox(title)
+        layout = QVBoxLayout(group)
+        run_label.setFont(_section_font())
+        layout.addWidget(run_label)
+        layout.addWidget(status_label)
+        layout.addWidget(state_label)
+        layout.addWidget(values_label)
+        return group
+
     def _combo_group(self, label: str, combo: QComboBox) -> QGroupBox:
         group = QGroupBox(label)
         layout = QVBoxLayout(group)
@@ -600,6 +804,19 @@ class MainWindow(QMainWindow):
         self.review_slider.valueChanged.connect(self._handle_review_slider_changed)
         self.review_play_button.clicked.connect(self._handle_review_play_clicked)
         self.review_timer.timeout.connect(self._advance_review_replay)
+        self.compare_track_combo.currentIndexChanged.connect(
+            self._handle_compare_track_changed
+        )
+        self.compare_run_a_combo.currentIndexChanged.connect(
+            self._update_compare_button_state
+        )
+        self.compare_run_b_combo.currentIndexChanged.connect(
+            self._update_compare_button_state
+        )
+        self.compare_button.clicked.connect(self._load_selected_comparison)
+        self.compare_slider.valueChanged.connect(self._handle_compare_slider_changed)
+        self.compare_play_button.clicked.connect(self._handle_compare_play_clicked)
+        self.compare_timer.timeout.connect(self._advance_compare_replay)
 
     def _handle_start_clicked(self) -> None:
         if self.race_thread is not None:
@@ -937,6 +1154,372 @@ class MainWindow(QMainWindow):
             return
         plot.setXRange(0.0, max(1.0, x_values[-1]), padding=0.02)
 
+    def _refresh_compare_options(self, preferred_track: str | None = None) -> None:
+        from storage import RaceRepository
+
+        current_track = preferred_track or self.compare_track_combo.currentData(
+            Qt.UserRole
+        )
+        try:
+            self.compare_runs = RaceRepository().list_runs(limit=500)
+        except Exception as exc:
+            self.compare_runs = []
+            self._clear_compare_selectors()
+            self._clear_compare_view(f"Could not load saved runs: {exc}")
+            return
+
+        tracks = sorted(
+            {
+                str(run.get("track"))
+                for run in self.compare_runs
+                if run.get("track")
+            }
+        )
+
+        self.compare_track_combo.blockSignals(True)
+        self.compare_track_combo.clear()
+        for track in tracks:
+            run_count = len(self._compare_runs_for_track(track))
+            self.compare_track_combo.addItem(f"{track} ({run_count} runs)", track)
+
+        selected = False
+        if current_track:
+            for index in range(self.compare_track_combo.count()):
+                if self.compare_track_combo.itemData(index, Qt.UserRole) == current_track:
+                    self.compare_track_combo.setCurrentIndex(index)
+                    selected = True
+                    break
+        if not selected and self.compare_track_combo.count() > 0:
+            self.compare_track_combo.setCurrentIndex(0)
+        self.compare_track_combo.blockSignals(False)
+
+        self._refresh_compare_run_combos()
+        if not tracks:
+            self._clear_compare_view("No saved runs are available yet.")
+
+    def _clear_compare_selectors(self) -> None:
+        for combo in (
+            self.compare_track_combo,
+            self.compare_run_a_combo,
+            self.compare_run_b_combo,
+        ):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.blockSignals(False)
+        self.compare_button.setEnabled(False)
+
+    def _handle_compare_track_changed(self) -> None:
+        self._refresh_compare_run_combos()
+        track = self.compare_track_combo.currentData(Qt.UserRole)
+        if track:
+            self._clear_compare_view(f"Awaiting a {track} comparison.")
+        else:
+            self._clear_compare_view("No saved runs are available yet.")
+
+    def _refresh_compare_run_combos(self) -> None:
+        track = self.compare_track_combo.currentData(Qt.UserRole)
+        runs = self._compare_runs_for_track(str(track)) if track else []
+
+        for combo in (self.compare_run_a_combo, self.compare_run_b_combo):
+            combo.blockSignals(True)
+            combo.clear()
+            for run in runs:
+                combo.addItem(run_combo_label(run), run)
+            combo.blockSignals(False)
+
+        if len(runs) > 1:
+            self.compare_run_a_combo.setCurrentIndex(0)
+            self.compare_run_b_combo.setCurrentIndex(1)
+
+        self._update_compare_button_state()
+        if len(runs) < 2 and track:
+            self._clear_compare_view(
+                f"{track} needs at least two saved runs before comparison."
+            )
+        elif runs and self.compare_run_a is None and self.compare_run_b is None:
+            self.compare_summary_label.setText("Ready to compare")
+            self.compare_summary_box.setText("Selected runs are ready.")
+
+    def _compare_runs_for_track(self, track: str) -> list[dict[str, Any]]:
+        return [
+            run
+            for run in self.compare_runs
+            if str(run.get("track")) == track
+        ]
+
+    def _update_compare_button_state(self) -> None:
+        run_a = self._selected_compare_run(self.compare_run_a_combo)
+        run_b = self._selected_compare_run(self.compare_run_b_combo)
+        self.compare_button.setEnabled(
+            run_a is not None
+            and run_b is not None
+            and run_a.get("id") != run_b.get("id")
+            and run_a.get("track") == run_b.get("track")
+        )
+
+    def _selected_compare_run(self, combo: QComboBox) -> dict[str, Any] | None:
+        run = combo.currentData(Qt.UserRole)
+        return run if isinstance(run, dict) else None
+
+    def _load_selected_comparison(self) -> None:
+        from storage import RaceRepository
+
+        selected_a = self._selected_compare_run(self.compare_run_a_combo)
+        selected_b = self._selected_compare_run(self.compare_run_b_combo)
+        if selected_a is None or selected_b is None:
+            self._clear_compare_view("No saved run pair selected.")
+            return
+        if selected_a.get("id") == selected_b.get("id"):
+            self._clear_compare_view("Run A and Run B are the same saved run.")
+            return
+        if selected_a.get("track") != selected_b.get("track"):
+            self._clear_compare_view("Run A and Run B must be from the same track.")
+            return
+
+        repository = RaceRepository()
+        run_a = repository.get_run(int(selected_a["id"]))
+        run_b = repository.get_run(int(selected_b["id"]))
+        if run_a is None or run_b is None:
+            QMessageBox.warning(self, "Run Not Found", "One selected run was not found.")
+            return
+
+        samples_a = repository.list_run_telemetry(int(run_a["id"]))
+        samples_b = repository.list_run_telemetry(int(run_b["id"]))
+        self.compare_run_a = run_a
+        self.compare_run_b = run_b
+        self.compare_snapshots_a = [
+            TelemetrySnapshot.from_sample(sample) for sample in samples_a
+        ]
+        self.compare_snapshots_b = [
+            TelemetrySnapshot.from_sample(sample) for sample in samples_b
+        ]
+        self.compare_times_a = snapshot_times(self.compare_snapshots_a)
+        self.compare_times_b = snapshot_times(self.compare_snapshots_b)
+        self.compare_current_time = 0.0
+        self.compare_timer.stop()
+        self.compare_play_button.setText("Play")
+
+        summary = compare_runs(
+            run_a,
+            run_b,
+            self.compare_snapshots_a,
+            self.compare_snapshots_b,
+        )
+        self.compare_summary_label.setText(summary.headline)
+        self.compare_summary_box.setText("\n".join(summary.details))
+        self.compare_a_title_label.setText(run_title(run_a, "Run A"))
+        self.compare_b_title_label.setText(run_title(run_b, "Run B"))
+
+        self._update_compare_chart()
+        self._configure_compare_slider(summary.finish_time)
+        self._set_compare_current_time(0.0)
+        self.statusBar().showMessage(
+            f"Comparing run #{run_a['id']} and run #{run_b['id']}"
+        )
+
+    def _clear_compare_view(self, message: str) -> None:
+        self.compare_timer.stop()
+        self.compare_play_button.setText("Play")
+        self.compare_play_button.setEnabled(False)
+        self.compare_slider.blockSignals(True)
+        self.compare_slider.setMinimum(0)
+        self.compare_slider.setMaximum(0)
+        self.compare_slider.setValue(0)
+        self.compare_slider.setEnabled(False)
+        self.compare_slider.blockSignals(False)
+        self.compare_time_label.setText("No comparison loaded")
+        self.compare_summary_label.setText("No comparison loaded")
+        self.compare_summary_box.setText(message)
+        self.compare_delta_label.setText("- No comparison loaded.")
+        self.compare_current_time = 0.0
+        self.compare_run_a = None
+        self.compare_run_b = None
+        self.compare_snapshots_a = []
+        self.compare_snapshots_b = []
+        self.compare_times_a = []
+        self.compare_times_b = []
+        self.compare_a_title_label.setText("Run A")
+        self.compare_b_title_label.setText("Run B")
+        self._set_compare_side(
+            self.compare_a_status_label,
+            self.compare_a_state_label,
+            self.compare_a_values_label,
+            "Idle",
+            "No run selected.",
+            "-",
+        )
+        self._set_compare_side(
+            self.compare_b_status_label,
+            self.compare_b_state_label,
+            self.compare_b_values_label,
+            "Idle",
+            "No run selected.",
+            "-",
+        )
+        self._update_compare_chart()
+
+    def _configure_compare_slider(self, finish_time: float) -> None:
+        max_tick = max(0, int(round(finish_time * 10.0)))
+        has_comparable_samples = bool(self.compare_snapshots_a and self.compare_snapshots_b)
+
+        self.compare_slider.blockSignals(True)
+        self.compare_slider.setMinimum(0)
+        self.compare_slider.setMaximum(max_tick)
+        self.compare_slider.setValue(0)
+        self.compare_slider.setEnabled(has_comparable_samples and max_tick > 0)
+        self.compare_slider.blockSignals(False)
+        self.compare_play_button.setEnabled(has_comparable_samples and max_tick > 0)
+
+    def _update_compare_chart(self) -> None:
+        if self.compare_speed_curve_a is not None:
+            self.compare_speed_curve_a.setData(
+                self.compare_times_a,
+                _snapshot_values(self.compare_snapshots_a, "speed_kmh"),
+            )
+        if self.compare_speed_curve_b is not None:
+            self.compare_speed_curve_b.setData(
+                self.compare_times_b,
+                _snapshot_values(self.compare_snapshots_b, "speed_kmh"),
+            )
+        if self.compare_speed_marker is not None:
+            self.compare_speed_marker.setValue(self.compare_current_time)
+        self._apply_compare_x_range()
+
+    def _apply_compare_x_range(self) -> None:
+        if self.compare_speed_plot is None:
+            return
+        finish_time = self._compare_finish_time()
+        self.compare_speed_plot.setXRange(0.0, max(1.0, finish_time), padding=0.02)
+
+    def _set_compare_current_time(self, target_time: float) -> None:
+        if not self.compare_snapshots_a and not self.compare_snapshots_b:
+            self.compare_time_label.setText("No replay samples")
+            return
+
+        finish_time = self._compare_finish_time()
+        self.compare_current_time = max(0.0, min(target_time, finish_time))
+        snapshot_a = self._compare_snapshot_at_time(
+            self.compare_snapshots_a,
+            self.compare_times_a,
+            self.compare_current_time,
+        )
+        snapshot_b = self._compare_snapshot_at_time(
+            self.compare_snapshots_b,
+            self.compare_times_b,
+            self.compare_current_time,
+        )
+
+        self._set_compare_side_from_snapshot(
+            self.compare_a_status_label,
+            self.compare_a_state_label,
+            self.compare_a_values_label,
+            snapshot_a,
+        )
+        self._set_compare_side_from_snapshot(
+            self.compare_b_status_label,
+            self.compare_b_state_label,
+            self.compare_b_values_label,
+            snapshot_b,
+        )
+        self.compare_delta_label.setText(
+            _format_reason_lines(moment_comparison_reasons(snapshot_a, snapshot_b))
+        )
+        self.compare_time_label.setText(
+            f"{self.compare_current_time:.1f}s / {finish_time:.1f}s"
+        )
+        if self.compare_speed_marker is not None:
+            self.compare_speed_marker.setValue(self.compare_current_time)
+
+        slider_value = int(round(self.compare_current_time * 10.0))
+        slider_value = max(
+            self.compare_slider.minimum(),
+            min(slider_value, self.compare_slider.maximum()),
+        )
+        if self.compare_slider.value() != slider_value:
+            self.compare_slider.blockSignals(True)
+            self.compare_slider.setValue(slider_value)
+            self.compare_slider.blockSignals(False)
+
+    def _compare_snapshot_at_time(
+        self,
+        snapshots: list[TelemetrySnapshot],
+        times: list[float],
+        replay_time: float,
+    ) -> TelemetrySnapshot | None:
+        if not snapshots or not times:
+            return None
+        return snapshots[nearest_snapshot_index(times, replay_time)]
+
+    def _set_compare_side_from_snapshot(
+        self,
+        status_label: QLabel,
+        state_label: QLabel,
+        values_label: QLabel,
+        snapshot: TelemetrySnapshot | None,
+    ) -> None:
+        severity, headline, values = moment_panel_text(snapshot)
+        self._set_compare_side(
+            status_label,
+            state_label,
+            values_label,
+            severity,
+            headline,
+            values,
+        )
+
+    def _set_compare_side(
+        self,
+        status_label: QLabel,
+        state_label: QLabel,
+        values_label: QLabel,
+        severity: str,
+        headline: str,
+        values: str,
+    ) -> None:
+        status_label.setText(severity)
+        status_label.setStyleSheet(_severity_style(severity))
+        state_label.setText(headline)
+        values_label.setText(values)
+
+    def _handle_compare_slider_changed(self, value: int) -> None:
+        self._set_compare_current_time(value / 10.0)
+
+    def _handle_compare_play_clicked(self) -> None:
+        if not (self.compare_snapshots_a and self.compare_snapshots_b):
+            return
+        if self.compare_timer.isActive():
+            self.compare_timer.stop()
+            self.compare_play_button.setText("Play")
+            return
+
+        self.compare_play_button.setText("Pause")
+        self.compare_timer.start()
+
+    def _advance_compare_replay(self) -> None:
+        if not (self.compare_snapshots_a and self.compare_snapshots_b):
+            self.compare_timer.stop()
+            self.compare_play_button.setText("Play")
+            return
+
+        finish_time = self._compare_finish_time()
+        next_time = self.compare_current_time + self._compare_playback_step_seconds()
+        if next_time >= finish_time:
+            self._set_compare_current_time(finish_time)
+            self.compare_timer.stop()
+            self.compare_play_button.setText("Play")
+            return
+
+        self._set_compare_current_time(next_time)
+
+    def _compare_playback_step_seconds(self) -> float:
+        return max(0.1, self._compare_finish_time() / 240.0)
+
+    def _compare_finish_time(self) -> float:
+        return comparison_finish_time(
+            self.compare_snapshots_a,
+            self.compare_snapshots_b,
+        )
+
     def _update_selection_details(self) -> None:
         agent = self.selected_agent()
         track = self.selected_track()
@@ -1248,6 +1831,7 @@ class MainWindow(QMainWindow):
         )
         self.run_history_source_label.setText(f"Source: {source}")
         self._populate_run_history_table(runs)
+        self._refresh_compare_options()
 
     def _discovery_summary(self) -> str:
         return (
@@ -1267,6 +1851,17 @@ def _add_review_marker(plot: pg.PlotWidget) -> Any:
     )
     plot.addItem(marker)
     return marker
+
+
+def _snapshot_values(
+    snapshots: list[TelemetrySnapshot],
+    attribute: str,
+) -> list[float]:
+    values: list[float] = []
+    for snapshot in snapshots:
+        value = getattr(snapshot, attribute)
+        values.append(float(value) if value is not None else float("nan"))
+    return values
 
 
 def _review_comparison_text(
