@@ -10,12 +10,33 @@ except ImportError:
 
 
 @dataclass(frozen=True)
+class CodeSnippet:
+    title: str
+    source: str
+    explanation: str
+    code: str
+
+
+@dataclass(frozen=True)
+class FormulaNote:
+    title: str
+    formula: str
+    explanation: str
+
+
+@dataclass(frozen=True)
 class AgentEducationProfile:
     title: str
     badge: str
     headline: str
     overview: tuple[str, ...]
     decision_steps: tuple[str, ...]
+    algorithm_summary: tuple[str, ...]
+    pseudocode: tuple[str, ...]
+    formula_notes: tuple[FormulaNote, ...]
+    code_snippets: tuple[CodeSnippet, ...]
+    math_notes: tuple[str, ...]
+    key_takeaways: tuple[str, ...]
     input_signals: tuple[str, ...]
     strengths: tuple[str, ...]
     failure_signs: tuple[str, ...]
@@ -34,6 +55,12 @@ def build_agent_education_profile(
         headline=template["headline"],
         overview=tuple(template["overview"]),
         decision_steps=tuple(template["decision_steps"]),
+        algorithm_summary=tuple(template["algorithm_summary"]),
+        pseudocode=tuple(template["pseudocode"]),
+        formula_notes=tuple(template["formula_notes"]),
+        code_snippets=tuple(template["code_snippets"]),
+        math_notes=tuple(template["math_notes"]),
+        key_takeaways=tuple(template["key_takeaways"]),
         input_signals=tuple(template["input_signals"]),
         strengths=tuple(template["strengths"]),
         failure_signs=tuple(template["failure_signs"]),
@@ -47,27 +74,244 @@ def _template_for(agent_type: str) -> dict[str, Any]:
         return {
             "badge": "Map-specific racing-line planner",
             "headline": (
-                "This driver uses a saved mathematical racing line, then adjusts "
-                "the car to stay near that line while managing speed."
+                "This driver uses a precomputed racing line as a geometric plan, "
+                "then turns that plan into steering, throttle, and braking decisions."
             ),
             "overview": (
-                "It is not just reacting to the road immediately in front of the car.",
+                "It is not only reacting to the road immediately in front of the car.",
                 (
-                    "The racing line gives it a target route through the track, so "
-                    "its steering and speed choices are tied to where the car should "
-                    "be next."
+                    "Before the run starts, the track is represented as a sequence of "
+                    "centreline samples. The racing line shifts those samples left or "
+                    "right across the road to create an intended route."
                 ),
                 (
-                    "When it works well, it looks deliberate: it aims for a line, "
-                    "sets up corners earlier, and tries to avoid late panic steering."
+                    "During the run, the agent uses lap distance to look up where the "
+                    "car should be now, where it should be next, and how fast it should "
+                    "aim to travel through that part of the circuit."
+                ),
+                (
+                    "When it works well, the behaviour looks planned: the car sets up "
+                    "corners early, cuts toward an apex, and exits with less panic "
+                    "steering than a purely reactive controller."
                 ),
             ),
             "decision_steps": (
-                "Load the racing-line points for the selected track.",
-                "Read the car's speed, angle, road position, and road sensors.",
-                "Find the nearby target point on the racing line.",
-                "Steer back toward the target while keeping the car stable.",
-                "Use throttle or brake depending on the corner and available road.",
+                "Load the racing-line waypoints generated for the selected track.",
+                "Read speed, yaw angle, side speed, track position, lap distance, and sensors.",
+                "Interpolate the racing-line target at the current lap distance.",
+                "Preview several lookahead points to estimate the next corner.",
+                "Blend onto the line, guard unsafe targets, then calculate controls.",
+            ),
+            "algorithm_summary": (
+                "The map-aware driver separates route planning from real-time control.",
+                (
+                    "The saved racing-line file stores target road position, target "
+                    "speed, curvature, heading offset, speed change, and driving phase "
+                    "around the lap."
+                ),
+                (
+                    "At runtime, distance around the lap becomes the lookup key. The "
+                    "agent interpolates between waypoints so the target changes smoothly "
+                    "rather than jumping from point to point."
+                ),
+                (
+                    "The controller is then a path-following problem: minimise the "
+                    "difference between current road position and planned road position, "
+                    "while respecting speed, stability, and sensor safety limits."
+                ),
+                (
+                    "Live road sensors act as guardrails. They do not define the ideal "
+                    "line, but they can slow the car or pull the target inward when the "
+                    "ideal line is unsafe in the current state."
+                ),
+            ),
+            "pseudocode": (
+                "Load the racing-line JSON for this track.",
+                "For each control tick, read speed, angle, side speed, trackPos, distFromStart, and road sensors.",
+                "Convert the current lap distance into a racing-line waypoint lookup.",
+                "Interpolate target road position, curvature, heading, speed, and phase.",
+                "Choose a lookahead distance that grows with speed.",
+                "Blend from the launch position onto the racing line using smoothstep.",
+                "Clamp or guard the target if edge risk or road sensors show danger.",
+                "Estimate a target speed from planned speed, curvature, lookahead, and live safety caps.",
+                "Compute line error: current road position minus target road position.",
+                "Steer using cross-track error, heading offset, curvature, and previous steer.",
+                "Choose throttle or brake from the difference between current speed and target speed.",
+                "Return full-control actions: steering, throttle, brake, and gear.",
+            ),
+            "formula_notes": (
+                FormulaNote(
+                    title="Normalised Track Position",
+                    formula=(
+                        r"$\mathrm{offset}_m = \mathrm{target\_track\_pos}"
+                        r" \cdot \frac{\mathrm{track\_width}_m}{2}$"
+                    ),
+                    explanation=(
+                        "TORCS represents road position as a normalised value. A value "
+                        "of 0 is the centreline, -1 is the left edge, and +1 is the "
+                        "right edge. The formula converts that normalised value into a "
+                        "physical sideways offset in metres."
+                    ),
+                ),
+                FormulaNote(
+                    title="Racing Point Projection",
+                    formula=(
+                        r"$\mathbf{p}_{race,i} = \mathbf{c}_i"
+                        r" + \mathbf{n}_i \cdot \mathrm{offset}_m$"
+                    ),
+                    explanation=(
+                        "Each sampled centreline point has a perpendicular normal vector. "
+                        "Moving along that normal places the racing line inside the actual "
+                        "track instead of drawing a separate abstract curve."
+                    ),
+                ),
+                FormulaNote(
+                    title="Lap-Distance Interpolation",
+                    formula=(
+                        r"$\alpha = \frac{\mathrm{mod}(d - d_i, L)}{\mathrm{mod}(d_{next} - d_i, L)}$"
+                        "\n"
+                        r"$x(d) = x_i + \alpha(x_{next} - x_i)$"
+                    ),
+                    explanation=(
+                        "The racing line is stored as waypoints, but the car can be at "
+                        "any distance around the lap. Interpolation fills the gap between "
+                        "two saved points, and modulo arithmetic wraps the lookup over "
+                        "the start/finish line."
+                    ),
+                ),
+                FormulaNote(
+                    title="Speed-Dependent Lookahead",
+                    formula=(
+                        r"$lookahead_m = \mathrm{clamp}"
+                        r"(24.0 + 0.16v_{km/h}, 24.0, 56.0)$"
+                    ),
+                    explanation=(
+                        "The faster the car travels, the further ahead it should preview. "
+                        "The clamp prevents the controller from looking too close at high "
+                        "speed or too far ahead at low speed."
+                    ),
+                ),
+                FormulaNote(
+                    title="Smooth Merge Onto The Line",
+                    formula=(
+                        r"$t = \mathrm{clamp}\left(\frac{d_{travelled}}{d_{merge}}, 0, 1\right)$"
+                        "\n"
+                        r"$line\_blend = t^2(3 - 2t)$"
+                    ),
+                    explanation=(
+                        "This smoothstep curve lets the car join the racing line gradually "
+                        "after launch. It avoids snapping sideways toward the ideal line "
+                        "before the car has enough speed and control authority."
+                    ),
+                ),
+                FormulaNote(
+                    title="Curvature-Limited Speed",
+                    formula=(
+                        r"$v_{m/s} \leq"
+                        r" \sqrt{\frac{a_{lat}}{\max(|\kappa|, 10^{-6})}}$"
+                    ),
+                    explanation=(
+                        "Sharper bends have larger curvature, so the maximum safe speed "
+                        "falls. This is the same principle as cornering grip: for a fixed "
+                        "lateral acceleration limit, tighter turns require lower speed."
+                    ),
+                ),
+                FormulaNote(
+                    title="Line Error",
+                    formula=r"$e_{line} = track\_pos - target\_position$",
+                    explanation=(
+                        "A positive or negative error tells the controller which side of "
+                        "the desired racing line the car is currently on. Steering and "
+                        "speed limits are then adjusted from that error."
+                    ),
+                ),
+            ),
+            "code_snippets": (
+                CodeSnippet(
+                    title="Racing-line lookup",
+                    source="src/racing_line/optimizer.py - RacingLine.lookup",
+                    explanation=(
+                        "The line is indexed by distance around the lap. The modulo "
+                        "operation lets the lookup wrap cleanly over the start/finish line."
+                    ),
+                    code=(
+                        "def lookup(self, distance):\n"
+                        "    distance = float(distance) % self.track_length\n"
+                        "    right_index = bisect.bisect_right(self._distances, distance) % len(self.waypoints)\n"
+                        "    left_index = (right_index - 1) % len(self.waypoints)\n"
+                        "    left = self.waypoints[left_index]\n"
+                        "    right = self.waypoints[right_index]\n"
+                        "    span = (right[\"distance\"] - left[\"distance\"]) % self.track_length\n"
+                        "    travelled = (distance - left[\"distance\"]) % self.track_length\n"
+                        "    fraction = travelled / span if span else 0.0\n"
+                        "    return interpolated | {\"phase\": left[\"phase\"]}"
+                    ),
+                ),
+                CodeSnippet(
+                    title="Previewing the route ahead",
+                    source="src/agents/map_aware_agent.py - MapAwareAgent.act",
+                    explanation=(
+                        "The controller does not only chase the point underneath the car. "
+                        "It samples points ahead so steering and speed prepare for the next section."
+                    ),
+                    code=(
+                        "lookahead_distance = clamp(24.0 + speed * 0.16, 24.0, 56.0)\n"
+                        "target = self.racing_line.lookup(distance)\n"
+                        "lookahead = self.racing_line.lookup(distance + lookahead_distance)\n"
+                        "far_lookahead = self.racing_line.lookup(distance + lookahead_distance * 1.85)\n"
+                        "very_far_lookahead = self.racing_line.lookup(distance + lookahead_distance * 3.25)\n"
+                        "line_complexity = estimate_line_complexity(target, lookahead, far_lookahead)"
+                    ),
+                ),
+                CodeSnippet(
+                    title="Turning the plan into controls",
+                    source="src/agents/map_aware_agent.py - MapAwareAgent.act",
+                    explanation=(
+                        "The agent softens the line error, calculates steering from the path, "
+                        "then asks the speed controller for throttle and brake."
+                    ),
+                    code=(
+                        "target_speed = calculate_dynamic_target_speed(...)\n"
+                        "steering_target_position = track_position - effective_line_error\n"
+                        "steer = calculate_path_tracking_steer(\n"
+                        "    speed=speed,\n"
+                        "    track_position=track_position,\n"
+                        "    target_position=steering_target_position,\n"
+                        "    heading_offset=desired_heading,\n"
+                        "    curvature=target_curvature,\n"
+                        ")\n"
+                        "accel, brake, adjusted_target_speed = calculate_aggressive_speed_control(...)"
+                    ),
+                ),
+            ),
+            "math_notes": (
+                "TORCS track position is normalised: 0 is the centre, -1 is the left edge, and +1 is the right edge.",
+                (
+                    "The optimizer samples the centreline and shifts each sample along the "
+                    "track normal: racing point = centre point + normal * offset."
+                ),
+                (
+                    "target_track_pos is the normal offset expressed as road position: "
+                    "offset / (track_width / 2)."
+                ),
+                (
+                    "Curvature is estimated from neighbouring racing-line points. Higher "
+                    "curvature means the safe target speed should drop."
+                ),
+                (
+                    "The speed profile is bounded by maximum speed, minimum speed, "
+                    "lateral acceleration, acceleration, and braking limits."
+                ),
+                (
+                    "Runtime lookup interpolates between waypoints using lap distance "
+                    "modulo track length, so the plan behaves like a continuous loop."
+                ),
+            ),
+            "key_takeaways": (
+                "This is a planned driver: it has a target route before the race starts.",
+                "The racing line is track-specific, so missing or mismatched line files matter.",
+                "Sensors do not replace the map; they keep the map from becoming unsafe.",
+                "Telemetry should show smoother preparation before corners when the line is working well.",
             ),
             "input_signals": (
                 "Racing-line file for the selected track.",
@@ -93,27 +337,185 @@ def _template_for(agent_type: str) -> dict[str, Any]:
         return {
             "badge": "Reactive rule-based controller",
             "headline": (
-                "This driver follows hand-written rules that react to sensors, "
-                "wheel behaviour, and road position."
+                "This driver uses transparent hand-written rules to turn live sensor "
+                "readings into steering, speed, braking, and recovery decisions."
             ),
             "overview": (
-                "It does not need a precomputed map of the track.",
+                "It does not need a precomputed map of the track or a saved racing line.",
                 (
-                    "The controller watches the road sensors and applies a set of "
-                    "if-this-then-that decisions for steering, throttle, braking, "
-                    "gear changes, and anti-spin recovery."
+                    "Instead, it treats each control step as a local decision problem: "
+                    "what road can the sensors see, how fast is the car moving, and is "
+                    "the car stable enough to keep attacking?"
                 ),
                 (
-                    "It is useful as a comparison because the decision process is "
-                    "clear, but it can be late to prepare for corners it cannot see yet."
+                    "The design is useful for explanation because every behaviour can be "
+                    "linked back to a threshold, score, or rule. Its weakness is that it "
+                    "cannot truly plan for parts of the circuit beyond the sensor view."
                 ),
             ),
             "decision_steps": (
-                "Read road sensors, speed, track position, and wheel behaviour.",
-                "Choose a safe steering direction from the visible road space.",
-                "Reduce throttle or brake when the car looks unstable.",
-                "Apply gear and anti-spin rules to keep control.",
-                "Repeat the same rule checks at every control step.",
+                "Read road sensors, speed, side speed, angle, track position, and wheel spin.",
+                "Score the front-facing sensors to find the most useful visible road.",
+                "Classify the visible section as straight, bend, tight corner, or hairpin.",
+                "Choose speed and steering from the section, edge risk, and stability state.",
+                "Apply gear, braking, and anti-spin rules before returning the action.",
+            ),
+            "algorithm_summary": (
+                "The rule-based driver is reactive and interpretable.",
+                (
+                    "Its road model comes from 19 range sensors. The centre sensor looks "
+                    "straight ahead, while neighbouring sensors provide angled views left "
+                    "and right."
+                ),
+                (
+                    "The controller scores those sensors, estimates how severe the next "
+                    "section looks, and maps that section to a target speed."
+                ),
+                (
+                    "Stability rules are deliberately separate from racing rules. If the "
+                    "car has a high angle, high side speed, or is drifting toward an edge, "
+                    "saving the car takes priority over going fast."
+                ),
+                (
+                    "This makes the algorithm easy to audit, but it also gives it a lower "
+                    "ceiling than a map-aware agent on a track where planning matters."
+                ),
+            ),
+            "pseudocode": (
+                "Read speed, side speed, angle, trackPos, wheel spin, and 19 road sensors.",
+                "Find which front-facing sensor sees the most useful open road.",
+                "Classify the visible section as straight, fast bend, shallow, medium, tight, or hairpin.",
+                "Pick a target speed from that section type.",
+                "Steer from car angle, road position, and best sensor direction.",
+                "Brake or reduce throttle if the car is too fast for the visible road.",
+                "Enter stability mode if angle, sideways speed, or edge risk is high.",
+                "Apply gear and traction rules.",
+                "Return the next full-control action.",
+            ),
+            "formula_notes": (
+                FormulaNote(
+                    title="Sensor Score",
+                    formula=r"$score_i = track_i(1 - |i - 9|p)$",
+                    explanation=(
+                        "The middle sensor is index 9. This score favours open road but "
+                        "penalises sensors that point too far away from the car's current "
+                        "heading, reducing the chance of chasing an extreme edge."
+                    ),
+                ),
+                FormulaNote(
+                    title="Visible-Corner Severity",
+                    formula=(
+                        r"$severity = 0.40a$"
+                        "\n"
+                        r"$\quad + 0.45c$"
+                        "\n"
+                        r"$\quad + 0.15d$"
+                    ),
+                    explanation=(
+                        "The rule-based agent compresses several sensor cues into one "
+                        "severity value. Higher severity pushes the section label toward "
+                        "TIGHT or HAIRPIN and lowers the target speed."
+                    ),
+                ),
+                FormulaNote(
+                    title="Closing Factor",
+                    formula=(
+                        r"$c = \max\left(0,"
+                        r" \frac{145 - front\_sensor}{145}\right)$"
+                    ),
+                    explanation=(
+                        "As the clear road in front gets shorter, this term rises. It is "
+                        "a simple way to make the agent brake earlier when the visible "
+                        "track is closing quickly."
+                    ),
+                ),
+                FormulaNote(
+                    title="Stability Mode",
+                    formula=(
+                        r"$u = |\theta| > 0.72$"
+                        "\n"
+                        r"$\mathrm{or}\ |v_y| > 20$"
+                        "\n"
+                        r"$\mathrm{or}\ s_{sideways} = \mathrm{high}$"
+                    ),
+                    explanation=(
+                        "This is not a probability model. It is a set of safety thresholds "
+                        "that tell the controller when recovery should override normal "
+                        "cornering behaviour."
+                    ),
+                ),
+            ),
+            "code_snippets": (
+                CodeSnippet(
+                    title="Choosing the most useful road sensor",
+                    source="src/agents/rule_based_agent.py - get_best_sensor",
+                    explanation=(
+                        "The middle sensor points straight ahead. Nearby sensors are scored "
+                        "so the driver can aim toward open road without chasing extreme edges."
+                    ),
+                    code=(
+                        "def get_best_sensor(state):\n"
+                        "    track = state[\"track\"]\n"
+                        "    front = track[9]\n"
+                        "    candidate_indices = range(4, 15) if front < 65 else range(6, 13)\n"
+                        "    best_index = 9\n"
+                        "    best_score = front * 1.12\n"
+                        "    for index in candidate_indices:\n"
+                        "        offset = abs(index - 9)\n"
+                        "        centre_penalty = 1.0 - offset * (0.035 if front < 65 else 0.10)\n"
+                        "        score = track[index] * centre_penalty\n"
+                        "        if score > best_score:\n"
+                        "            best_score = score\n"
+                        "            best_index = index\n"
+                        "    return best_index"
+                    ),
+                ),
+                CodeSnippet(
+                    title="Classifying the road ahead",
+                    source="src/agents/rule_based_agent.py - classify_section",
+                    explanation=(
+                        "The driver turns sensor readings into a human-readable road section. "
+                        "That section then controls the target speed."
+                    ),
+                    code=(
+                        "def classify_section(front, planned_angle_abs, best_distance):\n"
+                        "    closing = max(0.0, (145.0 - front) / 145.0)\n"
+                        "    angle_factor = planned_angle_abs / 19.0\n"
+                        "    distance_factor = max(0.0, (125.0 - best_distance) / 125.0)\n"
+                        "    severity = 0.40 * angle_factor + 0.45 * closing + 0.15 * distance_factor\n"
+                        "    if front > 155 and planned_angle_abs <= 7:\n"
+                        "        section = \"STRAIGHT\"\n"
+                        "    elif severity < 0.46:\n"
+                        "        section = \"SHALLOW\"\n"
+                        "    elif severity < 0.88:\n"
+                        "        section = \"TIGHT\"\n"
+                        "    else:\n"
+                        "        section = \"HAIRPIN\"\n"
+                        "    return section, severity"
+                    ),
+                ),
+            ),
+            "math_notes": (
+                "The rule-based controller is mostly thresholds and weighted scores, not learned weights.",
+                "The front road sensor is track[9]; sensors around it represent increasingly angled views left and right.",
+                (
+                    "Section severity combines angle demand, closing distance, and best visible "
+                    "distance: severity = 0.40 * angle + 0.45 * closing + 0.15 * distance."
+                ),
+                (
+                    "Target speed is selected from section labels, so a HAIRPIN produces a "
+                    "much lower speed target than a STRAIGHT."
+                ),
+                (
+                    "Stability checks use absolute angle and sideways speed to decide when "
+                    "saving the car matters more than attacking the road."
+                ),
+            ),
+            "key_takeaways": (
+                "This driver is easy to explain because it is built from visible rules.",
+                "It can run on more tracks because it does not need a saved map.",
+                "Its weakness is anticipation: it reacts to what the sensors can see now.",
+                "Telemetry should show clear cause-and-effect between sensor danger and braking.",
             ),
             "input_signals": (
                 "Road sensors showing left, centre, and right space.",
@@ -139,18 +541,19 @@ def _template_for(agent_type: str) -> dict[str, Any]:
         return {
             "badge": "Baseline random driver",
             "headline": (
-                "This driver is a control baseline: it makes random driving choices "
-                "so better agents have something simple to beat."
+                "This driver is an experimental baseline: it samples random actions "
+                "so planned or rule-based agents can be compared against a weak control."
             ),
             "overview": (
-                "It is not trying to learn the track or follow a strategy.",
+                "It is not trying to learn the track, interpret sensors, or follow a strategy.",
                 (
-                    "Its value is experimental rather than competitive: if another "
-                    "agent cannot beat this baseline, that is a warning sign."
+                    "Its value is methodological rather than competitive. It gives the "
+                    "project a lower-bound comparison for judging whether the other "
+                    "agents are genuinely adding intelligence."
                 ),
                 (
-                    "In telemetry, random behaviour usually appears as unstable "
-                    "steering, inconsistent throttle, and early off-track moments."
+                    "In telemetry, random behaviour usually appears as noisy steering, "
+                    "inconsistent throttle, poor repeatability, and early off-track moments."
                 ),
             ),
             "decision_steps": (
@@ -159,6 +562,84 @@ def _template_for(agent_type: str) -> dict[str, Any]:
                 "Send that action to TORCS without planning ahead.",
                 "Record the result as a baseline behaviour.",
                 "Use the run as a low-skill comparison point.",
+            ),
+            "algorithm_summary": (
+                "The random driver is intentionally simple and deliberately unskilled.",
+                (
+                    "It samples steering and throttle from fixed ranges and sends those "
+                    "values to TORCS without understanding the track."
+                ),
+                (
+                    "Because a seed can be reused, its randomness can still be made "
+                    "repeatable enough for a fair baseline comparison."
+                ),
+                (
+                    "For a dissertation, this agent is useful because it demonstrates "
+                    "that better performance is not automatic: the other controllers "
+                    "should clearly outperform this non-reasoning baseline."
+                ),
+            ),
+            "pseudocode": (
+                "Create a seeded random-number generator.",
+                "For each simulator step, sample steering between -0.4 and 0.4.",
+                "Sample throttle between 0.3 and 0.7.",
+                "Return those two values as the action.",
+                "Reset by reusing the same seed so the baseline can be repeated.",
+            ),
+            "formula_notes": (
+                FormulaNote(
+                    title="Uniform Steering Sample",
+                    formula=r"$steering \sim \mathcal{U}(-0.4, 0.4)$",
+                    explanation=(
+                        "Every steering value inside this interval is equally likely. "
+                        "The sample is bounded so the car does not constantly request "
+                        "full steering lock, but it is still not a planned decision."
+                    ),
+                ),
+                FormulaNote(
+                    title="Uniform Throttle Sample",
+                    formula=r"$throttle \sim \mathcal{U}(0.3, 0.7)$",
+                    explanation=(
+                        "Throttle is also sampled uniformly from a fixed interval. The "
+                        "agent does not check whether it is on a straight, entering a "
+                        "corner, or leaving the track."
+                    ),
+                ),
+                FormulaNote(
+                    title="Repeatable Randomness",
+                    formula=r"$random\_sequence = \mathrm{Random}(seed)$",
+                    explanation=(
+                        "A fixed seed produces the same sequence again, which helps make "
+                        "baseline comparisons reproducible even though the behaviour is random."
+                    ),
+                ),
+            ),
+            "code_snippets": (
+                CodeSnippet(
+                    title="Random baseline action",
+                    source="src/agents/random_agent.py - RandomAgent.act",
+                    explanation=(
+                        "The ranges deliberately avoid full steering lock and full throttle, "
+                        "but the agent still has no idea where the road is."
+                    ),
+                    code=(
+                        "def act(self, _observation, _telemetry=None):\n"
+                        "    steering = self._random.uniform(-0.4, 0.4)\n"
+                        "    throttle = self._random.uniform(0.3, 0.7)\n"
+                        "    return [steering, throttle]"
+                    ),
+                ),
+            ),
+            "math_notes": (
+                "This baseline uses uniform random sampling rather than a driving model.",
+                "Every value inside the allowed steering range has equal probability.",
+                "The seed makes a random run repeatable, which is useful for comparisons.",
+                "There is no target speed, racing line, reward model, or recovery equation.",
+            ),
+            "key_takeaways": (
+                "This is a sanity-check baseline, not a serious racing strategy.",
+                "A useful agent should beat it clearly and consistently.",
+                "Noisy telemetry is expected because actions are not tied to road context.",
             ),
             "input_signals": (
                 "Simulator observation is received, but not meaningfully interpreted.",
@@ -193,6 +674,25 @@ def _template_for(agent_type: str) -> dict[str, Any]:
             "Return steering, throttle, brake, or gear commands.",
             "Record telemetry and run results.",
             "Compare the outcome with other saved runs.",
+        ),
+        "algorithm_summary": (
+            "This discovered agent does not yet have a custom explanation profile.",
+            "The dashboard can still describe its metadata and inspect its telemetry.",
+        ),
+        "pseudocode": (
+            "Load the agent.",
+            "Read simulator observations.",
+            "Return an action.",
+            "Record telemetry.",
+            "Compare the saved result.",
+        ),
+        "formula_notes": (),
+        "code_snippets": (),
+        "math_notes": (
+            "No dedicated mathematics notes are available for this agent type yet.",
+        ),
+        "key_takeaways": (
+            "Add a profile entry to explain this agent in the same format as the others.",
         ),
         "input_signals": (
             "Simulator telemetry.",

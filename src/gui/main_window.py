@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from io import BytesIO
 from typing import Any
 
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, Qt, QThread, QTimer
-from PySide6.QtGui import QFont, QTextCursor
+from PySide6.QtGui import QFont, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -29,7 +30,10 @@ from PySide6.QtWidgets import (
 )
 
 try:
-    from .agent_education_model import build_agent_education_profile
+    from .agent_education_model import (
+        AgentEducationProfile,
+        build_agent_education_profile,
+    )
     from .comparison_model import (
         compare_runs,
         comparison_finish_time,
@@ -71,7 +75,10 @@ try:
     )
     from .track_view import RoadSensorWidget, TrackPositionWidget
 except ImportError:
-    from agent_education_model import build_agent_education_profile
+    from agent_education_model import (
+        AgentEducationProfile,
+        build_agent_education_profile,
+    )
     from comparison_model import (
         compare_runs,
         comparison_finish_time,
@@ -182,6 +189,7 @@ class MainWindow(QMainWindow):
         self.agent_education_title_label = QLabel("Agent Guide")
         self.agent_education_badge_label = QLabel("Idle")
         self.agent_education_headline_label = QLabel("Select an agent.")
+        self.agent_algorithm_button = QPushButton("Algorithm Guide")
         self.agent_education_metadata_box = QTextEdit()
         self.agent_education_overview_box = QTextEdit()
         self.agent_education_signals_box = QTextEdit()
@@ -219,6 +227,8 @@ class MainWindow(QMainWindow):
         self.racing_line_profile: RacingLineProfile | None = None
         self.racing_line_visual_profile: RacingLineVisualProfile | None = None
         self.racing_line_map_dialog: RacingLineMapDialog | None = None
+        self.agent_education_profile: AgentEducationProfile | None = None
+        self.agent_algorithm_dialog: AgentAlgorithmDialog | None = None
         self.racing_line_distance = 0.0
         self.telemetry_history = TelemetryHistory()
         self.metric_value_labels: dict[str, QLabel] = {}
@@ -331,6 +341,7 @@ class MainWindow(QMainWindow):
         self.agent_education_badge_label.setStyleSheet(_agent_badge_style())
         self.agent_education_headline_label.setWordWrap(True)
         self.agent_education_headline_label.setMinimumHeight(54)
+        self.agent_algorithm_button.setEnabled(False)
         for box in (
             self.agent_education_metadata_box,
             self.agent_education_overview_box,
@@ -818,6 +829,7 @@ class MainWindow(QMainWindow):
         profile_layout.addWidget(self.agent_education_title_label)
         profile_layout.addWidget(self.agent_education_badge_label)
         profile_layout.addWidget(self.agent_education_headline_label)
+        profile_layout.addWidget(self.agent_algorithm_button)
         layout.addWidget(profile_group)
 
         layout.addWidget(
@@ -1018,6 +1030,7 @@ class MainWindow(QMainWindow):
         self.agent_education_combo.currentIndexChanged.connect(
             self._update_agent_education
         )
+        self.agent_algorithm_button.clicked.connect(self._open_agent_algorithm_dialog)
         self.run_history_table.cellClicked.connect(self._handle_run_history_clicked)
         self.review_slider.valueChanged.connect(self._handle_review_slider_changed)
         self.review_play_button.clicked.connect(self._handle_review_play_clicked)
@@ -1171,13 +1184,18 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(self.track_combo.count() > 0)
 
     def _update_agent_education(self) -> None:
+        if self.agent_algorithm_dialog is not None:
+            self.agent_algorithm_dialog.close()
+
         agent = self.selected_education_agent()
         if agent is None:
+            self.agent_education_profile = None
             self.agent_education_title_label.setText("No agent discovered")
             self.agent_education_badge_label.setText("Idle")
             self.agent_education_headline_label.setText(
                 "No project agent metadata is available."
             )
+            self.agent_algorithm_button.setEnabled(False)
             self._set_text_box(self.agent_education_metadata_box, ())
             self._set_text_box(self.agent_education_overview_box, ())
             self._set_text_box(self.agent_education_signals_box, ())
@@ -1193,6 +1211,8 @@ class MainWindow(QMainWindow):
             agent,
             self.project_options.tracks,
         )
+        self.agent_education_profile = profile
+        self.agent_algorithm_button.setEnabled(True)
         self.agent_education_title_label.setText(profile.title)
         self.agent_education_badge_label.setText(profile.badge)
         self.agent_education_headline_label.setText(profile.headline)
@@ -1214,6 +1234,33 @@ class MainWindow(QMainWindow):
 
     def _set_text_box(self, box: QTextEdit, lines: tuple[str, ...]) -> None:
         box.setPlainText(_format_bullet_lines(lines))
+
+    def _open_agent_algorithm_dialog(self) -> None:
+        if self.agent_education_profile is None:
+            return
+        if self.agent_algorithm_dialog is not None:
+            self.agent_algorithm_dialog.raise_()
+            self.agent_algorithm_dialog.activateWindow()
+            return
+
+        dialog = AgentAlgorithmDialog(self.agent_education_profile, self)
+        self.agent_algorithm_dialog = dialog
+        dialog.finished.connect(
+            lambda _result, guide_dialog=dialog: self._handle_agent_algorithm_closed(
+                guide_dialog
+            )
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _handle_agent_algorithm_closed(
+        self,
+        dialog: "AgentAlgorithmDialog",
+    ) -> None:
+        if dialog is self.agent_algorithm_dialog:
+            self.agent_algorithm_dialog = None
+            dialog.deleteLater()
 
     def _sync_racing_line_visualizer(self, agent: AgentOption | None) -> None:
         if agent is None or not agent.requires_racing_line:
@@ -2275,6 +2322,142 @@ class MainWindow(QMainWindow):
         )
 
 
+class AgentAlgorithmDialog(QDialog):
+    def __init__(
+        self,
+        profile: AgentEducationProfile,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Algorithm Guide - {profile.title}")
+        self.resize(960, 700)
+
+        layout = QVBoxLayout(self)
+        title = QLabel(profile.title)
+        title.setFont(_section_font())
+        subtitle = QLabel(profile.badge)
+        subtitle.setAlignment(Qt.AlignLeft)
+        subtitle.setStyleSheet(_agent_badge_style())
+        subtitle.setMinimumHeight(28)
+
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        tabs = QTabWidget()
+        tabs.addTab(self._build_overview_tab(profile), "Overview")
+        tabs.addTab(self._build_pseudocode_tab(profile), "Algorithm")
+        if profile.formula_notes:
+            tabs.addTab(self._build_formula_tab(profile), "Formulas")
+        if profile.code_snippets:
+            tabs.addTab(self._build_code_tab(profile), "Code")
+        tabs.addTab(self._build_math_tab(profile), "Interpretation")
+        layout.addWidget(tabs, 1)
+
+        controls = QHBoxLayout()
+        controls.addStretch(1)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.close)
+        controls.addWidget(close_button)
+        layout.addLayout(controls)
+
+    def _build_overview_tab(self, profile: AgentEducationProfile) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.addWidget(
+            _standalone_text_group(
+                "How The Algorithm Thinks",
+                _guide_text_box(_format_bullet_lines(profile.algorithm_summary)),
+            )
+        )
+        layout.addWidget(
+            _standalone_text_group(
+                "What Users Should Notice",
+                _guide_text_box(_format_bullet_lines(profile.key_takeaways)),
+            )
+        )
+        layout.addStretch(1)
+        return _scrollable_dialog_page(content)
+
+    def _build_pseudocode_tab(self, profile: AgentEducationProfile) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.addWidget(
+            _standalone_text_group(
+                "Readable Algorithm",
+                _guide_text_box(
+                    _format_numbered_lines(profile.pseudocode),
+                    monospace=True,
+                    minimum_height=360,
+                ),
+            )
+        )
+        layout.addStretch(1)
+        return _scrollable_dialog_page(content)
+
+    def _build_formula_tab(self, profile: AgentEducationProfile) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+
+        for note in profile.formula_notes:
+            group = QGroupBox(note.title)
+            group_layout = QVBoxLayout(group)
+
+            explanation = QLabel(note.explanation)
+            explanation.setWordWrap(True)
+
+            group_layout.addWidget(_formula_display_widget(note.formula))
+            group_layout.addWidget(explanation)
+            layout.addWidget(group)
+
+        layout.addStretch(1)
+        return _scrollable_dialog_page(content)
+
+    def _build_code_tab(self, profile: AgentEducationProfile) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+
+        for snippet in profile.code_snippets:
+            group = QGroupBox(snippet.title)
+            group_layout = QVBoxLayout(group)
+
+            source = QLabel(snippet.source)
+            source.setObjectName("metricLabel")
+            source.setWordWrap(True)
+            explanation = QLabel(snippet.explanation)
+            explanation.setWordWrap(True)
+
+            line_count = max(4, snippet.code.count("\n") + 1)
+            code_box = _guide_text_box(
+                snippet.code,
+                monospace=True,
+                minimum_height=min(260, 34 + line_count * 18),
+            )
+            code_box.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+
+            group_layout.addWidget(source)
+            group_layout.addWidget(explanation)
+            group_layout.addWidget(code_box)
+            layout.addWidget(group)
+
+        layout.addStretch(1)
+        return _scrollable_dialog_page(content)
+
+    def _build_math_tab(self, profile: AgentEducationProfile) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.addWidget(
+            _standalone_text_group(
+                "Maths / Logic In Human Terms",
+                _guide_text_box(
+                    _format_bullet_lines(profile.math_notes),
+                    minimum_height=420,
+                ),
+            )
+        )
+        layout.addStretch(1)
+        return _scrollable_dialog_page(content)
+
+
 class RacingLineMapDialog(QDialog):
     def __init__(
         self,
@@ -2389,6 +2572,112 @@ class RacingLineMapDialog(QDialog):
         self.progress_label.setText(
             f"{self.distance:.0f}m / {self.profile.track_length_m:.0f}m"
         )
+
+
+def _scrollable_dialog_page(content: QWidget) -> QScrollArea:
+    scroll_area = QScrollArea()
+    scroll_area.setWidgetResizable(True)
+    scroll_area.setWidget(content)
+    return scroll_area
+
+
+def _guide_text_box(
+    text: str,
+    *,
+    monospace: bool = False,
+    minimum_height: int = 180,
+) -> QTextEdit:
+    box = QTextEdit()
+    box.setReadOnly(True)
+    box.setPlainText(text)
+    box.setMinimumHeight(minimum_height)
+    if monospace:
+        box.setFont(_monospace_font())
+    return box
+
+
+def _formula_display_widget(formula: str) -> QWidget:
+    container = QWidget()
+    layout = QVBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+
+    pixmap = _render_formula_pixmap(formula)
+    if pixmap is not None and not pixmap.isNull():
+        formula_label = QLabel()
+        formula_label.setPixmap(pixmap)
+        formula_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        formula_label.setMinimumHeight(pixmap.height() + 12)
+        formula_label.setStyleSheet(
+            "background-color: #f8f8f6; "
+            "border: 1px solid #555555; "
+            "padding: 8px;"
+        )
+        layout.addWidget(formula_label)
+        return container
+
+    formula_box = _guide_text_box(
+        formula,
+        monospace=True,
+        minimum_height=min(150, 44 + formula.count("\n") * 20),
+    )
+    formula_box.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+    layout.addWidget(formula_box)
+    return container
+
+
+def _render_formula_pixmap(formula: str) -> QPixmap | None:
+    try:
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+    except Exception:
+        return None
+
+    try:
+        line_count = max(1, formula.count("\n") + 1)
+        figure = Figure(
+            figsize=(8.4, max(0.78, 0.48 * line_count)),
+            dpi=145,
+            facecolor="#f8f8f6",
+        )
+        canvas = FigureCanvasAgg(figure)
+        figure.text(
+            0.02,
+            0.52,
+            formula,
+            ha="left",
+            va="center",
+            color="#111111",
+            fontsize=17,
+            math_fontfamily="dejavuserif",
+        )
+
+        buffer = BytesIO()
+        figure.savefig(
+            buffer,
+            format="png",
+            bbox_inches="tight",
+            pad_inches=0.18,
+            facecolor=figure.get_facecolor(),
+        )
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(buffer.getvalue(), "PNG"):
+            return None
+        return pixmap
+    except Exception:
+        return None
+
+
+def _format_numbered_lines(lines: tuple[str, ...]) -> str:
+    if not lines:
+        return "1. --"
+    return "\n".join(f"{index}. {line}" for index, line in enumerate(lines, start=1))
+
+
+def _monospace_font() -> QFont:
+    font = QFont("Consolas")
+    font.setStyleHint(QFont.StyleHint.Monospace)
+    font.setPointSize(9)
+    return font
 
 
 def _add_review_marker(plot: pg.PlotWidget) -> Any:

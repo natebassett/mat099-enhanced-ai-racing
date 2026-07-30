@@ -28,6 +28,19 @@ class GuiAgentEducationModelTests(unittest.TestCase):
             profile.input_signals,
         )
         self.assertIn(
+            "The map-aware driver separates route planning",
+            profile.algorithm_summary[0],
+        )
+        self.assertTrue(any("target_track_pos" in note for note in profile.math_notes))
+        self.assertTrue(
+            any("Racing Point Projection" == note.title for note in profile.formula_notes)
+        )
+        self.assertTrue(any(r"\sqrt" in note.formula for note in profile.formula_notes))
+        self.assertTrue(any("smoothstep" in note.explanation for note in profile.formula_notes))
+        self.assertTrue(
+            any("RacingLine.lookup" in snippet.source for snippet in profile.code_snippets)
+        )
+        self.assertIn(
             "Track dependency",
             [label for label, _value in profile.metadata],
         )
@@ -44,6 +57,13 @@ class GuiAgentEducationModelTests(unittest.TestCase):
         self.assertEqual(metadata["Track dependency"], "No racing-line file required")
         self.assertIn("Reactive rule-based controller", profile.badge)
         self.assertIn("Compatible tracks", profile.track_context[0])
+        self.assertTrue(
+            any("Visible-Corner Severity" == note.title for note in profile.formula_notes)
+        )
+        self.assertTrue(any("severity" in note for note in profile.math_notes))
+        self.assertTrue(
+            any("get_best_sensor" in snippet.source for snippet in profile.code_snippets)
+        )
 
     def test_random_profile_is_marked_as_baseline(self):
         profile = build_agent_education_profile(
@@ -53,6 +73,12 @@ class GuiAgentEducationModelTests(unittest.TestCase):
 
         self.assertEqual(profile.badge, "Baseline random driver")
         self.assertIn("low-skill comparison point", profile.decision_steps[-1])
+        self.assertIn("uniform random sampling", profile.math_notes[0])
+        self.assertTrue(
+            any("Uniform Steering Sample" == note.title for note in profile.formula_notes)
+        )
+        self.assertTrue(any(r"\mathcal{U}" in note.formula for note in profile.formula_notes))
+        self.assertEqual(len(profile.code_snippets), 1)
 
 
 def _agent(name: str, agent_type: str, *, requires_line: bool) -> AgentOption:
