@@ -4,10 +4,11 @@ from dataclasses import dataclass
 from typing import Any
 
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, QThread, QTimer
+from PySide6.QtCore import QEvent, Qt, QThread, QTimer
 from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox,
+    QDialog,
     QFrame,
     QGridLayout,
     QGroupBox,
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QSlider,
     QTableWidget,
@@ -27,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 try:
+    from .agent_education_model import build_agent_education_profile
     from .comparison_model import (
         compare_runs,
         comparison_finish_time,
@@ -48,6 +51,15 @@ try:
         load_project_options,
     )
     from .race_worker import RaceWorker
+    from .racing_line_model import (
+        RacingLineProfile,
+        RacingLineVisualProfile,
+        build_racing_line_visual_profile,
+        load_racing_line_profile,
+        racing_line_point_text,
+        racing_line_summary_lines,
+    )
+    from .racing_line_view import RacingLineGraphWidget, RacingLineWidget
     from .telemetry_model import (
         ExplanationFrame,
         TelemetryHistory,
@@ -59,6 +71,7 @@ try:
     )
     from .track_view import RoadSensorWidget, TrackPositionWidget
 except ImportError:
+    from agent_education_model import build_agent_education_profile
     from comparison_model import (
         compare_runs,
         comparison_finish_time,
@@ -80,6 +93,15 @@ except ImportError:
         load_project_options,
     )
     from race_worker import RaceWorker
+    from racing_line_model import (
+        RacingLineProfile,
+        RacingLineVisualProfile,
+        build_racing_line_visual_profile,
+        load_racing_line_profile,
+        racing_line_point_text,
+        racing_line_summary_lines,
+    )
+    from racing_line_view import RacingLineGraphWidget, RacingLineWidget
     from telemetry_model import (
         ExplanationFrame,
         TelemetryHistory,
@@ -125,6 +147,7 @@ class MainWindow(QMainWindow):
         self.tabs: QTabWidget | None = None
         self.review_tab_index = 0
         self.compare_tab_index = 0
+        self.agents_tab_index = 0
         self.review_title_label = QLabel("No run selected")
         self.review_status_label = QLabel("Idle")
         self.review_summary_box = QTextEdit()
@@ -155,12 +178,33 @@ class MainWindow(QMainWindow):
         self.compare_b_state_label = QLabel("No run selected.")
         self.compare_a_values_label = QLabel("-")
         self.compare_b_values_label = QLabel("-")
+        self.agent_education_combo = QComboBox()
+        self.agent_education_title_label = QLabel("Agent Guide")
+        self.agent_education_badge_label = QLabel("Idle")
+        self.agent_education_headline_label = QLabel("Select an agent.")
+        self.agent_education_metadata_box = QTextEdit()
+        self.agent_education_overview_box = QTextEdit()
+        self.agent_education_signals_box = QTextEdit()
+        self.agent_education_strengths_box = QTextEdit()
+        self.agent_education_failure_box = QTextEdit()
+        self.agent_education_tracks_box = QTextEdit()
+        self.agent_pipeline_labels: list[QLabel] = []
+        self.racing_line_track_combo = QComboBox()
+        self.racing_line_play_button = QPushButton("Play")
+        self.racing_line_reset_button = QPushButton("Reset")
+        self.racing_line_map_button = QPushButton("Open Map")
+        self.racing_line_progress_label = QLabel("No racing line loaded")
+        self.racing_line_summary_box = QTextEdit()
+        self.racing_line_point_box = QTextEdit()
+        self.racing_line_graph_widget = RacingLineGraphWidget()
+        self.racing_line_visualizer_group: QGroupBox | None = None
         self.track_position_widget = TrackPositionWidget()
         self.road_sensor_widget = RoadSensorWidget()
         self.race_thread: QThread | None = None
         self.race_worker: RaceWorker | None = None
         self.review_timer = QTimer(self)
         self.compare_timer = QTimer(self)
+        self.racing_line_timer = QTimer(self)
         self.review_snapshots: list[TelemetrySnapshot] = []
         self.review_run: dict[str, Any] | None = None
         self.review_current_index = 0
@@ -172,6 +216,10 @@ class MainWindow(QMainWindow):
         self.compare_times_a: list[float] = []
         self.compare_times_b: list[float] = []
         self.compare_current_time = 0.0
+        self.racing_line_profile: RacingLineProfile | None = None
+        self.racing_line_visual_profile: RacingLineVisualProfile | None = None
+        self.racing_line_map_dialog: RacingLineMapDialog | None = None
+        self.racing_line_distance = 0.0
         self.telemetry_history = TelemetryHistory()
         self.metric_value_labels: dict[str, QLabel] = {}
         self.chart_window_seconds = 90.0
@@ -205,11 +253,14 @@ class MainWindow(QMainWindow):
         self._configure_controls()
         self._build_ui()
         self._refresh_compare_options()
+        self._update_agent_education()
         self._connect_signals()
         self._update_selection_details()
 
     def _configure_controls(self) -> None:
         self._populate_combo(self.agent_combo, self.project_options.agents)
+        self._populate_combo(self.agent_education_combo, self.project_options.agents)
+        self._populate_racing_line_tracks()
         self._refresh_track_options(preferred_track_id="g-track-3")
         self._populate_combo(self.car_combo, self.project_options.cars)
         self._select_combo_item(self.car_combo, "car_id", "car1-ow1")
@@ -274,12 +325,39 @@ class MainWindow(QMainWindow):
             label.setStyleSheet(_severity_style("Idle"))
         self.compare_timer.setInterval(250)
 
+        self.agent_education_title_label.setFont(_section_font())
+        self.agent_education_badge_label.setAlignment(Qt.AlignCenter)
+        self.agent_education_badge_label.setMinimumHeight(28)
+        self.agent_education_badge_label.setStyleSheet(_agent_badge_style())
+        self.agent_education_headline_label.setWordWrap(True)
+        self.agent_education_headline_label.setMinimumHeight(54)
+        for box in (
+            self.agent_education_metadata_box,
+            self.agent_education_overview_box,
+            self.agent_education_signals_box,
+            self.agent_education_strengths_box,
+            self.agent_education_failure_box,
+            self.agent_education_tracks_box,
+            self.racing_line_summary_box,
+            self.racing_line_point_box,
+        ):
+            box.setReadOnly(True)
+            box.setMinimumHeight(104)
+        self.racing_line_summary_box.setMaximumHeight(124)
+        self.racing_line_point_box.setMaximumHeight(124)
+        self.racing_line_progress_label.setWordWrap(True)
+        self.racing_line_play_button.setEnabled(False)
+        self.racing_line_reset_button.setEnabled(False)
+        self.racing_line_map_button.setEnabled(False)
+        self.racing_line_timer.setInterval(60)
+
     def _build_ui(self) -> None:
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_dashboard_tab(), "Dashboard")
         self.tabs.addTab(self._build_run_history_tab(), "Run History")
         self.review_tab_index = self.tabs.addTab(self._build_review_tab(), "Review")
         self.compare_tab_index = self.tabs.addTab(self._build_compare_tab(), "Compare")
+        self.agents_tab_index = self.tabs.addTab(self._build_agents_tab(), "Agents")
 
         self.setCentralWidget(self.tabs)
         self.statusBar().showMessage(self._discovery_summary())
@@ -714,10 +792,147 @@ class MainWindow(QMainWindow):
         layout.addWidget(values_label)
         return group
 
+    def _build_agents_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QHBoxLayout(page)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self._build_agent_education_left_panel())
+        splitter.addWidget(self._build_agent_education_detail_panel())
+        splitter.setSizes([330, 850])
+        layout.addWidget(splitter)
+
+        return page
+
+    def _build_agent_education_left_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        title = QLabel("Agents")
+        title.setFont(_section_font())
+        layout.addWidget(title)
+        layout.addWidget(self._combo_group("Driver", self.agent_education_combo))
+
+        profile_group = QGroupBox("Profile")
+        profile_layout = QVBoxLayout(profile_group)
+        profile_layout.addWidget(self.agent_education_title_label)
+        profile_layout.addWidget(self.agent_education_badge_label)
+        profile_layout.addWidget(self.agent_education_headline_label)
+        layout.addWidget(profile_group)
+
+        layout.addWidget(
+            self._text_group("Project Metadata", self.agent_education_metadata_box)
+        )
+        layout.addStretch(1)
+        return panel
+
+    def _build_agent_education_detail_panel(self) -> QWidget:
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.addWidget(
+            self._text_group("What This Driver Is Doing", self.agent_education_overview_box)
+        )
+
+        decision_group = QGroupBox("Decision Flow")
+        decision_layout = QVBoxLayout(decision_group)
+        decision_layout.addWidget(self._build_agent_pipeline())
+        layout.addWidget(decision_group)
+
+        layout.addWidget(self._build_racing_line_visualizer_panel())
+
+        first_row = QHBoxLayout()
+        first_row.addWidget(
+            self._text_group("What It Watches", self.agent_education_signals_box)
+        )
+        first_row.addWidget(
+            self._text_group("Where It Helps", self.agent_education_strengths_box)
+        )
+        layout.addLayout(first_row)
+
+        second_row = QHBoxLayout()
+        second_row.addWidget(
+            self._text_group("Failure Signs", self.agent_education_failure_box)
+        )
+        second_row.addWidget(
+            self._text_group("Track Fit", self.agent_education_tracks_box)
+        )
+        layout.addLayout(second_row)
+        layout.addStretch(1)
+
+        scroll_area.setWidget(content)
+        return scroll_area
+
+    def _build_agent_pipeline(self) -> QWidget:
+        widget = QWidget()
+        layout = QGridLayout(widget)
+        layout.setSpacing(8)
+        self.agent_pipeline_labels.clear()
+
+        for index in range(5):
+            card = QFrame()
+            card.setFrameShape(QFrame.StyledPanel)
+            card.setMinimumHeight(88)
+
+            card_layout = QVBoxLayout(card)
+            step_label = QLabel(f"Step {index + 1}")
+            step_label.setObjectName("metricLabel")
+            body_label = QLabel("--")
+            body_label.setWordWrap(True)
+            body_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            self.agent_pipeline_labels.append(body_label)
+
+            card_layout.addWidget(step_label)
+            card_layout.addWidget(body_label)
+            layout.addWidget(card, index // 3, index % 3)
+
+        return widget
+
+    def _build_racing_line_visualizer_panel(self) -> QGroupBox:
+        group = QGroupBox("Racing-Line Visualizer")
+        self.racing_line_visualizer_group = group
+        layout = QVBoxLayout(group)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Track"))
+        controls.addWidget(self.racing_line_track_combo, 1)
+        controls.addWidget(self.racing_line_play_button)
+        controls.addWidget(self.racing_line_reset_button)
+        controls.addWidget(self.racing_line_map_button)
+        controls.addWidget(self.racing_line_progress_label)
+        layout.addLayout(controls)
+
+        layout.addWidget(self.racing_line_graph_widget)
+        layout.addWidget(
+            self._chart_legend(
+                [
+                    ("Brake", "#c0392b"),
+                    ("Accelerate", "#27ae60"),
+                    ("Full throttle", "#1f7a4d"),
+                    ("Turn", "#d97706"),
+                    ("Settle", "#2f80ed"),
+                ]
+            )
+        )
+
+        details = QHBoxLayout()
+        details.addWidget(self._text_group("Line Summary", self.racing_line_summary_box))
+        details.addWidget(self._text_group("Current Target", self.racing_line_point_box))
+        layout.addLayout(details)
+        return group
+
     def _combo_group(self, label: str, combo: QComboBox) -> QGroupBox:
         group = QGroupBox(label)
         layout = QVBoxLayout(group)
         layout.addWidget(combo)
+        return group
+
+    def _text_group(self, label: str, widget: QWidget) -> QGroupBox:
+        group = QGroupBox(label)
+        layout = QVBoxLayout(group)
+        layout.addWidget(widget)
         return group
 
     def _visual_group(self, label: str, widget: QWidget) -> QGroupBox:
@@ -800,6 +1015,9 @@ class MainWindow(QMainWindow):
         self.agent_combo.currentIndexChanged.connect(self._handle_agent_changed)
         self.track_combo.currentIndexChanged.connect(self._update_selection_details)
         self.car_combo.currentIndexChanged.connect(self._update_selection_details)
+        self.agent_education_combo.currentIndexChanged.connect(
+            self._update_agent_education
+        )
         self.run_history_table.cellClicked.connect(self._handle_run_history_clicked)
         self.review_slider.valueChanged.connect(self._handle_review_slider_changed)
         self.review_play_button.clicked.connect(self._handle_review_play_clicked)
@@ -817,6 +1035,13 @@ class MainWindow(QMainWindow):
         self.compare_slider.valueChanged.connect(self._handle_compare_slider_changed)
         self.compare_play_button.clicked.connect(self._handle_compare_play_clicked)
         self.compare_timer.timeout.connect(self._advance_compare_replay)
+        self.racing_line_track_combo.currentIndexChanged.connect(
+            self._load_selected_racing_line
+        )
+        self.racing_line_play_button.clicked.connect(self._handle_racing_line_play_clicked)
+        self.racing_line_reset_button.clicked.connect(self._reset_racing_line_animation)
+        self.racing_line_map_button.clicked.connect(self._open_racing_line_map_dialog)
+        self.racing_line_timer.timeout.connect(self._advance_racing_line_animation)
 
     def _handle_start_clicked(self) -> None:
         if self.race_thread is not None:
@@ -877,10 +1102,28 @@ class MainWindow(QMainWindow):
     def selected_car(self) -> CarOption | None:
         return self.car_combo.currentData(Qt.UserRole)
 
+    def selected_education_agent(self) -> AgentOption | None:
+        return self.agent_education_combo.currentData(Qt.UserRole)
+
+    def selected_racing_line_track(self) -> TrackOption | None:
+        return self.racing_line_track_combo.currentData(Qt.UserRole)
+
     def _populate_combo(self, combo: QComboBox, options: list[object]) -> None:
         combo.clear()
         for option in options:
             combo.addItem(option.label, option)
+
+    def _populate_racing_line_tracks(self) -> None:
+        self.racing_line_track_combo.clear()
+        for track in self.project_options.tracks:
+            if track.racing_line_path is not None:
+                self.racing_line_track_combo.addItem(track.label, track)
+
+        self._select_combo_item(
+            self.racing_line_track_combo,
+            "track_id",
+            "g-track-3",
+        )
 
     def _select_combo_item(self, combo: QComboBox, attribute: str, value: str) -> bool:
         for index in range(combo.count()):
@@ -926,6 +1169,196 @@ class MainWindow(QMainWindow):
 
         self.track_combo.blockSignals(False)
         self.start_button.setEnabled(self.track_combo.count() > 0)
+
+    def _update_agent_education(self) -> None:
+        agent = self.selected_education_agent()
+        if agent is None:
+            self.agent_education_title_label.setText("No agent discovered")
+            self.agent_education_badge_label.setText("Idle")
+            self.agent_education_headline_label.setText(
+                "No project agent metadata is available."
+            )
+            self._set_text_box(self.agent_education_metadata_box, ())
+            self._set_text_box(self.agent_education_overview_box, ())
+            self._set_text_box(self.agent_education_signals_box, ())
+            self._set_text_box(self.agent_education_strengths_box, ())
+            self._set_text_box(self.agent_education_failure_box, ())
+            self._set_text_box(self.agent_education_tracks_box, ())
+            for label in self.agent_pipeline_labels:
+                label.setText("--")
+            self._sync_racing_line_visualizer(None)
+            return
+
+        profile = build_agent_education_profile(
+            agent,
+            self.project_options.tracks,
+        )
+        self.agent_education_title_label.setText(profile.title)
+        self.agent_education_badge_label.setText(profile.badge)
+        self.agent_education_headline_label.setText(profile.headline)
+        self.agent_education_metadata_box.setPlainText(
+            _format_key_value_lines(profile.metadata)
+        )
+        self._set_text_box(self.agent_education_overview_box, profile.overview)
+        self._set_text_box(self.agent_education_signals_box, profile.input_signals)
+        self._set_text_box(self.agent_education_strengths_box, profile.strengths)
+        self._set_text_box(self.agent_education_failure_box, profile.failure_signs)
+        self._set_text_box(self.agent_education_tracks_box, profile.track_context)
+
+        for index, label in enumerate(self.agent_pipeline_labels):
+            if index < len(profile.decision_steps):
+                label.setText(profile.decision_steps[index])
+            else:
+                label.setText("--")
+        self._sync_racing_line_visualizer(agent)
+
+    def _set_text_box(self, box: QTextEdit, lines: tuple[str, ...]) -> None:
+        box.setPlainText(_format_bullet_lines(lines))
+
+    def _sync_racing_line_visualizer(self, agent: AgentOption | None) -> None:
+        if agent is None or not agent.requires_racing_line:
+            self._set_racing_line_unavailable(
+                "This driver does not use a saved racing-line file."
+            )
+            if self.racing_line_visualizer_group is not None:
+                self.racing_line_visualizer_group.setVisible(False)
+            return
+
+        if self.racing_line_visualizer_group is not None:
+            self.racing_line_visualizer_group.setVisible(True)
+        self.racing_line_track_combo.setEnabled(True)
+        self._load_selected_racing_line()
+
+    def _load_selected_racing_line(self, *_args: object) -> None:
+        agent = self.selected_education_agent()
+        if agent is not None and not agent.requires_racing_line:
+            self._sync_racing_line_visualizer(agent)
+            return
+
+        track = self.selected_racing_line_track()
+        if track is None or track.racing_line_path is None:
+            self._set_racing_line_unavailable("No racing-line track discovered.")
+            return
+
+        try:
+            profile = load_racing_line_profile(track.racing_line_path)
+            visual_profile = build_racing_line_visual_profile(profile, track.path)
+        except Exception as exc:
+            self._set_racing_line_unavailable(f"Could not load racing line: {exc}")
+            return
+
+        self.racing_line_profile = profile
+        self.racing_line_visual_profile = visual_profile
+        self.racing_line_distance = 0.0
+        self.racing_line_graph_widget.set_profile(profile)
+        self.racing_line_summary_box.setPlainText(
+            _format_bullet_lines(racing_line_summary_lines(profile))
+        )
+        self.racing_line_play_button.setEnabled(True)
+        self.racing_line_reset_button.setEnabled(True)
+        self.racing_line_map_button.setEnabled(True)
+        self.racing_line_timer.stop()
+        self.racing_line_play_button.setText("Play")
+        self._set_racing_line_distance(0.0)
+
+    def _set_racing_line_unavailable(self, message: str) -> None:
+        if self.racing_line_map_dialog is not None:
+            self.racing_line_map_dialog.close()
+        self.racing_line_profile = None
+        self.racing_line_visual_profile = None
+        self.racing_line_distance = 0.0
+        self.racing_line_timer.stop()
+        self.racing_line_play_button.setText("Play")
+        self.racing_line_play_button.setEnabled(False)
+        self.racing_line_reset_button.setEnabled(False)
+        self.racing_line_map_button.setEnabled(False)
+        self.racing_line_graph_widget.set_profile(None)
+        self.racing_line_summary_box.setPlainText(message)
+        self.racing_line_point_box.setPlainText("No racing-line target.")
+        self.racing_line_progress_label.setText("No racing line loaded")
+
+    def _handle_racing_line_play_clicked(self) -> None:
+        if self.racing_line_profile is None:
+            return
+        if self.racing_line_timer.isActive():
+            self.racing_line_timer.stop()
+            self.racing_line_play_button.setText("Play")
+            return
+
+        if self.racing_line_distance >= self.racing_line_profile.track_length_m - 0.1:
+            self._set_racing_line_distance(0.0)
+        self.racing_line_play_button.setText("Pause")
+        self.racing_line_timer.start()
+
+    def _reset_racing_line_animation(self) -> None:
+        self.racing_line_timer.stop()
+        self.racing_line_play_button.setText("Play")
+        self._set_racing_line_distance(0.0)
+
+    def _advance_racing_line_animation(self) -> None:
+        if self.racing_line_profile is None:
+            self.racing_line_timer.stop()
+            self.racing_line_play_button.setText("Play")
+            return
+
+        step = max(6.0, self.racing_line_profile.track_length_m / 420.0)
+        next_distance = self.racing_line_distance + step
+        if next_distance >= self.racing_line_profile.track_length_m:
+            self._set_racing_line_distance(self.racing_line_profile.track_length_m)
+            self.racing_line_timer.stop()
+            self.racing_line_play_button.setText("Play")
+            return
+
+        self._set_racing_line_distance(next_distance)
+
+    def _set_racing_line_distance(self, distance: float) -> None:
+        if self.racing_line_profile is None:
+            return
+
+        self.racing_line_distance = max(
+            0.0,
+            min(distance, self.racing_line_profile.track_length_m),
+        )
+        self.racing_line_graph_widget.set_distance(self.racing_line_distance)
+        point = self.racing_line_graph_widget.current_point()
+        self.racing_line_point_box.setPlainText(racing_line_point_text(point))
+        self.racing_line_progress_label.setText(
+            f"{self.racing_line_distance:.0f}m / "
+            f"{self.racing_line_profile.track_length_m:.0f}m"
+        )
+
+    def _open_racing_line_map_dialog(self) -> None:
+        if self.racing_line_profile is None or self.racing_line_visual_profile is None:
+            return
+        if self.racing_line_map_dialog is not None:
+            self.racing_line_map_dialog.raise_()
+            self.racing_line_map_dialog.activateWindow()
+            return
+
+        dialog = RacingLineMapDialog(
+            self.racing_line_profile,
+            self.racing_line_visual_profile,
+            self.racing_line_distance,
+            self,
+        )
+        self.racing_line_map_dialog = dialog
+        dialog.finished.connect(
+            lambda _result, map_dialog=dialog: self._handle_racing_line_map_closed(
+                map_dialog
+            )
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _handle_racing_line_map_closed(
+        self,
+        dialog: "RacingLineMapDialog",
+    ) -> None:
+        if dialog is self.racing_line_map_dialog:
+            self._set_racing_line_distance(dialog.current_distance())
+            self.racing_line_map_dialog = None
+            dialog.deleteLater()
 
     def _populate_run_history_table(self, runs: list[RunSummary]) -> None:
         self.run_history_table.setRowCount(max(1, len(runs)))
@@ -1842,6 +2275,122 @@ class MainWindow(QMainWindow):
         )
 
 
+class RacingLineMapDialog(QDialog):
+    def __init__(
+        self,
+        profile: RacingLineProfile,
+        visual_profile: RacingLineVisualProfile,
+        initial_distance: float,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Racing Line Map - {profile.track_name}")
+        self.resize(1120, 760)
+
+        self.profile = profile
+        self.distance = 0.0
+        self.timer = QTimer(self)
+        self.timer.setInterval(60)
+
+        self.map_widget = RacingLineWidget()
+        self.map_widget.setMinimumHeight(500)
+        self.map_widget.set_profile(visual_profile)
+        self.map_widget.set_follow_enabled(True)
+        self.play_button = QPushButton("Play")
+        self.reset_button = QPushButton("Reset")
+        self.view_button = QPushButton("Zoom Out")
+        self.progress_label = QLabel("0m")
+        self.progress_label.setMinimumWidth(120)
+        self.summary_box = QTextEdit()
+        self.point_box = QTextEdit()
+        for box in (self.summary_box, self.point_box):
+            box.setReadOnly(True)
+            box.setMinimumHeight(118)
+        self.summary_box.setPlainText(
+            _format_bullet_lines(racing_line_summary_lines(profile))
+        )
+
+        layout = QVBoxLayout(self)
+        title = QLabel("Actual Track Racing Line")
+        title.setFont(_section_font())
+        layout.addWidget(title)
+
+        controls = QHBoxLayout()
+        controls.addWidget(self.play_button)
+        controls.addWidget(self.reset_button)
+        controls.addWidget(self.view_button)
+        controls.addWidget(self.progress_label)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        layout.addWidget(self.map_widget)
+        layout.addWidget(_phase_legend_widget())
+
+        details = QHBoxLayout()
+        details.addWidget(_standalone_text_group("Line Summary", self.summary_box))
+        details.addWidget(_standalone_text_group("Current Target", self.point_box))
+        layout.addLayout(details)
+
+        self.play_button.clicked.connect(self._handle_play_clicked)
+        self.reset_button.clicked.connect(self._reset_animation)
+        self.view_button.clicked.connect(self._toggle_view_mode)
+        self.timer.timeout.connect(self._advance_animation)
+        self._set_distance(initial_distance)
+
+    def current_distance(self) -> float:
+        return self.distance
+
+    def event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.WindowDeactivate:
+            self.close()
+        return super().event(event)
+
+    def closeEvent(self, event) -> None:
+        self.timer.stop()
+        self.play_button.setText("Play")
+        super().closeEvent(event)
+
+    def _handle_play_clicked(self) -> None:
+        if self.timer.isActive():
+            self.timer.stop()
+            self.play_button.setText("Play")
+            return
+
+        if self.distance >= self.profile.track_length_m - 0.1:
+            self._set_distance(0.0)
+        self.play_button.setText("Pause")
+        self.timer.start()
+
+    def _reset_animation(self) -> None:
+        self.timer.stop()
+        self.play_button.setText("Play")
+        self._set_distance(0.0)
+
+    def _toggle_view_mode(self) -> None:
+        follow_enabled = not self.map_widget.follow_enabled()
+        self.map_widget.set_follow_enabled(follow_enabled)
+        self.view_button.setText("Zoom Out" if follow_enabled else "Follow")
+
+    def _advance_animation(self) -> None:
+        step = max(6.0, self.profile.track_length_m / 420.0)
+        next_distance = self.distance + step
+        if next_distance >= self.profile.track_length_m:
+            self._set_distance(self.profile.track_length_m)
+            self.timer.stop()
+            self.play_button.setText("Play")
+            return
+
+        self._set_distance(next_distance)
+
+    def _set_distance(self, distance: float) -> None:
+        self.distance = max(0.0, min(distance, self.profile.track_length_m))
+        self.map_widget.set_distance(self.distance)
+        self.point_box.setPlainText(racing_line_point_text(self.map_widget.current_point()))
+        self.progress_label.setText(
+            f"{self.distance:.0f}m / {self.profile.track_length_m:.0f}m"
+        )
+
+
 def _add_review_marker(plot: pg.PlotWidget) -> Any:
     marker = pg.InfiniteLine(
         pos=0.0,
@@ -1921,6 +2470,51 @@ def _section_font() -> QFont:
     return font
 
 
+def _standalone_text_group(label: str, widget: QWidget) -> QGroupBox:
+    group = QGroupBox(label)
+    layout = QVBoxLayout(group)
+    layout.addWidget(widget)
+    return group
+
+
+def _phase_legend_widget() -> QWidget:
+    legend = QWidget()
+    layout = QHBoxLayout(legend)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(8)
+    layout.addStretch(1)
+
+    for label, color in (
+        ("Brake", "#c0392b"),
+        ("Accelerate", "#27ae60"),
+        ("Full throttle", "#1f7a4d"),
+        ("Turn", "#d97706"),
+        ("Settle", "#2f80ed"),
+    ):
+        swatch = QLabel()
+        swatch.setFixedSize(10, 10)
+        swatch.setStyleSheet(
+            f"background-color: {color}; border: 1px solid #202020;"
+        )
+        text = QLabel(label)
+        layout.addWidget(swatch)
+        layout.addWidget(text)
+
+    return legend
+
+
+def _format_bullet_lines(lines: tuple[str, ...]) -> str:
+    if not lines:
+        return "--"
+    return "\n".join(f"- {line}" for line in lines)
+
+
+def _format_key_value_lines(items: tuple[tuple[str, str], ...]) -> str:
+    if not items:
+        return "--"
+    return "\n".join(f"{label}: {value}" for label, value in items)
+
+
 def _format_optional(value: object) -> str:
     return "--" if value is None else str(value)
 
@@ -1963,6 +2557,16 @@ def _severity_style(severity: str) -> str:
     return (
         f"background-color: {background}; "
         f"color: {foreground}; "
+        "border-radius: 4px; "
+        "font-weight: 700; "
+        "padding: 4px 8px;"
+    )
+
+
+def _agent_badge_style() -> str:
+    return (
+        "background-color: #234b63; "
+        "color: #ffffff; "
         "border-radius: 4px; "
         "font-weight: 700; "
         "padding: 4px 8px;"
