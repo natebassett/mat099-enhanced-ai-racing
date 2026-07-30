@@ -179,7 +179,7 @@ class RacingLineWidget(QWidget):
         self._profile: RacingLineVisualProfile | None = None
         self._distance = 0.0
         self._follow_enabled = True
-        self._follow_window_m = 170.0
+        self._follow_window_m = 145.0
         self.setMinimumHeight(320)
 
     def set_profile(self, profile: RacingLineVisualProfile | None) -> None:
