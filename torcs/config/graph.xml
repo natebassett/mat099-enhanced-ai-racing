@@ -76,7 +76,7 @@
       <attnum name="arcade" val="0"/>
       <attnum name="driver board" val="1"/>
       <attnum name="camera" val="0"/>
-      <attnum name="camera head list" val="6"/>
+      <attnum name="camera head list" val="9"/>
       <attnum name="fovy-0-1" val="40"/>
       <attnum name="fovy-4-0" val="21"/>
       <attnum name="fovy-0-2" val="67.5"/>

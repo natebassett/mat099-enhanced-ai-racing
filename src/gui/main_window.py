@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QSlider,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -101,16 +102,44 @@ class MainWindow(QMainWindow):
         self.explanation_box = QTextEdit()
         self.run_history_table = QTableWidget(0, 8)
         self.run_history_source_label = QLabel()
+        self.tabs: QTabWidget | None = None
+        self.review_tab_index = 0
+        self.review_title_label = QLabel("No run selected")
+        self.review_status_label = QLabel("Idle")
+        self.review_summary_box = QTextEdit()
+        self.review_play_button = QPushButton("Play")
+        self.review_slider = QSlider(Qt.Horizontal)
+        self.review_time_label = QLabel("Select a run from Run History.")
+        self.review_metric_value_labels: dict[str, QLabel] = {}
+        self.review_track_position_widget = TrackPositionWidget()
+        self.review_road_sensor_widget = RoadSensorWidget()
+        self.review_moment_status_label = QLabel("Idle")
+        self.review_moment_state_label = QLabel("Select a run to review.")
+        self.review_moment_reason_label = QLabel("- No replay sample selected.")
         self.track_position_widget = TrackPositionWidget()
         self.road_sensor_widget = RoadSensorWidget()
         self.race_thread: QThread | None = None
         self.race_worker: RaceWorker | None = None
+        self.review_timer = QTimer(self)
+        self.review_snapshots: list[TelemetrySnapshot] = []
+        self.review_run: dict[str, Any] | None = None
+        self.review_current_index = 0
         self.telemetry_history = TelemetryHistory()
         self.metric_value_labels: dict[str, QLabel] = {}
         self.chart_window_seconds = 90.0
         self.speed_plot: pg.PlotWidget | None = None
         self.steer_plot: pg.PlotWidget | None = None
         self.pedal_plot: pg.PlotWidget | None = None
+        self.review_speed_plot: pg.PlotWidget | None = None
+        self.review_steer_plot: pg.PlotWidget | None = None
+        self.review_pedal_plot: pg.PlotWidget | None = None
+        self.review_speed_curve: Any = None
+        self.review_steer_curve: Any = None
+        self.review_throttle_curve: Any = None
+        self.review_brake_curve: Any = None
+        self.review_speed_marker: Any = None
+        self.review_steer_marker: Any = None
+        self.review_pedal_marker: Any = None
         self.speed_curve: Any = None
         self.steer_curve: Any = None
         self.throttle_curve: Any = None
@@ -150,12 +179,32 @@ class MainWindow(QMainWindow):
         self.explanation_box.document().setMaximumBlockCount(240)
         self.explanation_box.setText("Race log idle.")
 
-    def _build_ui(self) -> None:
-        tabs = QTabWidget()
-        tabs.addTab(self._build_dashboard_tab(), "Dashboard")
-        tabs.addTab(self._build_run_history_tab(), "Run History")
+        self.review_title_label.setFont(_section_font())
+        self.review_status_label.setAlignment(Qt.AlignCenter)
+        self.review_status_label.setMinimumHeight(28)
+        self.review_summary_box.setReadOnly(True)
+        self.review_summary_box.setMaximumHeight(112)
+        self.review_summary_box.setText("Select a saved run from Run History.")
+        self.review_slider.setEnabled(False)
+        self.review_play_button.setEnabled(False)
+        self.review_moment_state_label.setWordWrap(True)
+        self.review_moment_reason_label.setWordWrap(True)
+        self.review_moment_reason_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._set_review_status("Idle")
+        self._set_review_moment(
+            "Idle",
+            "Select a run to review.",
+            ["No replay sample selected."],
+        )
+        self.review_timer.setInterval(250)
 
-        self.setCentralWidget(tabs)
+    def _build_ui(self) -> None:
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_dashboard_tab(), "Dashboard")
+        self.tabs.addTab(self._build_run_history_tab(), "Run History")
+        self.review_tab_index = self.tabs.addTab(self._build_review_tab(), "Review")
+
+        self.setCentralWidget(self.tabs)
         self.statusBar().showMessage(self._discovery_summary())
 
     def _build_dashboard_tab(self) -> QWidget:
@@ -333,6 +382,134 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.run_history_table)
         return page
 
+    def _build_review_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QHBoxLayout(page)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self._build_review_replay_panel())
+        splitter.addWidget(self._build_review_moment_panel())
+        splitter.setSizes([820, 360])
+        layout.addWidget(splitter)
+
+        return page
+
+    def _build_review_replay_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        layout.addWidget(self.review_title_label)
+
+        summary_group = QGroupBox("Run Summary")
+        summary_layout = QVBoxLayout(summary_group)
+        summary_layout.addWidget(self.review_status_label)
+        summary_layout.addWidget(self.review_summary_box)
+        layout.addWidget(summary_group)
+
+        controls_group = QGroupBox("Replay Controls")
+        controls_layout = QHBoxLayout(controls_group)
+        controls_layout.addWidget(self.review_play_button)
+        controls_layout.addWidget(self.review_slider, 1)
+        controls_layout.addWidget(self.review_time_label)
+        layout.addWidget(controls_group)
+
+        metrics = [
+            MetricSpec("speed", "Speed", "--", "km/h"),
+            MetricSpec("gear", "Gear", "--"),
+            MetricSpec("throttle", "Throttle", "--", "%"),
+            MetricSpec("brake", "Brake", "--", "%"),
+            MetricSpec("steer", "Steer", "--"),
+            MetricSpec("track_pos", "Track Pos", "--"),
+            MetricSpec("lap_time", "Lap Time", "--", "s"),
+            MetricSpec("damage", "Damage", "--"),
+        ]
+        metric_grid = QGridLayout()
+        for index, metric in enumerate(metrics):
+            metric_grid.addWidget(
+                self._review_metric_card(metric),
+                index // 4,
+                index % 4,
+            )
+        layout.addLayout(metric_grid)
+
+        road_row = QHBoxLayout()
+        road_row.addWidget(
+            self._visual_group("Replay Road Position", self.review_track_position_widget)
+        )
+        road_row.addWidget(
+            self._visual_group("Replay Road Ahead", self.review_road_sensor_widget)
+        )
+        layout.addLayout(road_row)
+
+        chart_row = QHBoxLayout()
+        self.review_speed_plot = self._build_plot("Speed", "km/h")
+        self.review_speed_plot.setYRange(0.0, 220.0)
+        self.review_speed_curve = self.review_speed_plot.plot(
+            [],
+            [],
+            pen=pg.mkPen("#2f80ed", width=2),
+        )
+        self.review_speed_marker = _add_review_marker(self.review_speed_plot)
+        chart_row.addWidget(self.review_speed_plot)
+
+        self.review_steer_plot = self._build_plot("Steering", "steer")
+        self.review_steer_plot.setYRange(-1.0, 1.0)
+        self.review_steer_curve = self.review_steer_plot.plot(
+            [],
+            [],
+            pen=pg.mkPen("#8e5cf7", width=2),
+        )
+        self.review_steer_marker = _add_review_marker(self.review_steer_plot)
+        chart_row.addWidget(self.review_steer_plot)
+        layout.addLayout(chart_row)
+
+        self.review_pedal_plot = self._build_plot("Throttle / Brake", "%")
+        self.review_pedal_plot.setYRange(0.0, 100.0)
+        self.review_throttle_curve = self.review_pedal_plot.plot(
+            [],
+            [],
+            pen=pg.mkPen("#27ae60", width=2),
+        )
+        self.review_brake_curve = self.review_pedal_plot.plot(
+            [],
+            [],
+            pen=pg.mkPen("#c0392b", width=2),
+        )
+        self.review_pedal_marker = _add_review_marker(self.review_pedal_plot)
+        layout.addWidget(
+            self._chart_legend(
+                [
+                    ("Throttle", "#27ae60"),
+                    ("Brake", "#c0392b"),
+                ]
+            )
+        )
+        layout.addWidget(self.review_pedal_plot)
+
+        return panel
+
+    def _build_review_moment_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        title = QLabel("At This Moment")
+        title.setFont(_section_font())
+        layout.addWidget(title)
+
+        current_group = QGroupBox("Replay State")
+        current_layout = QVBoxLayout(current_group)
+        current_layout.addWidget(self.review_moment_status_label)
+        current_layout.addWidget(self.review_moment_state_label)
+        layout.addWidget(current_group)
+
+        reason_group = QGroupBox("Why")
+        reason_layout = QVBoxLayout(reason_group)
+        reason_layout.addWidget(self.review_moment_reason_label)
+        layout.addWidget(reason_group)
+
+        layout.addStretch(1)
+        return panel
+
     def _combo_group(self, label: str, combo: QComboBox) -> QGroupBox:
         group = QGroupBox(label)
         layout = QVBoxLayout(group)
@@ -382,6 +559,24 @@ class MainWindow(QMainWindow):
         layout.addWidget(value)
         return card
 
+    def _review_metric_card(self, metric: MetricSpec) -> QFrame:
+        card = QFrame()
+        card.setFrameShape(QFrame.StyledPanel)
+        card.setMinimumHeight(72)
+
+        layout = QVBoxLayout(card)
+        label = QLabel(metric.label)
+        label.setObjectName("metricLabel")
+
+        value = QLabel(metric.value if not metric.unit else f"{metric.value} {metric.unit}")
+        value.setObjectName("metricValue")
+        value.setAlignment(Qt.AlignBottom | Qt.AlignLeft)
+        self.review_metric_value_labels[metric.key] = value
+
+        layout.addWidget(label)
+        layout.addWidget(value)
+        return card
+
     def _build_plot(self, title: str, left_axis_label: str) -> pg.PlotWidget:
         plot = pg.PlotWidget()
         plot.setTitle(title)
@@ -401,6 +596,10 @@ class MainWindow(QMainWindow):
         self.agent_combo.currentIndexChanged.connect(self._handle_agent_changed)
         self.track_combo.currentIndexChanged.connect(self._update_selection_details)
         self.car_combo.currentIndexChanged.connect(self._update_selection_details)
+        self.run_history_table.cellClicked.connect(self._handle_run_history_clicked)
+        self.review_slider.valueChanged.connect(self._handle_review_slider_changed)
+        self.review_play_button.clicked.connect(self._handle_review_play_clicked)
+        self.review_timer.timeout.connect(self._advance_review_replay)
 
     def _handle_start_clicked(self) -> None:
         if self.race_thread is not None:
@@ -542,6 +741,201 @@ class MainWindow(QMainWindow):
                 )
 
         self.run_history_table.resizeColumnsToContents()
+
+    def _handle_run_history_clicked(self, row: int, _column: int) -> None:
+        run_id_item = self.run_history_table.item(row, 0)
+        if run_id_item is None:
+            return
+
+        try:
+            run_id = int(run_id_item.text())
+        except ValueError:
+            return
+
+        self._load_review_run(run_id)
+        if self.tabs is not None:
+            self.tabs.setCurrentIndex(self.review_tab_index)
+
+    def _load_review_run(self, run_id: int) -> None:
+        from storage import RaceRepository
+
+        repository = RaceRepository()
+        run = repository.get_run(run_id)
+        if run is None:
+            QMessageBox.warning(self, "Run Not Found", f"Run #{run_id} was not found.")
+            return
+
+        samples = repository.list_run_telemetry(run_id)
+        snapshots = [TelemetrySnapshot.from_sample(sample) for sample in samples]
+        best_run = repository.best_run_for_track(
+            run["track"],
+            agent_type=run.get("agent_type"),
+        )
+
+        self.review_run = run
+        self.review_snapshots = snapshots
+        self.review_current_index = 0
+        self.review_timer.stop()
+        self.review_play_button.setText("Play")
+        self._set_review_status(_completion_status(run.get("termination_reason")))
+        self.review_title_label.setText(
+            f"Run #{run_id} - {run.get('agent_name', 'Unknown Agent')} "
+            f"on {run.get('track', 'unknown track')}"
+        )
+
+        summary = summarize_run_explanation(snapshots, run, run_id=run_id)
+        comparison = _review_comparison_text(run, best_run)
+        self.review_summary_box.setText(f"{summary}\n\n{comparison}")
+
+        self._update_review_charts()
+        self._configure_review_slider()
+        if snapshots:
+            self._set_review_current_index(0)
+        else:
+            self._clear_review_snapshot()
+
+        self.statusBar().showMessage(f"Loaded run #{run_id} for review")
+
+    def _configure_review_slider(self) -> None:
+        self.review_slider.blockSignals(True)
+        self.review_slider.setMinimum(0)
+        self.review_slider.setMaximum(max(0, len(self.review_snapshots) - 1))
+        self.review_slider.setValue(0)
+        self.review_slider.setEnabled(bool(self.review_snapshots))
+        self.review_slider.blockSignals(False)
+        self.review_play_button.setEnabled(len(self.review_snapshots) > 1)
+
+    def _clear_review_snapshot(self) -> None:
+        self._reset_review_metrics()
+        self.review_track_position_widget.set_snapshot(None)
+        self.review_road_sensor_widget.set_snapshot(None)
+        self._set_review_moment(
+            "Idle",
+            "No saved telemetry samples for this run.",
+            ["New runs will include lightweight sampled telemetry."],
+        )
+        self.review_time_label.setText("No replay samples")
+
+    def _update_review_charts(self) -> None:
+        history = TelemetryHistory(max_points=max(1, len(self.review_snapshots)))
+        for snapshot in self.review_snapshots:
+            history.append(snapshot)
+        x_values = history.chart_times()
+
+        if self.review_speed_curve is not None:
+            self.review_speed_curve.setData(x_values, history.values("speed_kmh"))
+            self._apply_review_x_range(self.review_speed_plot, x_values)
+        if self.review_steer_curve is not None:
+            self.review_steer_curve.setData(x_values, history.values("steer"))
+            self._apply_review_x_range(self.review_steer_plot, x_values)
+        if self.review_throttle_curve is not None:
+            self.review_throttle_curve.setData(
+                x_values,
+                history.values("throttle_pct"),
+            )
+        if self.review_brake_curve is not None:
+            self.review_brake_curve.setData(x_values, history.values("brake_pct"))
+            self._apply_review_x_range(self.review_pedal_plot, x_values)
+
+    def _set_review_current_index(self, index: int) -> None:
+        if not self.review_snapshots:
+            self._clear_review_snapshot()
+            return
+
+        self.review_current_index = max(0, min(index, len(self.review_snapshots) - 1))
+        snapshot = self.review_snapshots[self.review_current_index]
+        self._update_review_metric_values(snapshot)
+        self.review_track_position_widget.set_snapshot(snapshot)
+        self.review_road_sensor_widget.set_snapshot(snapshot)
+
+        frame = build_explanation_frame(snapshot)
+        self._set_review_moment(frame.severity, frame.headline, frame.reasons)
+        replay_time = _snapshot_replay_time(snapshot, self.review_current_index)
+        finish_time = _review_finish_time(self.review_snapshots)
+        self.review_time_label.setText(
+            f"{replay_time:.1f}s / {finish_time:.1f}s"
+        )
+        self._set_review_marker_position(replay_time)
+
+        if self.review_slider.value() != self.review_current_index:
+            self.review_slider.blockSignals(True)
+            self.review_slider.setValue(self.review_current_index)
+            self.review_slider.blockSignals(False)
+
+    def _handle_review_slider_changed(self, value: int) -> None:
+        self._set_review_current_index(value)
+
+    def _handle_review_play_clicked(self) -> None:
+        if not self.review_snapshots:
+            return
+        if self.review_timer.isActive():
+            self.review_timer.stop()
+            self.review_play_button.setText("Play")
+            return
+
+        self.review_play_button.setText("Pause")
+        self.review_timer.start()
+
+    def _advance_review_replay(self) -> None:
+        if not self.review_snapshots:
+            self.review_timer.stop()
+            self.review_play_button.setText("Play")
+            return
+
+        next_index = self.review_current_index + self._review_playback_step_size()
+        if next_index >= len(self.review_snapshots):
+            self._set_review_current_index(len(self.review_snapshots) - 1)
+            self.review_timer.stop()
+            self.review_play_button.setText("Play")
+            return
+
+        self._set_review_current_index(next_index)
+
+    def _review_playback_step_size(self) -> int:
+        return max(1, len(self.review_snapshots) // 240)
+
+    def _update_review_metric_values(self, snapshot: TelemetrySnapshot) -> None:
+        self._set_review_metric("speed", format_value(snapshot.speed_kmh, ".1f"))
+        self._set_review_metric(
+            "gear",
+            "--" if snapshot.gear is None else str(snapshot.gear),
+        )
+        self._set_review_metric("throttle", format_value(snapshot.throttle_pct, ".0f"))
+        self._set_review_metric("brake", format_value(snapshot.brake_pct, ".0f"))
+        self._set_review_metric("steer", format_value(snapshot.steer, ".3f"))
+        self._set_review_metric("track_pos", format_value(snapshot.track_pos, ".3f"))
+        self._set_review_metric("lap_time", format_value(snapshot.cur_lap_time, ".2f"))
+        self._set_review_metric("damage", format_value(snapshot.damage, ".0f"))
+
+    def _set_review_metric(self, key: str, value: str) -> None:
+        label = self.review_metric_value_labels.get(key)
+        if label is None:
+            return
+        unit = _metric_unit(key)
+        label.setText(value if not unit else f"{value} {unit}")
+
+    def _reset_review_metrics(self) -> None:
+        for key, label in self.review_metric_value_labels.items():
+            unit = _metric_unit(key)
+            label.setText("--" if not unit else f"-- {unit}")
+
+    def _set_review_marker_position(self, replay_time: float) -> None:
+        for marker in (
+            self.review_speed_marker,
+            self.review_steer_marker,
+            self.review_pedal_marker,
+        ):
+            if marker is not None:
+                marker.setValue(replay_time)
+
+    def _apply_review_x_range(
+        self,
+        plot: pg.PlotWidget | None,
+        x_values: list[float],
+    ) -> None:
+        if plot is None or not x_values:
+            return
+        plot.setXRange(0.0, max(1.0, x_values[-1]), padding=0.02)
 
     def _update_selection_details(self) -> None:
         agent = self.selected_agent()
@@ -802,6 +1196,21 @@ class MainWindow(QMainWindow):
         self.explanation_state_label.setText(headline)
         self.explanation_reason_label.setText(_format_reason_lines(reasons))
 
+    def _set_review_status(self, severity: str) -> None:
+        self.review_status_label.setText(severity)
+        self.review_status_label.setStyleSheet(_severity_style(severity))
+
+    def _set_review_moment(
+        self,
+        severity: str,
+        headline: str,
+        reasons: tuple[str, ...] | list[str],
+    ) -> None:
+        self.review_moment_status_label.setText(severity)
+        self.review_moment_status_label.setStyleSheet(_severity_style(severity))
+        self.review_moment_state_label.setText(headline)
+        self.review_moment_reason_label.setText(_format_reason_lines(reasons))
+
     def _append_explanation(self, message: str) -> None:
         if self.explanation_box.toPlainText().strip():
             self.explanation_box.append("")
@@ -847,6 +1256,67 @@ class MainWindow(QMainWindow):
             f"{len(self.project_options.cars)} cars, "
             f"{len(self.project_options.runs)} saved runs."
         )
+
+
+def _add_review_marker(plot: pg.PlotWidget) -> Any:
+    marker = pg.InfiniteLine(
+        pos=0.0,
+        angle=90,
+        movable=False,
+        pen=pg.mkPen("#202020", width=1),
+    )
+    plot.addItem(marker)
+    return marker
+
+
+def _review_comparison_text(
+    run: dict[str, Any],
+    best_run: dict[str, Any] | None,
+) -> str:
+    selected_lap = run.get("best_lap_time_seconds")
+    if not isinstance(selected_lap, (int, float)):
+        return "Comparison: this run has no completed lap time yet."
+    if best_run is None:
+        return "Comparison: no completed baseline run found for this track."
+
+    best_lap = best_run.get("best_lap_time_seconds")
+    if not isinstance(best_lap, (int, float)):
+        return "Comparison: no completed baseline run found for this track."
+
+    delta = selected_lap - best_lap
+    if run.get("id") == best_run.get("id"):
+        return (
+            f"Comparison: this is the best saved comparable lap for "
+            f"{run.get('track', 'this track')} at {selected_lap:.3f}s."
+        )
+
+    return (
+        f"Comparison: best comparable is run #{best_run.get('id')} at "
+        f"{best_lap:.3f}s. This run is {_format_delta(delta)}."
+    )
+
+
+def _format_delta(delta: float) -> str:
+    if abs(delta) < 0.001:
+        return "equal to the baseline"
+    if delta > 0:
+        return f"+{delta:.3f}s slower"
+    return f"{abs(delta):.3f}s faster"
+
+
+def _snapshot_replay_time(snapshot: TelemetrySnapshot, fallback_index: int) -> float:
+    if snapshot.cur_lap_time is not None and snapshot.cur_lap_time >= 0.0:
+        return snapshot.cur_lap_time
+    return float(fallback_index)
+
+
+def _review_finish_time(snapshots: list[TelemetrySnapshot]) -> float:
+    if not snapshots:
+        return 0.0
+    return max(
+        _snapshot_replay_time(snapshot, index)
+        for index, snapshot in enumerate(snapshots)
+    )
 
 
 def _section_font() -> QFont:

@@ -205,10 +205,11 @@ class RaceRepository:
                     off_track,
                     front_sensor,
                     min_track_sensor,
+                    track_sensors_json,
                     cur_lap_time,
                     last_lap_time
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     (
@@ -229,12 +230,104 @@ class RaceRepository:
                         1 if sample.get("off_track") else 0,
                         sample.get("front_sensor"),
                         sample.get("min_track_sensor"),
+                        _track_sensors_json(sample),
                         sample.get("cur_lap_time"),
                         sample.get("last_lap_time"),
                     )
                     for sample in samples
                 ),
             )
+
+    def get_run(self, run_id: int) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    race_runs.*,
+                    agents.name AS agent_name,
+                    agents.agent_type,
+                    agents.version AS agent_version
+                FROM race_runs
+                JOIN agents ON agents.id = race_runs.agent_id
+                WHERE race_runs.id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+
+        return None if row is None else dict(row)
+
+    def list_run_telemetry(self, run_id: int) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    step,
+                    dist_from_start,
+                    dist_raced,
+                    speed_x,
+                    speed_y,
+                    angle,
+                    track_pos,
+                    damage,
+                    steer,
+                    accel,
+                    brake,
+                    gear,
+                    reward,
+                    off_track,
+                    front_sensor,
+                    min_track_sensor,
+                    track_sensors_json,
+                    cur_lap_time,
+                    last_lap_time
+                FROM run_telemetry
+                WHERE run_id = ?
+                ORDER BY step ASC
+                """,
+                (run_id,),
+            ).fetchall()
+
+        telemetry = []
+        for row in rows:
+            sample = dict(row)
+            sample["track_sensors"] = _decode_track_sensors(
+                sample.pop("track_sensors_json")
+            )
+            telemetry.append(sample)
+        return telemetry
+
+    def best_run_for_track(
+        self,
+        track: str,
+        *,
+        agent_type: Optional[str] = None,
+    ) -> dict[str, Any] | None:
+        where_clause = [
+            "race_runs.track = ?",
+            "race_runs.best_lap_time_seconds IS NOT NULL",
+        ]
+        parameters: list[Any] = [track]
+        if agent_type:
+            where_clause.append("agents.agent_type = ?")
+            parameters.append(agent_type)
+
+        query = f"""
+            SELECT
+                race_runs.*,
+                agents.name AS agent_name,
+                agents.agent_type,
+                agents.version AS agent_version
+            FROM race_runs
+            JOIN agents ON agents.id = race_runs.agent_id
+            WHERE {" AND ".join(where_clause)}
+            ORDER BY race_runs.best_lap_time_seconds ASC
+            LIMIT 1
+        """
+
+        with self._connect() as connection:
+            row = connection.execute(query, parameters).fetchone()
+
+        return None if row is None else dict(row)
 
     def list_runs(
         self,
@@ -274,3 +367,32 @@ class RaceRepository:
 
         with self._connect() as connection:
             return [dict(row) for row in connection.execute(query, parameters)]
+
+
+def _track_sensors_json(sample: Mapping[str, Any]) -> str | None:
+    values = sample.get("track_sensors")
+    if not values:
+        return None
+    try:
+        return json.dumps([float(value) for value in values], separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _decode_track_sensors(value: Any) -> list[float]:
+    if not value:
+        return []
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(decoded, list):
+        return []
+
+    sensors = []
+    for item in decoded:
+        try:
+            sensors.append(float(item))
+        except (TypeError, ValueError):
+            continue
+    return sensors
