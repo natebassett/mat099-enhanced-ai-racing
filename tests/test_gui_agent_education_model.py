@@ -80,6 +80,23 @@ class GuiAgentEducationModelTests(unittest.TestCase):
         self.assertTrue(any(r"\mathcal{U}" in note.formula for note in profile.formula_notes))
         self.assertEqual(len(profile.code_snippets), 1)
 
+    def test_dyna_q_profile_explains_model_replay_and_finalised_mode(self):
+        profile = build_agent_education_profile(
+            _agent("Dyna-Q Learning Agent", "dyna_q_learning", requires_line=False),
+            _tracks(),
+        )
+
+        self.assertIn("reinforcement learner", profile.badge)
+        self.assertTrue(
+            any("planning updates" in note.casefold() for note in profile.math_notes)
+        )
+        self.assertTrue(any("Dyna-Q Model Replay" == note.title for note in profile.formula_notes))
+        self.assertTrue(any(r"\max" in note.formula for note in profile.formula_notes))
+        self.assertTrue(
+            any("learn_from_transition" in snippet.source for snippet in profile.code_snippets)
+        )
+        self.assertIn("Compatible tracks", profile.track_context[0])
+
 
 def _agent(name: str, agent_type: str, *, requires_line: bool) -> AgentOption:
     return AgentOption(

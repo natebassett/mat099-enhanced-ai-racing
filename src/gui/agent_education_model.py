@@ -537,6 +537,197 @@ def _template_for(agent_type: str) -> dict[str, Any]:
             ),
         }
 
+    if agent_type in {"dyna_q_learning", "dyna_q_finalised", "dyna_q"}:
+        is_finalised = agent_type == "dyna_q_finalised"
+        return {
+            "badge": (
+                "Finalised model-based reinforcement learner"
+                if is_finalised
+                else "Live model-based reinforcement learner"
+            ),
+            "headline": (
+                "This driver learns a racing policy from reward. Dyna-Q updates "
+                "from real driving experience, then replays learned transitions "
+                "internally so useful behaviour spreads faster through the Q-table."
+            ),
+            "overview": (
+                "It does not load a precomputed racing line or copy another driver.",
+                (
+                    "The agent converts TORCS telemetry into compact state bins: "
+                    "lap section, speed, road position, heading, side speed, front "
+                    "sensor danger, and the best visible road direction."
+                ),
+                (
+                    "It chooses from a small set of steering, throttle, coast, and "
+                    "brake actions. The action space is deliberately discrete so a "
+                    "classical reinforcement-learning method can learn from scratch."
+                ),
+                (
+                    "Learning mode explores and updates the Q-table while driving. "
+                    "Finalised mode loads a saved policy, switches exploration off, "
+                    "and always chooses the best-known action."
+                ),
+            ),
+            "decision_steps": (
+                "Read speed, angle, side speed, track position, lap distance, and road sensors.",
+                "Encode those signals into a compact discrete state.",
+                "Choose an action using epsilon-greedy exploration in learning mode.",
+                "Turn the selected action into smoothed steering, throttle, brake, and gear controls.",
+                "On the next telemetry frame, calculate reward from progress, speed, stability, and safety.",
+                "Update the Q-table from the real transition.",
+                "Replay stored transitions internally for extra Dyna-Q planning updates.",
+            ),
+            "algorithm_summary": (
+                "Dyna-Q combines direct reinforcement learning with lightweight planning.",
+                (
+                    "A normal Q-learning update learns from the transition that just "
+                    "happened: state, action, reward, and next state."
+                ),
+                (
+                    "Dyna-Q also stores that transition in a simple learned model. "
+                    "After the real update, it samples old model entries and performs "
+                    "additional imagined updates."
+                ),
+                (
+                    "Those planning updates are why Dyna-Q is a good fit for a time "
+                    "constrained TORCS project: every real driving step can produce "
+                    "several learning updates."
+                ),
+                (
+                    "The finalised agent uses the same Q-values but disables learning "
+                    "and exploration, making behaviour repeatable for demonstration runs."
+                ),
+            ),
+            "pseudocode": (
+                "Start with an empty Q-table and an empty transition model.",
+                "Read the current TORCS telemetry and convert it into a state.",
+                "Select an action: explore sometimes, otherwise choose the highest Q-value.",
+                "Send the selected steering/throttle/brake command to TORCS.",
+                "Read the next telemetry frame.",
+                "Reward progress and stable speed; penalise damage, off-track, sliding, and poor heading.",
+                "Apply the Q-learning update to Q(state, action).",
+                "Store the transition in the model.",
+                "Sample stored transitions and replay several planning updates.",
+                "Save the learned policy so finalised mode can run greedily later.",
+            ),
+            "formula_notes": (
+                FormulaNote(
+                    title="Q-Learning Update",
+                    formula=(
+                        r"$Q(s,a) \leftarrow Q(s,a) + \alpha"
+                        r"[r + \gamma \max_{a'} Q(s',a') - Q(s,a)]$"
+                    ),
+                    explanation=(
+                        "The action value moves toward the reward plus the discounted "
+                        "value of the best next action. This is the real driving update."
+                    ),
+                ),
+                FormulaNote(
+                    title="Dyna-Q Model Replay",
+                    formula=r"$model(s,a) = (r, s')$",
+                    explanation=(
+                        "After a real transition is observed, the agent stores what "
+                        "happened. Planning steps sample those stored transitions and "
+                        "apply the same Q update without needing another TORCS frame."
+                    ),
+                ),
+                FormulaNote(
+                    title="Epsilon-Greedy Choice",
+                    formula=(
+                        r"$a = random\ action \quad \mathrm{with\ probability}\ \epsilon$"
+                        "\n"
+                        r"$a = \arg\max_a Q(s,a) \quad \mathrm{otherwise}$"
+                    ),
+                    explanation=(
+                        "Learning mode keeps some exploration so the agent can discover "
+                        "better behaviour. Finalised mode sets epsilon to zero."
+                    ),
+                ),
+                FormulaNote(
+                    title="Progress Reward",
+                    formula=r"$reward \propto \Delta distance + speed \cdot \cos(|angle|)$",
+                    explanation=(
+                        "Progress is valuable, but only when the car is reasonably "
+                        "aligned with the road. Sliding, damage, and off-track states "
+                        "reduce the reward."
+                    ),
+                ),
+            ),
+            "code_snippets": (
+                CodeSnippet(
+                    title="Real update plus planning replay",
+                    source="src/agents/dyna_q_agent.py - DynaQBaseAgent.learn_from_transition",
+                    explanation=(
+                        "One real transition updates the Q-table, then the saved model "
+                        "is sampled for extra replay updates."
+                    ),
+                    code=(
+                        "def learn_from_transition(self, state, action, reward, next_state, terminal=False):\n"
+                        "    self._q_update(state, action, reward, next_state, terminal)\n"
+                        "    self.model[self._transition_key(state, action)] = DynaQTransition(\n"
+                        "        next_state=next_state,\n"
+                        "        reward=reward,\n"
+                        "        terminal=terminal,\n"
+                        "    )\n"
+                        "    for _ in range(self.planning_steps):\n"
+                        "        key = self._random.choice(model_keys)\n"
+                        "        planned_state, planned_action = self._parse_transition_key(key)\n"
+                        "        transition = self.model[key]\n"
+                        "        self._q_update(planned_state, planned_action, transition.reward, transition.next_state, transition.terminal)"
+                    ),
+                ),
+                CodeSnippet(
+                    title="Learning vs finalised mode",
+                    source="src/agents/dyna_q_agent.py - DynaQLearningAgent / DynaQFinalisedAgent",
+                    explanation=(
+                        "The learning agent saves Q-values and keeps exploration on. "
+                        "The finalised agent loads a saved policy and turns learning off."
+                    ),
+                    code=(
+                        "class DynaQLearningAgent(DynaQBaseAgent):\n"
+                        "    learning_enabled = True\n"
+                        "    save_policy = True\n\n"
+                        "class DynaQFinalisedAgent(DynaQBaseAgent):\n"
+                        "    learning_enabled = False\n"
+                        "    epsilon = 0.0\n"
+                        "    planning_steps = 0"
+                    ),
+                ),
+            ),
+            "math_notes": (
+                "Dyna-Q is still classical reinforcement learning; it does not use a neural network.",
+                "The Q-table is sparse: only state-action pairs the agent has seen need stored values.",
+                "The learned model stores observed transitions, not a hand-written racing line.",
+                "Planning updates make training more sample-efficient because one TORCS step can produce many Q-value updates.",
+                "Finalised mode is the same policy with exploration and learning disabled.",
+            ),
+            "key_takeaways": (
+                "The agent learns from reward rather than from a precomputed racing line.",
+                "Discrete actions keep the problem small enough for a classical RL method.",
+                "Planning replay is the reason Dyna-Q should improve faster than a plain one-step learner.",
+                "A strong finalised policy still needs training time before it can race cleanly.",
+            ),
+            "input_signals": (
+                "Distance around the lap.",
+                "Speed, sideways speed, and car angle.",
+                "Track position: centre, left edge, or right edge.",
+                "Road sensors showing open space ahead.",
+                "Damage and off-track signals for penalty rewards.",
+            ),
+            "strengths": (
+                "Learns from scratch without a racing-line file.",
+                "More sample-efficient than a plain Q-learning-only loop.",
+                "Easy to explain because Q-values, rewards, and replay updates are visible.",
+                "Finalised mode can run a saved policy with repeatable behaviour.",
+            ),
+            "failure_signs": (
+                "The policy file is missing when finalised mode is selected.",
+                "Too much exploration can cause unstable early runs.",
+                "Sparse rewards or too many state bins can slow learning.",
+                "It may need multiple training runs before it approaches engineered agents.",
+            ),
+        }
+
     if agent_type == "random":
         return {
             "badge": "Baseline random driver",
