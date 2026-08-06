@@ -326,6 +326,7 @@ class TorcsRunner:
         telemetry_callback=None,
         telemetry_interval_steps=1,
         telemetry_interval_seconds=None,
+        shutdown_on_finish=True,
     ):
         assert self.env is not None, "Call connect() before run()"
         started_at = datetime.now(timezone.utc).isoformat()
@@ -539,7 +540,8 @@ class TorcsRunner:
             if close_agent is not None:
                 close_agent()
             self.env.end()
-            self.shutdown()
+            if shutdown_on_finish:
+                self.shutdown()
 
         return results
 

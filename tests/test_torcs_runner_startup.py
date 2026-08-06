@@ -105,6 +105,94 @@ class TorcsRunnerStartupTests(unittest.TestCase):
 
         self.assertEqual(sensors, [float(value) for value in range(19)])
 
+    def test_shutdown_on_finish_flag_can_keep_torcs_process_alive(self):
+        runner = TorcsRunner()
+        runner.env = FakeFinishedEnv()
+        runner.torcs_process = FakeProcess()
+
+        runner.run(FakeFinishedAgent(), shutdown_on_finish=False)
+
+        self.assertIsNotNone(runner.torcs_process)
+        self.assertFalse(runner.torcs_process.terminated)
+
+    def test_run_shuts_down_by_default(self):
+        runner = TorcsRunner()
+        runner.env = FakeFinishedEnv()
+        process = FakeProcess()
+        runner.torcs_process = process
+
+        runner.run(FakeFinishedAgent())
+
+        self.assertIsNone(runner.torcs_process)
+        self.assertTrue(process.terminated)
+
+
+class FakeProcess:
+    def __init__(self):
+        self.terminated = False
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        return 0
+
+
+class FakeClient:
+    def __init__(self):
+        self.S = types.SimpleNamespace(
+            d={
+                "lastLapTime": 0.0,
+                "curLapTime": 0.0,
+                "speedX": 0.0,
+                "angle": 0.0,
+                "damage": 0.0,
+                "track": [200.0] * 19,
+            }
+        )
+        self.R = types.SimpleNamespace(d={})
+
+    def respond_to_server(self):
+        pass
+
+
+class FakeFinishedEnv:
+    default_speed = 50.0
+
+    def __init__(self):
+        self.client = FakeClient()
+
+    def reset(self, relaunch=False):
+        return types.SimpleNamespace(speedX=0.0, track=[200.0] * 19)
+
+    def end(self):
+        pass
+
+
+class FakeFinishedAgent:
+    uses_full_control = True
+    max_steps = 1
+    target_laps = 1
+
+    def reset(self):
+        pass
+
+    def act(self, _observation, _telemetry):
+        return {
+            "steer": 0.0,
+            "accel": 0.0,
+            "brake": 1.0,
+            "gear": 1,
+            "terminate": True,
+            "termination_reason": "test_complete",
+        }
+
+    def close(self):
+        pass
+
 
 if __name__ == "__main__":
     unittest.main()

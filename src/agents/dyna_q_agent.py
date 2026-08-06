@@ -13,10 +13,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 POLICY_DIR = PROJECT_ROOT / "data" / "policies"
 DEFAULT_LATEST_POLICY_PATH = POLICY_DIR / "dyna_q_g_track_3_latest.json"
 DEFAULT_FINAL_POLICY_PATH = POLICY_DIR / "dyna_q_g_track_3_final.json"
+DEFAULT_BEST_POLICY_PATH = POLICY_DIR / "dyna_q_g_track_3_best.json"
 G_TRACK_3_LENGTH_METRES = 2843.0934
 
 GEAR_SPEEDS = [0, 45, 85, 125, 165, 205]
 POLICY_FORMAT_VERSION = 1
+TRAINING_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -35,20 +37,41 @@ class DynaQTransition:
 
 
 ACTION_SPACE: tuple[DynaQAction, ...] = (
-    DynaQAction("hard left / cautious throttle", -0.62, 0.22, 0.00),
-    DynaQAction("left / balanced throttle", -0.38, 0.44, 0.00),
-    DynaQAction("slight left / attack", -0.18, 0.76, 0.00),
-    DynaQAction("straight / full attack", 0.00, 1.00, 0.00),
-    DynaQAction("slight right / attack", 0.18, 0.76, 0.00),
-    DynaQAction("right / balanced throttle", 0.38, 0.44, 0.00),
-    DynaQAction("hard right / cautious throttle", 0.62, 0.22, 0.00),
-    DynaQAction("left / coast", -0.24, 0.00, 0.00),
+    DynaQAction("straight / launch attack", 0.00, 1.00, 0.00),
+    DynaQAction("slight left / full attack", -0.10, 0.92, 0.00),
+    DynaQAction("slight right / full attack", 0.10, 0.92, 0.00),
+    DynaQAction("left arc / attack", -0.22, 0.74, 0.00),
+    DynaQAction("right arc / attack", 0.22, 0.74, 0.00),
+    DynaQAction("left arc / balanced", -0.34, 0.54, 0.00),
+    DynaQAction("right arc / balanced", 0.34, 0.54, 0.00),
+    DynaQAction("hard left / rotate", -0.58, 0.18, 0.00),
+    DynaQAction("hard right / rotate", 0.58, 0.18, 0.00),
+    DynaQAction("straight / maintain", 0.00, 0.48, 0.00),
+    DynaQAction("slight left / coast", -0.18, 0.00, 0.00),
     DynaQAction("straight / coast", 0.00, 0.00, 0.00),
-    DynaQAction("right / coast", 0.24, 0.00, 0.00),
-    DynaQAction("left / brake", -0.24, 0.00, 0.44),
-    DynaQAction("straight / brake", 0.00, 0.00, 0.56),
-    DynaQAction("right / brake", 0.24, 0.00, 0.44),
+    DynaQAction("slight right / coast", 0.18, 0.00, 0.00),
+    DynaQAction("left / trail brake", -0.22, 0.00, 0.32),
+    DynaQAction("straight / firm brake", 0.00, 0.00, 0.55),
+    DynaQAction("right / trail brake", 0.22, 0.00, 0.32),
+    DynaQAction("straight / emergency brake", 0.00, 0.00, 0.85),
+    DynaQAction("left recovery / drive", -0.46, 0.34, 0.00),
+    DynaQAction("right recovery / drive", 0.46, 0.34, 0.00),
+    DynaQAction("left recovery / coast", -0.48, 0.00, 0.00),
+    DynaQAction("right recovery / coast", 0.48, 0.00, 0.00),
+    DynaQAction("left recovery / brake", -0.40, 0.00, 0.24),
+    DynaQAction("right recovery / brake", 0.40, 0.00, 0.24),
+    DynaQAction("slight left / maintain", -0.12, 0.52, 0.00),
+    DynaQAction("slight right / maintain", 0.12, 0.52, 0.00),
+    DynaQAction("straight / gentle brake", 0.00, 0.00, 0.24),
 )
+
+LAUNCH_ACTIONS = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 18, 23, 24)
+FRONT_DANGER_ACTIONS = (10, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 25)
+HIGH_SPEED_ACTIONS = (0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15, 23, 24, 25)
+RECOVERY_ACTIONS = (5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 25)
+RIGHT_EDGE_RECOVERY_ACTIONS = (5, 7, 10, 13, 14, 16, 17, 19, 21, 25)
+LEFT_EDGE_RECOVERY_ACTIONS = (6, 8, 12, 14, 15, 16, 18, 20, 22, 25)
+ALL_ACTIONS = tuple(range(len(ACTION_SPACE)))
 
 
 def clamp(value: float, lower: float, upper: float) -> float:
@@ -74,7 +97,10 @@ class DynaQBaseAgent:
 
     alpha = 0.18
     gamma = 0.96
-    epsilon = 0.14
+    epsilon_start = 0.24
+    epsilon_min = 0.035
+    epsilon_decay_steps = 80000
+    epsilon = epsilon_start
     planning_steps = 16
     track_length_m = G_TRACK_3_LENGTH_METRES
     section_count = 48
@@ -91,7 +117,7 @@ class DynaQBaseAgent:
     ) -> None:
         self.seed = seed if seed is not None else secrets.randbits(32)
         self.policy_path = Path(policy_path or DEFAULT_LATEST_POLICY_PATH)
-        self.load_existing = load_existing
+        self.load_existing = False
         self.save_policy = save_policy
         self.learning_enabled = learning_enabled
         self.finalised = finalised
@@ -105,6 +131,7 @@ class DynaQBaseAgent:
         self.last_reward = 0.0
         self.last_td_error = 0.0
         self.last_action_label = ""
+        self.exploration_override: float | None = None
         self.previous_state: tuple[int, ...] | None = None
         self.previous_action_index: int | None = None
         self.previous_telemetry: dict[str, Any] | None = None
@@ -113,9 +140,13 @@ class DynaQBaseAgent:
         self.previous_brake = 0.0
         self.previous_gear = 1
         self.stuck_counter = 0
+        self.progress_stall_counter = 0
 
         if load_existing:
-            self._load_policy(self.policy_path)
+            self.load_existing = self._load_policy(
+                self.policy_path,
+                strict=finalised,
+            )
 
     @property
     def config(self) -> dict[str, Any]:
@@ -131,11 +162,16 @@ class DynaQBaseAgent:
                 "side speed band",
                 "front sensor danger",
                 "best sensor direction",
+                "forward corridor opening",
+                "sensor opening balance",
             ],
             "actions": [action.label for action in ACTION_SPACE],
             "alpha": 0.0 if not self.learning_enabled else self.alpha,
             "gamma": self.gamma,
-            "epsilon": 0.0 if self.finalised else self.epsilon,
+            "epsilon": self.exploration_rate(),
+            "epsilon_start": self.epsilon_start,
+            "epsilon_min": self.epsilon_min,
+            "epsilon_decay_steps": self.epsilon_decay_steps,
             "planning_steps": 0 if not self.learning_enabled else self.planning_steps,
             "policy_path": str(self.policy_path.relative_to(PROJECT_ROOT)),
             "loads_existing_policy": self.load_existing,
@@ -153,6 +189,7 @@ class DynaQBaseAgent:
         self.previous_brake = 0.0
         self.previous_gear = 1
         self.stuck_counter = 0
+        self.progress_stall_counter = 0
         self.episode_count += 1
 
     def act(
@@ -165,18 +202,25 @@ class DynaQBaseAgent:
 
         current_telemetry = dict(telemetry)
         current_state = self.encode_state(current_telemetry)
-
+        self._update_progress_stall(current_telemetry)
+        shutdown, reason = self.should_shutdown(current_telemetry)
         if (
             self.learning_enabled
             and self.previous_state is not None
             and self.previous_action_index is not None
             and self.previous_telemetry is not None
         ):
-            reward = self.calculate_reward(self.previous_telemetry, current_telemetry)
-            terminal = self.is_terminal_transition(
+            reward = self.calculate_reward(
+                self.previous_telemetry,
+                current_telemetry,
+                self.previous_action_index,
+            )
+            terminal = shutdown or self.is_terminal_transition(
                 self.previous_telemetry,
                 current_telemetry,
             )
+            if shutdown:
+                reward += self.terminal_reward(reason)
             self.learn_from_transition(
                 self.previous_state,
                 self.previous_action_index,
@@ -186,7 +230,6 @@ class DynaQBaseAgent:
             )
             self.last_reward = reward
 
-        shutdown, reason = self.should_shutdown(current_telemetry)
         if shutdown:
             return {
                 "steer": self.previous_steer,
@@ -197,7 +240,7 @@ class DynaQBaseAgent:
                 "termination_reason": reason,
             }
 
-        action_index = self.choose_action(current_state)
+        action_index = self.choose_action(current_state, current_telemetry)
         action = self.action_to_controls(action_index, current_telemetry)
 
         self.previous_state = current_state
@@ -234,6 +277,11 @@ class DynaQBaseAgent:
             (10.0, 20.0, 34.0, 54.0, 82.0, 120.0, 165.0),
         )
         best_direction = self._best_sensor_direction(track)
+        corridor_opening = _bucket(
+            max(track[7:12]) if len(track) >= 12 else 200.0,
+            (18.0, 32.0, 52.0, 78.0, 112.0, 155.0),
+        )
+        sensor_balance = self._sensor_opening_balance(track)
         return (
             section,
             speed,
@@ -242,27 +290,88 @@ class DynaQBaseAgent:
             side_speed,
             front,
             best_direction,
+            corridor_opening,
+            sensor_balance,
         )
 
-    def choose_action(self, state: tuple[int, ...]) -> int:
+    def choose_action(
+        self,
+        state: tuple[int, ...],
+        telemetry: Mapping[str, Any] | None = None,
+    ) -> int:
+        available_actions = self.available_actions(telemetry)
         if (
             self.learning_enabled
             and not self.finalised
-            and self._random.random() < self.epsilon
+            and self._random.random() < self.exploration_rate()
         ):
-            return self._random.randrange(len(ACTION_SPACE))
+            return self._random.choice(available_actions)
 
         values = [
             self.q_value(state, action_index)
-            for action_index in range(len(ACTION_SPACE))
+            for action_index in available_actions
         ]
         best_value = max(values)
         best_actions = [
             action_index
-            for action_index, value in enumerate(values)
+            for action_index, value in zip(available_actions, values)
             if math.isclose(value, best_value, abs_tol=1e-12)
         ]
         return self._random.choice(best_actions)
+
+    def available_actions(self, telemetry: Mapping[str, Any] | None) -> tuple[int, ...]:
+        if telemetry is None:
+            return ALL_ACTIONS
+
+        speed = float_value(telemetry.get("speedX"))
+        signed_track_pos = float_value(telemetry.get("trackPos"))
+        track_pos = abs(signed_track_pos)
+        angle = abs(float_value(telemetry.get("angle")))
+        signed_side_speed = float_value(telemetry.get("speedY"))
+        side_speed = abs(signed_side_speed)
+        track = track_sensors(telemetry)
+        front = track[9] if len(track) > 9 else 200.0
+        front_danger = front < 24.0 and speed > 48.0
+        high_speed = speed > 145.0
+        edge_danger = track_pos > 0.62
+        outward_drift = signed_track_pos * signed_side_speed > 1.2
+        unstable = (
+            track_pos > 0.82
+            or angle > 0.48
+            or side_speed > 10.0
+            or front < 12.0
+            or (track_pos > 0.48 and outward_drift)
+        )
+
+        if edge_danger:
+            return (
+                RIGHT_EDGE_RECOVERY_ACTIONS
+                if signed_track_pos > 0.0
+                else LEFT_EDGE_RECOVERY_ACTIONS
+            )
+        if speed < 34.0 and not unstable:
+            return LAUNCH_ACTIONS
+        if front_danger:
+            return FRONT_DANGER_ACTIONS
+        if unstable:
+            return RECOVERY_ACTIONS
+        if high_speed:
+            return HIGH_SPEED_ACTIONS
+        return ALL_ACTIONS
+
+    def exploration_rate(self) -> float:
+        if self.finalised or not self.learning_enabled:
+            return 0.0
+        if self.exploration_override is not None:
+            return clamp(float(self.exploration_override), 0.0, 1.0)
+        progress = clamp(
+            self.steps_trained / max(1.0, float(self.epsilon_decay_steps)),
+            0.0,
+            1.0,
+        )
+        return self.epsilon_min + (self.epsilon_start - self.epsilon_min) * (
+            1.0 - progress
+        )
 
     def action_to_controls(
         self,
@@ -273,6 +382,11 @@ class DynaQBaseAgent:
         speed = float_value(telemetry.get("speedX"))
         track_pos = float_value(telemetry.get("trackPos"))
         angle = float_value(telemetry.get("angle"))
+        recovery_drive = (
+            request.accel > 0.20
+            and request.brake < 0.05
+            and abs(request.steer) >= 0.40
+        )
 
         steer_limit = 0.78
         max_delta = 0.085
@@ -287,9 +401,14 @@ class DynaQBaseAgent:
             max_delta = 0.066
 
         target_steer = clamp(request.steer, -steer_limit, steer_limit)
+        if abs(track_pos) > 0.68:
+            target_steer = clamp(target_steer - track_pos * 0.28, -0.88, 0.88)
+            max_delta = max(max_delta, 0.085)
         if abs(track_pos) > 0.92:
-            target_steer = clamp(target_steer - track_pos * 0.34, -0.88, 0.88)
-            max_delta = max(max_delta, 0.10)
+            target_steer = clamp(target_steer - track_pos * 0.42, -0.90, 0.90)
+            max_delta = max(max_delta, 0.12)
+        if speed < 45.0 and abs(track_pos) > 0.62:
+            max_delta = max(max_delta, 0.14)
         if abs(angle) > 0.62:
             target_steer = clamp(target_steer + angle * 0.20, -0.88, 0.88)
 
@@ -301,16 +420,44 @@ class DynaQBaseAgent:
 
         accel = request.accel
         brake = request.brake
+        track = track_sensors(telemetry)
+        front = track[9] if len(track) > 9 else 200.0
         if brake > 0.02:
             accel = 0.0
-        if abs(track_pos) > 0.82 or abs(angle) > 0.42:
-            accel = min(accel, 0.28)
+        if abs(track_pos) > 0.90:
+            if speed < 45.0 and recovery_drive:
+                accel = min(max(request.accel, 0.32), 0.48)
+                brake = 0.0
+            else:
+                accel = min(accel, 0.18)
+                if speed > 45.0:
+                    brake = max(brake, 0.10)
+        elif abs(track_pos) > 0.82 or abs(angle) > 0.42:
+            if speed < 38.0 and recovery_drive:
+                accel = min(max(request.accel, 0.30), 0.48)
+            else:
+                accel = min(accel, 0.28)
+        elif abs(track_pos) > 0.68:
+            accel = min(accel, 0.42)
+        if front < 22.0 and speed > 55.0:
+            accel = min(accel, 0.08)
+            brake = max(brake, 0.22)
         if abs(float_value(telemetry.get("speedY"))) > 10.0:
             accel = min(accel, 0.12)
             brake = max(brake, 0.14)
+        if speed < 18.0 and abs(track_pos) < 1.02 and abs(angle) < 0.70:
+            accel = max(accel, 0.52 if abs(track_pos) > 0.82 else 0.58)
+            brake = 0.0
+        elif speed < 34.0 and brake < 0.05 and abs(track_pos) < 0.82:
+            accel = max(accel, 0.38)
 
         accel = self.previous_accel + clamp(accel - self.previous_accel, -0.30, 0.22)
-        brake = self.previous_brake + clamp(brake - self.previous_brake, -0.25, 0.34)
+        brake_up = 0.55 if request.brake > 0.70 else 0.34
+        brake = self.previous_brake + clamp(
+            brake - self.previous_brake,
+            -0.25,
+            brake_up,
+        )
         if brake > 0.05:
             accel = 0.0
 
@@ -327,31 +474,70 @@ class DynaQBaseAgent:
         self,
         previous: Mapping[str, Any],
         current: Mapping[str, Any],
+        action_index: int | None = None,
     ) -> float:
         progress = self._progress_delta(previous, current)
         speed = max(0.0, float_value(current.get("speedX")))
-        angle = abs(float_value(current.get("angle")))
-        track_position = abs(float_value(current.get("trackPos")))
-        side_speed = abs(float_value(current.get("speedY")))
+        signed_angle = float_value(current.get("angle"))
+        angle = abs(signed_angle)
+        signed_track_position = float_value(current.get("trackPos"))
+        track_position = abs(signed_track_position)
+        previous_track_position = abs(float_value(previous.get("trackPos")))
+        signed_side_speed = float_value(current.get("speedY"))
+        side_speed = abs(signed_side_speed)
         track = track_sensors(current)
         front = track[9] if len(track) > 9 else 200.0
+        invalid_track_sensor = bool(track and min(track) < 0.0)
         damage_delta = max(
             0.0,
             float_value(current.get("damage")) - float_value(previous.get("damage")),
         )
 
         alignment = max(0.0, math.cos(angle))
-        reward = progress * 0.10
-        reward += min(speed, 220.0) * alignment * 0.012
-        reward -= max(0.0, track_position - 0.35) * 1.8
-        reward -= max(0.0, angle - 0.08) * 2.2
-        reward -= max(0.0, side_speed - 4.0) * 0.09
+        outward_motion = signed_track_position * signed_side_speed
+        outward_heading = signed_track_position * signed_angle < -0.045
+        reward = progress * 0.62
+        if speed < 45.0:
+            reward += progress * 0.32
+        if progress > 0.18:
+            reward += 0.55
+        if speed < 24.0 and progress > 0.12:
+            reward += 0.8
+        if track_position < 0.84 and angle < 0.55:
+            reward += min(speed, 220.0) * alignment * 0.006
+        reward -= max(0.0, track_position - 0.35) * 2.2
+        reward -= max(0.0, track_position - 0.66) * 8.5
+        reward -= max(0.0, track_position - 0.88) * 18.0
+        if previous_track_position > 0.48:
+            edge_delta = previous_track_position - track_position
+            reward += edge_delta * 10.0
+        if track_position > 0.50 and outward_motion > 1.2:
+            reward -= min(7.0, outward_motion * 0.45)
+        if track_position > 0.50 and outward_motion < -1.2:
+            reward += min(2.5, abs(outward_motion) * 0.18)
+        if track_position > 0.52 and outward_heading:
+            reward -= min(6.0, track_position * angle * 8.0)
+        reward -= max(0.0, angle - 0.06) * 2.8
+        reward -= max(0.0, angle - 0.28) * 5.0
+        reward -= max(0.0, side_speed - 3.5) * 0.12
 
-        if progress < 0.08 and speed < 8.0:
-            reward -= 2.5
-        if front < 18.0 and speed > 80.0:
-            reward -= (80.0 - front) * 0.035
-        if track and min(track) < 0.0:
+        if progress < 0.04 and speed < 8.0:
+            reward -= 6.0
+        elif progress < 0.04 and speed < 25.0:
+            reward -= 2.8
+        elif progress < 0.04 and speed > 35.0:
+            reward -= 2.2
+        if action_index is not None:
+            action = ACTION_SPACE[action_index]
+            if speed < 24.0 and action.brake > 0.05 and track_position < 0.90:
+                reward -= 8.0
+            if speed < 18.0 and action.accel < 0.20 and track_position < 0.90:
+                reward -= 5.0
+            if speed > 105.0 and abs(action.steer) > 0.45:
+                reward -= 2.0
+        if front < 26.0 and speed > 65.0:
+            reward -= (65.0 - front) * 0.06
+        if invalid_track_sensor:
             reward -= 35.0
         if track_position > 1.0:
             reward -= 45.0
@@ -359,6 +545,16 @@ class DynaQBaseAgent:
             reward -= 60.0 + damage_delta * 0.20
 
         return clamp(reward, -120.0, 120.0)
+
+    @staticmethod
+    def terminal_reward(reason: str) -> float:
+        if reason in {"car stuck", "stuck", "no progress"}:
+            return -90.0
+        if reason in {"out of bounds", "wrong direction"}:
+            return -110.0
+        if reason == "damage limit exceeded":
+            return -120.0
+        return -70.0
 
     def learn_from_transition(
         self,
@@ -408,7 +604,9 @@ class DynaQBaseAgent:
             return True, "out of bounds"
         if angle > 2.25:
             return True, "wrong direction"
-        if self.stuck_counter > 260:
+        if self.progress_stall_counter > 300:
+            return True, "no progress"
+        if self.stuck_counter > 220:
             return True, "car stuck"
         return False, ""
 
@@ -437,6 +635,7 @@ class DynaQBaseAgent:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "format_version": POLICY_FORMAT_VERSION,
+            "training_schema_version": TRAINING_SCHEMA_VERSION,
             "algorithm": "dyna_q",
             "track_id": "g-track-3",
             "track_length_m": self.track_length_m,
@@ -445,6 +644,10 @@ class DynaQBaseAgent:
             "steps_trained": self.steps_trained,
             "real_updates": self.real_updates,
             "planning_updates": self.planning_updates,
+            "epsilon": self.exploration_rate(),
+            "epsilon_start": self.epsilon_start,
+            "epsilon_min": self.epsilon_min,
+            "epsilon_decay_steps": self.epsilon_decay_steps,
             "action_labels": [action.label for action in ACTION_SPACE],
             "q_values": self.q_values,
             "model": {
@@ -461,7 +664,7 @@ class DynaQBaseAgent:
             encoding="utf-8",
         )
 
-    def _load_policy(self, path: Path) -> None:
+    def _load_policy(self, path: Path, *, strict: bool = True) -> bool:
         if not path.is_file():
             raise FileNotFoundError(
                 f"No Dyna-Q policy found at {path}. Train a learning agent first "
@@ -471,6 +674,21 @@ class DynaQBaseAgent:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if payload.get("algorithm") != "dyna_q":
             raise ValueError(f"{path} is not a Dyna-Q policy file")
+
+        current_action_labels = [action.label for action in ACTION_SPACE]
+        saved_action_labels = payload.get("action_labels")
+        schema_version = payload.get("training_schema_version")
+        if (
+            saved_action_labels != current_action_labels
+            or schema_version != TRAINING_SCHEMA_VERSION
+        ):
+            message = (
+                f"{path} was trained with a different Dyna-Q learning schema. "
+                "Train a new policy from scratch before loading it."
+            )
+            if strict:
+                raise ValueError(message)
+            return False
 
         self.q_values = {
             str(key): float(value)
@@ -488,6 +706,7 @@ class DynaQBaseAgent:
         self.steps_trained = int(payload.get("steps_trained", 0))
         self.real_updates = int(payload.get("real_updates", 0))
         self.planning_updates = int(payload.get("planning_updates", 0))
+        return True
 
     def _q_update(
         self,
@@ -531,6 +750,22 @@ class DynaQBaseAgent:
             return 0.0
         return delta
 
+    def _update_progress_stall(self, current: Mapping[str, Any]) -> None:
+        if self.previous_telemetry is None:
+            self.progress_stall_counter = 0
+            return
+
+        progress = self._progress_delta(self.previous_telemetry, current)
+        speed = max(0.0, float_value(current.get("speedX")))
+        track_position = abs(float_value(current.get("trackPos")))
+        barely_moving = progress < 0.025 and speed < 10.0
+        creeping = progress < 0.04 and speed < 16.0
+
+        if track_position < 1.05 and (barely_moving or creeping):
+            self.progress_stall_counter += 1
+        else:
+            self.progress_stall_counter = max(0, self.progress_stall_counter - 4)
+
     def _section_bin(self, distance: float) -> int:
         wrapped = distance % self.track_length_m
         section = int(wrapped / self.track_length_m * self.section_count)
@@ -550,6 +785,22 @@ class DynaQBaseAgent:
         if best_index <= 12:
             return 3
         return 4
+
+    def _sensor_opening_balance(self, track: list[float]) -> int:
+        if len(track) < 14:
+            return 2
+        left_opening = sum(track[5:9]) / 4.0
+        right_opening = sum(track[10:14]) / 4.0
+        difference = left_opening - right_opening
+        if difference < -55.0:
+            return 0
+        if difference < -18.0:
+            return 1
+        if difference > 55.0:
+            return 4
+        if difference > 18.0:
+            return 3
+        return 2
 
     @staticmethod
     def _transition_key(state: tuple[int, ...], action_index: int) -> str:
