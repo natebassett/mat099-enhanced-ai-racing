@@ -16,6 +16,8 @@ from agents.dyna_q_agent import (  # noqa: E402
     DynaQBaseAgent,
     DynaQFinalisedAgent,
     DynaQLearningAgent,
+    edge_recovery_zone,
+    stable_open_corridor,
 )
 
 
@@ -316,6 +318,94 @@ class DynaQAgentTests(unittest.TestCase):
         self.assertGreaterEqual(controls["accel"], 0.20)
         self.assertEqual(controls["brake"], 0.0)
 
+    def test_hard_edge_recovery_overrides_low_speed_brake(self):
+        agent = DynaQBaseAgent(seed=1)
+        controls = agent.action_to_controls(
+            14,
+            {
+                **_telemetry(distance=0.0, raced=0.0, speed=8.0),
+                "trackPos": 1.14,
+                "track": [-1.0] * 19,
+            },
+        )
+
+        self.assertLess(controls["steer"], -0.10)
+        self.assertGreaterEqual(controls["accel"], 0.20)
+        self.assertEqual(controls["brake"], 0.0)
+
+    def test_hard_left_edge_recovery_steers_right(self):
+        agent = DynaQBaseAgent(seed=1)
+        controls = agent.action_to_controls(
+            14,
+            {
+                **_telemetry(distance=0.0, raced=0.0, speed=8.0),
+                "trackPos": -1.14,
+                "track": [-1.0] * 19,
+            },
+        )
+
+        self.assertGreater(controls["steer"], 0.10)
+        self.assertGreaterEqual(controls["accel"], 0.20)
+        self.assertEqual(controls["brake"], 0.0)
+
+    def test_reward_penalises_unneeded_stable_open_braking(self):
+        agent = DynaQBaseAgent(seed=1)
+        previous = _telemetry(distance=100.0, raced=100.0, speed=68.0)
+        current = _telemetry(distance=104.0, raced=104.0, speed=70.0)
+
+        maintain_reward = agent.calculate_reward(previous, current, 9)
+        brake_reward = agent.calculate_reward(previous, current, 14)
+
+        self.assertGreater(maintain_reward, brake_reward)
+
+    def test_stable_open_corridor_requires_safe_alignment(self):
+        self.assertTrue(
+            stable_open_corridor(
+                speed=70.0,
+                track_position=0.2,
+                angle=0.1,
+                side_speed=1.0,
+                front=150.0,
+            )
+        )
+        self.assertFalse(
+            stable_open_corridor(
+                speed=70.0,
+                track_position=0.7,
+                angle=0.1,
+                side_speed=1.0,
+                front=150.0,
+            )
+        )
+
+    def test_edge_recovery_zone_detects_mild_off_track_sensor_failure(self):
+        self.assertTrue(edge_recovery_zone(1.04, 200.0))
+        self.assertTrue(edge_recovery_zone(0.92, -1.0))
+        self.assertFalse(edge_recovery_zone(0.80, -1.0))
+
+    def test_reward_prefers_hard_edge_recovery_over_drifting_farther(self):
+        agent = DynaQBaseAgent(seed=1)
+        previous = {
+            **_telemetry(distance=100.0, raced=100.0, speed=18.0),
+            "trackPos": 1.12,
+            "track": [-1.0] * 19,
+        }
+        recovering = {
+            **_telemetry(distance=101.0, raced=101.0, speed=20.0),
+            "trackPos": 1.04,
+            "track": [-1.0] * 19,
+        }
+        drifting_farther = {
+            **_telemetry(distance=101.0, raced=101.0, speed=20.0),
+            "trackPos": 1.18,
+            "track": [-1.0] * 19,
+        }
+
+        self.assertGreater(
+            agent.calculate_reward(previous, recovering, 17),
+            agent.calculate_reward(previous, drifting_farther, 14),
+        )
+
     def test_stuck_shutdown_applies_terminal_learning_penalty(self):
         agent = DynaQLearningAgent(seed=123, load_existing=False)
         agent.planning_steps = 0
@@ -338,7 +428,7 @@ class DynaQAgentTests(unittest.TestCase):
         agent = DynaQBaseAgent(seed=1)
         telemetry = {
             **_telemetry(distance=100.0, raced=100.0, speed=0.0),
-            "trackPos": 1.23,
+            "trackPos": 1.33,
             "track": [-1.0] * 19,
         }
 
@@ -346,6 +436,42 @@ class DynaQAgentTests(unittest.TestCase):
 
         self.assertTrue(shutdown)
         self.assertEqual(reason, "out of bounds")
+
+    def test_slow_edge_position_can_attempt_recovery_before_shutdown(self):
+        agent = DynaQBaseAgent(seed=1)
+        telemetry = {
+            **_telemetry(distance=100.0, raced=100.0, speed=4.0),
+            "trackPos": 1.25,
+            "angle": 0.25,
+            "track": [-1.0] * 19,
+        }
+
+        shutdown, reason = agent.should_shutdown(telemetry)
+
+        self.assertFalse(shutdown)
+        self.assertEqual(reason, "")
+
+    def test_light_off_track_transition_can_learn_recovery(self):
+        agent = DynaQBaseAgent(seed=1)
+        previous = _telemetry(distance=100.0, raced=100.0, speed=20.0)
+        current = {
+            **_telemetry(distance=101.0, raced=101.0, speed=18.0),
+            "trackPos": 1.10,
+            "track": [-1.0] * 19,
+        }
+
+        self.assertFalse(agent.is_terminal_transition(previous, current))
+
+    def test_hard_off_track_transition_remains_terminal(self):
+        agent = DynaQBaseAgent(seed=1)
+        previous = _telemetry(distance=100.0, raced=100.0, speed=20.0)
+        current = {
+            **_telemetry(distance=101.0, raced=101.0, speed=18.0),
+            "trackPos": 1.25,
+            "track": [-1.0] * 19,
+        }
+
+        self.assertTrue(agent.is_terminal_transition(previous, current))
 
     def test_no_progress_shutdown_applies_terminal_learning_penalty(self):
         agent = DynaQLearningAgent(seed=123, load_existing=False)

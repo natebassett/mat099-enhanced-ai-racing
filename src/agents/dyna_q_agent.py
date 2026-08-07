@@ -86,6 +86,29 @@ def shift_gears(speed: float) -> int:
     return int(clamp(float(gear), 1.0, 6.0))
 
 
+def stable_open_corridor(
+    *,
+    speed: float,
+    track_position: float,
+    angle: float,
+    side_speed: float,
+    front: float,
+) -> bool:
+    return (
+        speed < 110.0
+        and track_position < 0.48
+        and angle < 0.22
+        and side_speed < 5.5
+        and front > 90.0
+    )
+
+
+def edge_recovery_zone(track_position: float, min_track_sensor: float) -> bool:
+    return track_position > 1.0 or (
+        track_position > 0.88 and min_track_sensor < -0.1
+    )
+
+
 class DynaQBaseAgent:
     name = "Dyna-Q Agent"
     agent_type = "dyna_q"
@@ -382,6 +405,9 @@ class DynaQBaseAgent:
         speed = float_value(telemetry.get("speedX"))
         track_pos = float_value(telemetry.get("trackPos"))
         angle = float_value(telemetry.get("angle"))
+        track = track_sensors(telemetry)
+        min_track_sensor = min(track) if track else 200.0
+        edge_recovery = edge_recovery_zone(abs(track_pos), min_track_sensor)
         recovery_drive = (
             request.accel > 0.20
             and request.brake < 0.05
@@ -407,6 +433,9 @@ class DynaQBaseAgent:
         if abs(track_pos) > 0.92:
             target_steer = clamp(target_steer - track_pos * 0.42, -0.90, 0.90)
             max_delta = max(max_delta, 0.12)
+        if edge_recovery:
+            target_steer = clamp(target_steer - track_pos * 0.74, -0.90, 0.90)
+            max_delta = max(max_delta, 0.20 if speed > 18.0 else 0.26)
         if speed < 45.0 and abs(track_pos) > 0.62:
             max_delta = max(max_delta, 0.14)
         if abs(angle) > 0.62:
@@ -420,7 +449,6 @@ class DynaQBaseAgent:
 
         accel = request.accel
         brake = request.brake
-        track = track_sensors(telemetry)
         front = track[9] if len(track) > 9 else 200.0
         if brake > 0.02:
             accel = 0.0
@@ -450,6 +478,16 @@ class DynaQBaseAgent:
             brake = 0.0
         elif speed < 34.0 and brake < 0.05 and abs(track_pos) < 0.82:
             accel = max(accel, 0.38)
+        if edge_recovery:
+            if speed < 34.0 and abs(angle) < 0.90:
+                accel = max(accel, 0.32 if abs(track_pos) > 1.12 else 0.40)
+                brake = 0.0
+            elif speed < 18.0:
+                accel = max(accel, 0.24)
+                brake = 0.0
+            if speed > 58.0 or abs(angle) > 1.05:
+                accel = min(accel, 0.10)
+                brake = max(brake, 0.18)
 
         accel = self.previous_accel + clamp(accel - self.previous_accel, -0.30, 0.22)
         brake_up = 0.55 if request.brake > 0.70 else 0.34
@@ -496,6 +534,13 @@ class DynaQBaseAgent:
         alignment = max(0.0, math.cos(angle))
         outward_motion = signed_track_position * signed_side_speed
         outward_heading = signed_track_position * signed_angle < -0.045
+        stable_open = stable_open_corridor(
+            speed=speed,
+            track_position=track_position,
+            angle=angle,
+            side_speed=side_speed,
+            front=front,
+        )
         reward = progress * 0.62
         if speed < 45.0:
             reward += progress * 0.32
@@ -511,6 +556,8 @@ class DynaQBaseAgent:
         if previous_track_position > 0.48:
             edge_delta = previous_track_position - track_position
             reward += edge_delta * 10.0
+            if previous_track_position > 0.92:
+                reward += edge_delta * 14.0
         if track_position > 0.50 and outward_motion > 1.2:
             reward -= min(7.0, outward_motion * 0.45)
         if track_position > 0.50 and outward_motion < -1.2:
@@ -535,6 +582,22 @@ class DynaQBaseAgent:
                 reward -= 5.0
             if speed > 105.0 and abs(action.steer) > 0.45:
                 reward -= 2.0
+            if stable_open and action.brake > 0.05:
+                reward -= 3.0
+            if stable_open and abs(action.steer) > 0.30:
+                reward -= min(2.5, (abs(action.steer) - 0.30) * 6.0)
+            if stable_open and action.accel > 0.30 and action.brake < 0.05:
+                reward += 0.35
+            if track_position > 0.94 and speed < 35.0 and action.brake > 0.05:
+                reward -= 4.0
+            if (
+                track_position > 0.94
+                and speed < 34.0
+                and action.accel > 0.20
+                and action.brake < 0.05
+                and signed_track_position * action.steer < 0.0
+            ):
+                reward += 1.0
         if front < 26.0 and speed > 65.0:
             reward -= (65.0 - front) * 0.06
         if invalid_track_sensor:
@@ -600,7 +663,9 @@ class DynaQBaseAgent:
         self.stuck_counter = self.stuck_counter + 1 if speed < 5.0 else 0
         if damage > 650.0:
             return True, "damage limit exceeded"
-        if track_position > 1.22:
+        if track_position > 1.32:
+            return True, "out of bounds"
+        if track_position > 1.24 and (speed > 35.0 or angle > 1.20):
             return True, "out of bounds"
         if angle > 2.25:
             return True, "wrong direction"
@@ -619,11 +684,12 @@ class DynaQBaseAgent:
             previous.get("damage")
         )
         track = track_sensors(current)
+        track_position = abs(float_value(current.get("trackPos")))
         return (
             damage_delta > 25.0
-            or abs(float_value(current.get("trackPos"))) > 1.08
+            or track_position > 1.24
             or abs(float_value(current.get("angle"))) > 1.45
-            or bool(track and min(track) < -0.1)
+            or bool(track and min(track) < -0.1 and track_position > 1.18)
         )
 
     def close(self) -> None:

@@ -128,6 +128,157 @@ class TrainDynaQPolicyTests(unittest.TestCase):
         self.assertEqual(best_payload["best_progress_m"], 300.0)
         self.assertEqual(best_payload["q_values"], {"b": 2})
 
+    def test_best_policy_checkpoint_can_be_gated_by_evaluation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "latest.json"
+            best_path = Path(directory) / "best.json"
+            policy_path.write_text(
+                json.dumps({"algorithm": "dyna_q", "q_values": {"a": 1}}),
+                encoding="utf-8",
+            )
+
+            first_update = train_dyna_q_policy._maybe_update_best_policy(
+                policy_path,
+                best_path,
+                1800.0,
+                evaluation_progress_m=500.0,
+                evaluation_results={
+                    "termination_reason": "out of bounds",
+                    "steps": 100,
+                    "laps_completed": 0,
+                    "best_lap_time_seconds": None,
+                },
+            )
+            policy_path.write_text(
+                json.dumps({"algorithm": "dyna_q", "q_values": {"b": 2}}),
+                encoding="utf-8",
+            )
+            worse_greedy_update = train_dyna_q_policy._maybe_update_best_policy(
+                policy_path,
+                best_path,
+                2200.0,
+                evaluation_progress_m=450.0,
+            )
+            better_greedy_update = train_dyna_q_policy._maybe_update_best_policy(
+                policy_path,
+                best_path,
+                1200.0,
+                evaluation_progress_m=700.0,
+            )
+            best_payload = json.loads(best_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(first_update)
+        self.assertFalse(worse_greedy_update)
+        self.assertTrue(better_greedy_update)
+        self.assertEqual(best_payload["checkpoint_score"], "finalised_evaluation_progress")
+        self.assertEqual(best_payload["best_progress_m"], 700.0)
+        self.assertEqual(best_payload["best_evaluation_progress_m"], 700.0)
+        self.assertEqual(best_payload["candidate_training_progress_m"], 1200.0)
+        self.assertEqual(best_payload["q_values"], {"b": 2})
+
+    def test_evaluation_gate_respects_minimum_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "latest.json"
+            best_path = Path(directory) / "best.json"
+            policy_path.write_text(
+                json.dumps({"algorithm": "dyna_q", "q_values": {"a": 1}}),
+                encoding="utf-8",
+            )
+
+            updated = train_dyna_q_policy._maybe_update_best_policy(
+                policy_path,
+                best_path,
+                1800.0,
+                evaluation_progress_m=400.0,
+                min_evaluation_progress_m=500.0,
+            )
+
+        self.assertFalse(updated)
+        self.assertFalse(best_path.exists())
+
+    def test_evaluation_gate_preserves_legacy_training_best_until_it_is_beaten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "latest.json"
+            best_path = Path(directory) / "best.json"
+            policy_path.write_text(
+                json.dumps({"algorithm": "dyna_q", "q_values": {"new": 1}}),
+                encoding="utf-8",
+            )
+            best_path.write_text(
+                json.dumps(
+                    {
+                        "algorithm": "dyna_q",
+                        "best_progress_m": 2031.56,
+                        "q_values": {"old": 2},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            updated = train_dyna_q_policy._maybe_update_best_policy(
+                policy_path,
+                best_path,
+                760.0,
+                evaluation_progress_m=1207.0,
+            )
+            best_payload = json.loads(best_path.read_text(encoding="utf-8"))
+
+        self.assertFalse(updated)
+        self.assertEqual(best_payload["best_progress_m"], 2031.56)
+        self.assertEqual(best_payload["q_values"], {"old": 2})
+
+    def test_gated_evaluation_relaunches_after_socket_reset(self):
+        class FakeAgent:
+            def __init__(self, *, policy_path):
+                self.policy_path = policy_path
+
+        class FakeConsole:
+            def __init__(self):
+                self.statuses = []
+
+            def render(self, _summaries, status):
+                self.statuses.append(status)
+
+        class ResettingRunner:
+            def __init__(self):
+                self.shutdown_called = False
+
+            def run(self, _agent, *, shutdown_on_finish):
+                raise ConnectionError("socket reset")
+
+            def shutdown(self):
+                self.shutdown_called = True
+
+        class WorkingRunner:
+            def run(self, _agent, *, shutdown_on_finish):
+                return {"telemetry_samples": [{"dist_raced": 0}, {"dist_raced": 10}]}
+
+        original_agent = train_dyna_q_policy.DynaQFinalisedAgent
+        original_start_runner = train_dyna_q_policy._start_runner
+        first_runner = ResettingRunner()
+        console = FakeConsole()
+
+        try:
+            train_dyna_q_policy.DynaQFinalisedAgent = FakeAgent
+            train_dyna_q_policy._start_runner = lambda _track: WorkingRunner()
+            runner, results = train_dyna_q_policy._run_gated_evaluation(
+                first_runner,
+                policy_path=Path("policy.json"),
+                track="g-track-3",
+                reconnect_attempts=1,
+                console=console,
+                summaries=[],
+                episode=3,
+            )
+        finally:
+            train_dyna_q_policy.DynaQFinalisedAgent = original_agent
+            train_dyna_q_policy._start_runner = original_start_runner
+
+        self.assertIsInstance(runner, WorkingRunner)
+        self.assertTrue(first_runner.shutdown_called)
+        self.assertEqual(results["telemetry_samples"][-1]["dist_raced"], 10)
+        self.assertIn("relaunching TORCS", console.statuses[-1])
+
     def test_resume_best_policy_copies_best_and_saves_previous(self):
         with tempfile.TemporaryDirectory() as directory:
             policy_path = Path(directory) / "latest.json"

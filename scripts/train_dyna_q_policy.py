@@ -18,11 +18,11 @@ from agents.dyna_q_agent import (  # noqa: E402
     DEFAULT_BEST_POLICY_PATH,
     DEFAULT_FINAL_POLICY_PATH,
     DEFAULT_LATEST_POLICY_PATH,
+    DynaQFinalisedAgent,
     DynaQLearningAgent,
     G_TRACK_3_LENGTH_METRES,
 )
 from gui.torcs_config import TorcsRaceSetup, TorcsRuntimeConfig  # noqa: E402
-from runner.torcs_runner import TorcsRunner  # noqa: E402
 
 
 DEFAULT_TRACK_ID = "g-track-3"
@@ -101,12 +101,39 @@ def main() -> int:
         action="store_true",
         help="Disable automatic previous/best policy checkpoints.",
     )
+    parser.add_argument(
+        "--gate-best-with-evaluation",
+        action="store_true",
+        help=(
+            "Before updating the best checkpoint, run the saved policy once as "
+            "a finalised greedy agent and score the checkpoint using that result."
+        ),
+    )
+    parser.add_argument(
+        "--best-evaluation-frequency",
+        type=int,
+        default=1,
+        help="When evaluation gating is enabled, evaluate every N episodes.",
+    )
+    parser.add_argument(
+        "--best-evaluation-min-progress",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum greedy evaluation progress in metres required before an "
+            "evaluation-gated best checkpoint can be promoted."
+        ),
+    )
     parser.add_argument("--promote-final", action="store_true")
     args = parser.parse_args()
     if args.from_scratch and args.resume_best:
         parser.error("--from-scratch and --resume-best cannot be used together")
     if args.exploration_boost is not None and not 0.0 <= args.exploration_boost <= 1.0:
         parser.error("--exploration-boost must be between 0.0 and 1.0")
+    if args.best_evaluation_frequency < 1:
+        parser.error("--best-evaluation-frequency must be at least 1")
+    if args.best_evaluation_min_progress < 0.0:
+        parser.error("--best-evaluation-min-progress cannot be negative")
 
     # gym_torcs/snakeoil reads sys.argv internally and rejects script-level
     # flags such as --from-scratch. Keep only the program name before TORCS
@@ -197,10 +224,36 @@ def main() -> int:
                 summary = _episode_summary(episode, results, agent)
                 summaries.append(summary)
                 if not args.no_checkpoints:
+                    evaluation_results = None
+                    evaluation_progress_m = None
+                    if (
+                        args.gate_best_with_evaluation
+                        and episode % args.best_evaluation_frequency == 0
+                    ):
+                        console.render(
+                            summaries,
+                            (
+                                "Evaluating saved policy greedily before best "
+                                f"checkpoint update after episode {episode}..."
+                            ),
+                        )
+                        runner, evaluation_results = _run_gated_evaluation(
+                            runner,
+                            policy_path=args.policy_path,
+                            track=args.track,
+                            reconnect_attempts=args.reconnect_attempts,
+                            console=console,
+                            summaries=summaries,
+                            episode=episode,
+                        )
+                        evaluation_progress_m = _episode_progress_m(evaluation_results)
                     _maybe_update_best_policy(
                         args.policy_path,
                         args.best_policy_path,
                         summary.progress_m,
+                        evaluation_progress_m=evaluation_progress_m,
+                        evaluation_results=evaluation_results,
+                        min_evaluation_progress_m=args.best_evaluation_min_progress,
                     )
                 console.render(
                     summaries,
@@ -275,11 +328,46 @@ class TrainingConsole:
 
 
 def _start_runner(track: str) -> TorcsRunner:
+    from runner.torcs_runner import TorcsRunner  # noqa: PLC0415
+
     runner = TorcsRunner()
     runner.launch()
     runner.connect()
     runner.load_track(track)
     return runner
+
+
+def _run_gated_evaluation(
+    runner: object,
+    *,
+    policy_path: Path,
+    track: str,
+    reconnect_attempts: int,
+    console: TrainingConsole,
+    summaries: list[EpisodeSummary],
+    episode: int,
+) -> tuple[object, dict[str, object]]:
+    retry_count = 0
+    max_reconnects = max(0, reconnect_attempts)
+    while True:
+        evaluation_agent = DynaQFinalisedAgent(policy_path=policy_path)
+        try:
+            results = runner.run(evaluation_agent, shutdown_on_finish=False)
+            return runner, results
+        except (ConnectionError, OSError):
+            if retry_count >= max_reconnects:
+                raise
+            retry_count += 1
+            console.render(
+                summaries,
+                (
+                    "SCR socket reset before gated evaluation after episode "
+                    f"{episode}; relaunching TORCS ({retry_count}/"
+                    f"{max_reconnects})..."
+                ),
+            )
+            runner.shutdown()
+            runner = _start_runner(track)
 
 
 def _episode_summary(
@@ -475,22 +563,76 @@ def _maybe_update_best_policy(
     policy_path: Path,
     best_policy_path: Path,
     progress_m: float,
+    *,
+    evaluation_progress_m: float | None = None,
+    evaluation_results: dict[str, object] | None = None,
+    min_evaluation_progress_m: float = 0.0,
 ) -> bool:
     if not policy_path.is_file():
         return False
 
+    score_m = progress_m
     previous_best = _policy_best_progress(best_policy_path)
+    metadata = {
+        "checkpoint_type": "best",
+        "checkpoint_score": "training_progress",
+        "best_progress_m": score_m,
+        "best_progress_percent": min(100.0, score_m / G_TRACK_3_LENGTH_METRES * 100.0),
+    }
+
+    if evaluation_progress_m is not None:
+        if evaluation_progress_m < min_evaluation_progress_m:
+            return False
+        score_m = evaluation_progress_m
+        previous_best = _policy_best_evaluation_progress(best_policy_path)
+        if previous_best is None:
+            previous_best = _policy_best_progress(best_policy_path)
+        metadata.update(
+            {
+                "checkpoint_score": "finalised_evaluation_progress",
+                "best_progress_m": score_m,
+                "best_progress_percent": min(
+                    100.0,
+                    score_m / G_TRACK_3_LENGTH_METRES * 100.0,
+                ),
+                "best_evaluation_progress_m": evaluation_progress_m,
+                "best_evaluation_progress_percent": min(
+                    100.0,
+                    evaluation_progress_m / G_TRACK_3_LENGTH_METRES * 100.0,
+                ),
+                "candidate_training_progress_m": progress_m,
+                "candidate_training_progress_percent": min(
+                    100.0,
+                    progress_m / G_TRACK_3_LENGTH_METRES * 100.0,
+                ),
+            }
+        )
+        if evaluation_results is not None:
+            metadata.update(
+                {
+                    "best_evaluation_reason": str(
+                        evaluation_results.get("termination_reason", "")
+                    ),
+                    "best_evaluation_steps": int(evaluation_results.get("steps", 0)),
+                    "best_evaluation_laps": int(
+                        evaluation_results.get("laps_completed", 0)
+                    ),
+                    "best_evaluation_lap_time": evaluation_results.get(
+                        "best_lap_time_seconds"
+                    ),
+                }
+            )
+
     if previous_best is not None and progress_m <= previous_best:
+        if evaluation_progress_m is None:
+            return False
+
+    if previous_best is not None and score_m <= previous_best:
         return False
 
     best_policy_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(policy_path, best_policy_path)
-    _annotate_policy(
-        best_policy_path,
-        checkpoint_type="best",
-        best_progress_m=progress_m,
-        best_progress_percent=min(100.0, progress_m / G_TRACK_3_LENGTH_METRES * 100.0),
-    )
+    _annotate_policy(best_policy_path, **metadata)
     return True
 
 
@@ -544,10 +686,40 @@ def _policy_best_progress(path: Path) -> float | None:
     return _optional_float(payload.get("best_progress_m"))
 
 
+def _policy_best_evaluation_progress(path: Path) -> float | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return _optional_float(payload.get("best_evaluation_progress_m"))
+
+
 def _best_policy_summary(path: Path) -> str:
     payload = json.loads(path.read_text(encoding="utf-8"))
     best_progress = _optional_float(payload.get("best_progress_m")) or 0.0
     best_percent = min(100.0, best_progress / G_TRACK_3_LENGTH_METRES * 100.0)
+    evaluation_progress = _optional_float(payload.get("best_evaluation_progress_m"))
+    if evaluation_progress is not None:
+        evaluation_percent = min(
+            100.0,
+            evaluation_progress / G_TRACK_3_LENGTH_METRES * 100.0,
+        )
+        training_progress = _optional_float(
+            payload.get("candidate_training_progress_m")
+        )
+        training_text = (
+            ""
+            if training_progress is None
+            else f" | train_progress={training_progress:.0f}m"
+        )
+        return (
+            f"best_eval_progress={evaluation_progress:.0f}m "
+            f"({evaluation_percent:.1f}%){training_text} | "
+            f"q_values={len(payload.get('q_values', {}))} | "
+            f"trained_steps={payload.get('steps_trained')}"
+        )
     return (
         f"best_progress={best_progress:.0f}m ({best_percent:.1f}%) | "
         f"q_values={len(payload.get('q_values', {}))} | "

@@ -16,6 +16,7 @@ ppo_driver/models/
 
 # Generated race data
 data/generated/
+data/evaluation/
 data/map_aware_telemetry_run*.csv
 data/map_aware_replay_eval_run*.csv
 data/map_aware_replay_run*.svg
