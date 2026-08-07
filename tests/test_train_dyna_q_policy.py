@@ -170,7 +170,7 @@ class TrainDynaQPolicyTests(unittest.TestCase):
         self.assertTrue(first_update)
         self.assertFalse(worse_greedy_update)
         self.assertTrue(better_greedy_update)
-        self.assertEqual(best_payload["checkpoint_score"], "finalised_evaluation_progress")
+        self.assertEqual(best_payload["checkpoint_score"], "finalised_evaluation_quality")
         self.assertEqual(best_payload["best_progress_m"], 700.0)
         self.assertEqual(best_payload["best_evaluation_progress_m"], 700.0)
         self.assertEqual(best_payload["candidate_training_progress_m"], 1200.0)
@@ -226,6 +226,177 @@ class TrainDynaQPolicyTests(unittest.TestCase):
         self.assertFalse(updated)
         self.assertEqual(best_payload["best_progress_m"], 2031.56)
         self.assertEqual(best_payload["q_values"], {"old": 2})
+
+    def test_evaluation_gate_prefers_completed_lap_over_progress_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "latest.json"
+            best_path = Path(directory) / "best.json"
+            policy_path.write_text(
+                json.dumps({"algorithm": "dyna_q", "q_values": {"lap": 1}}),
+                encoding="utf-8",
+            )
+            best_path.write_text(
+                json.dumps(
+                    {
+                        "algorithm": "dyna_q",
+                        "best_evaluation_progress_m": 2843.0,
+                        "best_evaluation_laps": 0,
+                        "q_values": {"progress": 2},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            updated = train_dyna_q_policy._maybe_update_best_policy(
+                policy_path,
+                best_path,
+                150.0,
+                evaluation_progress_m=2843.0,
+                evaluation_results={
+                    "termination_reason": "target_laps_completed",
+                    "steps": 18000,
+                    "laps_completed": 1,
+                    "best_lap_time_seconds": 360.0,
+                    "off_track": 300,
+                    "avg_speed": 0.6,
+                },
+            )
+            best_payload = json.loads(best_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(updated)
+        self.assertEqual(best_payload["best_evaluation_laps"], 1)
+        self.assertEqual(best_payload["best_evaluation_lap_time"], 360.0)
+        self.assertEqual(best_payload["q_values"], {"lap": 1})
+
+    def test_evaluation_gate_prefers_faster_completed_lap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "latest.json"
+            best_path = Path(directory) / "best.json"
+            policy_path.write_text(
+                json.dumps({"algorithm": "dyna_q", "q_values": {"fast": 1}}),
+                encoding="utf-8",
+            )
+            best_path.write_text(
+                json.dumps(
+                    {
+                        "algorithm": "dyna_q",
+                        "best_progress_m": 2843.0,
+                        "best_evaluation_progress_m": 2843.0,
+                        "best_evaluation_laps": 1,
+                        "best_evaluation_lap_time": 362.0,
+                        "best_evaluation_off_track": 370,
+                        "best_evaluation_avg_speed": 0.60,
+                        "q_values": {"slow": 2},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            updated = train_dyna_q_policy._maybe_update_best_policy(
+                policy_path,
+                best_path,
+                200.0,
+                evaluation_progress_m=2843.0,
+                evaluation_results={
+                    "termination_reason": "target_laps_completed",
+                    "steps": 17000,
+                    "laps_completed": 1,
+                    "best_lap_time_seconds": 338.0,
+                    "off_track": 450,
+                    "avg_speed": 0.55,
+                },
+            )
+            best_payload = json.loads(best_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(updated)
+        self.assertEqual(best_payload["best_evaluation_lap_time"], 338.0)
+        self.assertEqual(best_payload["q_values"], {"fast": 1})
+
+    def test_evaluation_gate_rejects_slower_completed_lap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "latest.json"
+            best_path = Path(directory) / "best.json"
+            policy_path.write_text(
+                json.dumps({"algorithm": "dyna_q", "q_values": {"slow": 1}}),
+                encoding="utf-8",
+            )
+            best_path.write_text(
+                json.dumps(
+                    {
+                        "algorithm": "dyna_q",
+                        "best_evaluation_progress_m": 2843.0,
+                        "best_evaluation_laps": 1,
+                        "best_evaluation_lap_time": 338.0,
+                        "best_evaluation_off_track": 450,
+                        "best_evaluation_avg_speed": 0.55,
+                        "q_values": {"fast": 2},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            updated = train_dyna_q_policy._maybe_update_best_policy(
+                policy_path,
+                best_path,
+                200.0,
+                evaluation_progress_m=2843.0,
+                evaluation_results={
+                    "termination_reason": "target_laps_completed",
+                    "steps": 18000,
+                    "laps_completed": 1,
+                    "best_lap_time_seconds": 362.0,
+                    "off_track": 100,
+                    "avg_speed": 0.70,
+                },
+            )
+            best_payload = json.loads(best_path.read_text(encoding="utf-8"))
+
+        self.assertFalse(updated)
+        self.assertEqual(best_payload["best_evaluation_lap_time"], 338.0)
+        self.assertEqual(best_payload["q_values"], {"fast": 2})
+
+    def test_evaluation_gate_uses_off_track_as_completed_lap_tiebreaker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "latest.json"
+            best_path = Path(directory) / "best.json"
+            policy_path.write_text(
+                json.dumps({"algorithm": "dyna_q", "q_values": {"clean": 1}}),
+                encoding="utf-8",
+            )
+            best_path.write_text(
+                json.dumps(
+                    {
+                        "algorithm": "dyna_q",
+                        "best_evaluation_progress_m": 2843.0,
+                        "best_evaluation_laps": 1,
+                        "best_evaluation_lap_time": 340.0,
+                        "best_evaluation_off_track": 300,
+                        "best_evaluation_avg_speed": 0.62,
+                        "q_values": {"messy": 2},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            updated = train_dyna_q_policy._maybe_update_best_policy(
+                policy_path,
+                best_path,
+                200.0,
+                evaluation_progress_m=2843.0,
+                evaluation_results={
+                    "termination_reason": "target_laps_completed",
+                    "steps": 17000,
+                    "laps_completed": 1,
+                    "best_lap_time_seconds": 340.0,
+                    "off_track": 180,
+                    "avg_speed": 0.58,
+                },
+            )
+            best_payload = json.loads(best_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(updated)
+        self.assertEqual(best_payload["best_evaluation_off_track"], 180)
+        self.assertEqual(best_payload["q_values"], {"clean": 1})
 
     def test_gated_evaluation_relaunches_after_socket_reset(self):
         class FakeAgent:

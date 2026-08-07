@@ -51,6 +51,15 @@ class EpisodeSummary:
     final_front: float | None = None
 
 
+@dataclass(frozen=True)
+class PolicyQuality:
+    completed_laps: int
+    best_lap: float | None
+    off_track: int | None
+    avg_speed: float | None
+    progress_m: float
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -584,12 +593,19 @@ def _maybe_update_best_policy(
         if evaluation_progress_m < min_evaluation_progress_m:
             return False
         score_m = evaluation_progress_m
-        previous_best = _policy_best_evaluation_progress(best_policy_path)
-        if previous_best is None:
-            previous_best = _policy_best_progress(best_policy_path)
+        candidate_quality = _evaluation_quality(
+            evaluation_progress_m,
+            evaluation_results,
+        )
+        previous_quality = _policy_best_quality(best_policy_path)
+        if previous_quality is not None and not _quality_is_better(
+            candidate_quality,
+            previous_quality,
+        ):
+            return False
         metadata.update(
             {
-                "checkpoint_score": "finalised_evaluation_progress",
+                "checkpoint_score": "finalised_evaluation_quality",
                 "best_progress_m": score_m,
                 "best_progress_percent": min(
                     100.0,
@@ -605,8 +621,16 @@ def _maybe_update_best_policy(
                     100.0,
                     progress_m / G_TRACK_3_LENGTH_METRES * 100.0,
                 ),
+                "best_evaluation_laps": candidate_quality.completed_laps,
+                "best_evaluation_lap_time": candidate_quality.best_lap,
+                "best_evaluation_off_track": candidate_quality.off_track,
+                "best_evaluation_avg_speed": candidate_quality.avg_speed,
             }
         )
+        if candidate_quality.avg_speed is not None:
+            metadata["best_evaluation_avg_speed_kmh"] = (
+                candidate_quality.avg_speed * 50.0
+            )
         if evaluation_results is not None:
             metadata.update(
                 {
@@ -620,14 +644,17 @@ def _maybe_update_best_policy(
                     "best_evaluation_lap_time": evaluation_results.get(
                         "best_lap_time_seconds"
                     ),
+                    "best_evaluation_off_track": int(
+                        evaluation_results.get("off_track", 0)
+                    ),
+                    "best_evaluation_avg_speed": evaluation_results.get("avg_speed"),
+                    "best_evaluation_avg_speed_kmh": _scaled_speed_kmh(
+                        evaluation_results.get("avg_speed")
+                    ),
                 }
             )
 
-    if previous_best is not None and progress_m <= previous_best:
-        if evaluation_progress_m is None:
-            return False
-
-    if previous_best is not None and score_m <= previous_best:
+    if evaluation_progress_m is None and previous_best is not None and score_m <= previous_best:
         return False
 
     best_policy_path.parent.mkdir(parents=True, exist_ok=True)
@@ -696,6 +723,149 @@ def _policy_best_evaluation_progress(path: Path) -> float | None:
     return _optional_float(payload.get("best_evaluation_progress_m"))
 
 
+def _evaluation_quality(
+    progress_m: float,
+    results: dict[str, object] | None,
+) -> PolicyQuality:
+    if results is None:
+        return PolicyQuality(
+            completed_laps=0,
+            best_lap=None,
+            off_track=None,
+            avg_speed=None,
+            progress_m=progress_m,
+        )
+    return PolicyQuality(
+        completed_laps=max(0, _optional_int(results.get("laps_completed")) or 0),
+        best_lap=_optional_float(results.get("best_lap_time_seconds")),
+        off_track=_optional_int(results.get("off_track")),
+        avg_speed=_optional_float(results.get("avg_speed")),
+        progress_m=progress_m,
+    )
+
+
+def _policy_best_quality(path: Path) -> PolicyQuality | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    progress_m = _optional_float(payload.get("best_evaluation_progress_m"))
+    if progress_m is None:
+        progress_m = _optional_float(payload.get("best_progress_m"))
+    if progress_m is None:
+        return None
+
+    completed_laps = _optional_int(payload.get("best_evaluation_laps"))
+    if completed_laps is None:
+        completed_laps = 1 if progress_m >= G_TRACK_3_LENGTH_METRES * 0.999 else 0
+    return PolicyQuality(
+        completed_laps=max(0, completed_laps),
+        best_lap=_optional_float(payload.get("best_evaluation_lap_time")),
+        off_track=_optional_int(payload.get("best_evaluation_off_track")),
+        avg_speed=_optional_float(payload.get("best_evaluation_avg_speed")),
+        progress_m=progress_m,
+    )
+
+
+def _quality_is_better(candidate: PolicyQuality, current: PolicyQuality) -> bool:
+    if candidate.completed_laps != current.completed_laps:
+        return candidate.completed_laps > current.completed_laps
+
+    if candidate.completed_laps > 0:
+        lap_comparison = _compare_lower_is_better(
+            candidate.best_lap,
+            current.best_lap,
+        )
+        if lap_comparison != 0:
+            return lap_comparison < 0
+
+        off_track_comparison = _compare_lower_is_better(
+            candidate.off_track,
+            current.off_track,
+        )
+        if off_track_comparison != 0:
+            return off_track_comparison < 0
+
+        speed_comparison = _compare_higher_is_better(
+            candidate.avg_speed,
+            current.avg_speed,
+        )
+        if speed_comparison != 0:
+            return speed_comparison > 0
+
+        return candidate.progress_m > current.progress_m + 1e-6
+
+    progress_delta = candidate.progress_m - current.progress_m
+    if abs(progress_delta) > 1e-6:
+        return progress_delta > 0.0
+
+    off_track_comparison = _compare_lower_is_better(
+        candidate.off_track,
+        current.off_track,
+    )
+    if off_track_comparison != 0:
+        return off_track_comparison < 0
+
+    speed_comparison = _compare_higher_is_better(
+        candidate.avg_speed,
+        current.avg_speed,
+    )
+    return speed_comparison > 0
+
+
+def _compare_lower_is_better(
+    candidate: float | int | None,
+    current: float | int | None,
+) -> int:
+    if candidate is None and current is None:
+        return 0
+    if candidate is None:
+        return 1
+    if current is None:
+        return -1
+    if math_isclose(float(candidate), float(current)):
+        return 0
+    return -1 if candidate < current else 1
+
+
+def _compare_higher_is_better(
+    candidate: float | int | None,
+    current: float | int | None,
+) -> int:
+    if candidate is None and current is None:
+        return 0
+    if candidate is None:
+        return -1
+    if current is None:
+        return 1
+    if math_isclose(float(candidate), float(current)):
+        return 0
+    return 1 if candidate > current else -1
+
+
+def math_isclose(left: float, right: float) -> bool:
+    return abs(left - right) <= 1e-6
+
+
+def _optional_int(value: object) -> int | None:
+    if value in {None, ""}:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _scaled_speed_kmh(value: object) -> float | None:
+    speed = _optional_float(value)
+    if speed is None:
+        return None
+    return speed * 50.0
+
+
 def _best_policy_summary(path: Path) -> str:
     payload = json.loads(path.read_text(encoding="utf-8"))
     best_progress = _optional_float(payload.get("best_progress_m")) or 0.0
@@ -714,9 +884,18 @@ def _best_policy_summary(path: Path) -> str:
             if training_progress is None
             else f" | train_progress={training_progress:.0f}m"
         )
+        laps = _optional_int(payload.get("best_evaluation_laps"))
+        lap_time = _optional_float(payload.get("best_evaluation_lap_time"))
+        off_track = _optional_int(payload.get("best_evaluation_off_track"))
+        avg_speed = _optional_float(payload.get("best_evaluation_avg_speed_kmh"))
+        lap_text = "" if laps is None else f" | laps={laps}"
+        lap_time_text = "" if lap_time is None else f" | lap={lap_time:.3f}s"
+        off_track_text = "" if off_track is None else f" | off_track={off_track}"
+        avg_speed_text = "" if avg_speed is None else f" | avg={avg_speed:.1f}km/h"
         return (
             f"best_eval_progress={evaluation_progress:.0f}m "
-            f"({evaluation_percent:.1f}%){training_text} | "
+            f"({evaluation_percent:.1f}%){lap_text}{lap_time_text}"
+            f"{off_track_text}{avg_speed_text}{training_text} | "
             f"q_values={len(payload.get('q_values', {}))} | "
             f"trained_steps={payload.get('steps_trained')}"
         )
