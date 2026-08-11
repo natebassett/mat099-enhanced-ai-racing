@@ -105,6 +105,36 @@ class TorcsRunnerStartupTests(unittest.TestCase):
 
         self.assertEqual(sensors, [float(value) for value in range(19)])
 
+    def test_recorded_telemetry_includes_optional_agent_debug_fields(self):
+        class DebugAgent:
+            def telemetry_debug(self):
+                return {
+                    "dyna_q_state": "1,2,3",
+                    "dyna_q_action_label": "straight / maintain",
+                    "dyna_q_reward": 1.25,
+                }
+
+        runner = TorcsRunner()
+        results = {"steps": 42, "telemetry_samples": []}
+        runner._record_telemetry_sample(
+            results,
+            {
+                "distFromStart": 100.0,
+                "distRaced": 100.0,
+                "speedX": 50.0,
+                "track": [200.0] * 19,
+            },
+            {"steer": 0.0, "accel": 0.5, "brake": 0.0, "gear": 2},
+            0.5,
+            False,
+            agent=DebugAgent(),
+        )
+
+        sample = results["telemetry_samples"][0]
+        self.assertEqual(sample["dyna_q_state"], "1,2,3")
+        self.assertEqual(sample["dyna_q_action_label"], "straight / maintain")
+        self.assertEqual(sample["dyna_q_reward"], 1.25)
+
     def test_shutdown_on_finish_flag_can_keep_torcs_process_alive(self):
         runner = TorcsRunner()
         runner.env = FakeFinishedEnv()

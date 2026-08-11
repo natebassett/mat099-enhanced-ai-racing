@@ -44,6 +44,19 @@ class TelemetryModelTests(unittest.TestCase):
                 "track_sensors": [str(value) for value in range(19)],
                 "cur_lap_time": "14.25",
                 "last_lap_time": "",
+                "dyna_q_learning_enabled": "true",
+                "dyna_q_finalised": 0,
+                "dyna_q_state": "1,2,3",
+                "dyna_q_action_label": "straight / maintain",
+                "dyna_q_action_source": "greedy",
+                "dyna_q_reward": "2.5",
+                "dyna_q_td_error": "-0.125",
+                "dyna_q_selected_q": "4.75",
+                "dyna_q_epsilon": "0.012",
+                "dyna_q_q_states": "123",
+                "dyna_q_model_states": "122",
+                "dyna_q_real_updates": "55",
+                "dyna_q_planning_updates": "880",
             }
         )
 
@@ -57,6 +70,19 @@ class TelemetryModelTests(unittest.TestCase):
         self.assertEqual(snapshot.steer, -0.125)
         self.assertEqual(snapshot.track_sensors, tuple(float(value) for value in range(19)))
         self.assertIsNone(snapshot.last_lap_time)
+        self.assertTrue(snapshot.dyna_q_learning_enabled)
+        self.assertFalse(snapshot.dyna_q_finalised)
+        self.assertEqual(snapshot.dyna_q_state, "1,2,3")
+        self.assertEqual(snapshot.dyna_q_action_label, "straight / maintain")
+        self.assertEqual(snapshot.dyna_q_action_source, "greedy")
+        self.assertEqual(snapshot.dyna_q_reward, 2.5)
+        self.assertEqual(snapshot.dyna_q_td_error, -0.125)
+        self.assertEqual(snapshot.dyna_q_selected_q, 4.75)
+        self.assertEqual(snapshot.dyna_q_epsilon, 0.012)
+        self.assertEqual(snapshot.dyna_q_q_states, 123)
+        self.assertEqual(snapshot.dyna_q_model_states, 122)
+        self.assertEqual(snapshot.dyna_q_real_updates, 55)
+        self.assertEqual(snapshot.dyna_q_planning_updates, 880)
 
     def test_history_keeps_bounded_chart_series(self):
         history = TelemetryHistory(max_points=2)

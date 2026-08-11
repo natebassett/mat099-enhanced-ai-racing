@@ -96,6 +96,9 @@ class GuiAgentEducationModelTests(unittest.TestCase):
             any("learn_from_transition" in snippet.source for snippet in profile.code_snippets)
         )
         self.assertIn("Compatible tracks", profile.track_context[0])
+        self.assertTrue(
+            any("live dashboard" in note.casefold() for note in profile.overview)
+        )
 
 
 def _agent(name: str, agent_type: str, *, requires_line: bool) -> AgentOption:

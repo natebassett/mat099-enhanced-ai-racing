@@ -154,6 +154,10 @@ class DynaQBaseAgent:
         self.last_reward = 0.0
         self.last_td_error = 0.0
         self.last_action_label = ""
+        self.last_state: tuple[int, ...] | None = None
+        self.last_action_index: int | None = None
+        self.last_action_was_exploratory = False
+        self.last_selected_q_value = 0.0
         self.exploration_override: float | None = None
         self.previous_state: tuple[int, ...] | None = None
         self.previous_action_index: int | None = None
@@ -213,6 +217,10 @@ class DynaQBaseAgent:
         self.previous_gear = 1
         self.stuck_counter = 0
         self.progress_stall_counter = 0
+        self.last_state = None
+        self.last_action_index = None
+        self.last_action_was_exploratory = False
+        self.last_selected_q_value = 0.0
         self.episode_count += 1
 
     def act(
@@ -273,6 +281,8 @@ class DynaQBaseAgent:
         self.previous_accel = action["accel"]
         self.previous_brake = action["brake"]
         self.previous_gear = action["gear"]
+        self.last_state = current_state
+        self.last_action_index = action_index
         self.last_action_label = ACTION_SPACE[action_index].label
         return action
 
@@ -328,7 +338,10 @@ class DynaQBaseAgent:
             and not self.finalised
             and self._random.random() < self.exploration_rate()
         ):
-            return self._random.choice(available_actions)
+            action_index = self._random.choice(available_actions)
+            self.last_action_was_exploratory = True
+            self.last_selected_q_value = self.q_value(state, action_index)
+            return action_index
 
         values = [
             self.q_value(state, action_index)
@@ -340,7 +353,30 @@ class DynaQBaseAgent:
             for action_index, value in zip(available_actions, values)
             if math.isclose(value, best_value, abs_tol=1e-12)
         ]
-        return self._random.choice(best_actions)
+        action_index = self._random.choice(best_actions)
+        self.last_action_was_exploratory = False
+        self.last_selected_q_value = self.q_value(state, action_index)
+        return action_index
+
+    def telemetry_debug(self) -> dict[str, Any]:
+        return {
+            "dyna_q_learning_enabled": self.learning_enabled,
+            "dyna_q_finalised": self.finalised,
+            "dyna_q_state": _format_state(self.last_state),
+            "dyna_q_action_index": self.last_action_index,
+            "dyna_q_action_label": self.last_action_label,
+            "dyna_q_action_source": (
+                "explore" if self.last_action_was_exploratory else "greedy"
+            ),
+            "dyna_q_reward": self.last_reward,
+            "dyna_q_td_error": self.last_td_error,
+            "dyna_q_selected_q": self.last_selected_q_value,
+            "dyna_q_epsilon": self.exploration_rate(),
+            "dyna_q_q_states": len(self.q_values),
+            "dyna_q_model_states": len(self.model),
+            "dyna_q_real_updates": self.real_updates,
+            "dyna_q_planning_updates": self.planning_updates,
+        }
 
     def available_actions(self, telemetry: Mapping[str, Any] | None) -> tuple[int, ...]:
         if telemetry is None:
@@ -550,9 +586,23 @@ class DynaQBaseAgent:
             reward += 0.8
         if track_position < 0.84 and angle < 0.55:
             reward += min(speed, 220.0) * alignment * 0.006
+        if (
+            progress > 0.08
+            and not invalid_track_sensor
+            and track_position < 0.58
+            and angle < 0.38
+            and side_speed < 4.0
+        ):
+            reward += 0.45 + progress * 0.36
+        if progress > 0.12 and track_position < 0.42 and angle < 0.24:
+            reward += 0.30
         reward -= max(0.0, track_position - 0.35) * 2.2
         reward -= max(0.0, track_position - 0.66) * 8.5
+        reward -= max(0.0, track_position - 0.78) * 11.0
         reward -= max(0.0, track_position - 0.88) * 18.0
+        if track_position > 0.92 and speed > 28.0:
+            reward -= min(24.0, (track_position - 0.92) * 42.0)
+            reward -= min(18.0, max(0.0, speed - 28.0) * 0.16)
         if previous_track_position > 0.48:
             edge_delta = previous_track_position - track_position
             reward += edge_delta * 10.0
@@ -601,9 +651,12 @@ class DynaQBaseAgent:
         if front < 26.0 and speed > 65.0:
             reward -= (65.0 - front) * 0.06
         if invalid_track_sensor:
-            reward -= 35.0
+            reward -= 42.0
+            reward -= min(30.0, max(0.0, speed - 18.0) * 0.20)
+            if track_position > 0.92:
+                reward -= min(22.0, (track_position - 0.92) * 55.0)
         if track_position > 1.0:
-            reward -= 45.0
+            reward -= 56.0
         if damage_delta > 0.0:
             reward -= 60.0 + damage_delta * 0.20
 
@@ -957,6 +1010,12 @@ def float_value(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _format_state(state: tuple[int, ...] | None) -> str:
+    if state is None:
+        return ""
+    return ",".join(str(part) for part in state)
 
 
 def _bucket(value: float, thresholds: tuple[float, ...]) -> int:

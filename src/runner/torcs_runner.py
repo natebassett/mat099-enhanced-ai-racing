@@ -460,6 +460,7 @@ class TorcsRunner:
                         action_snapshot,
                         reward,
                         off_track,
+                        agent=agent,
                     )
                     telemetry_sample = results["telemetry_samples"][-1]
                     if telemetry_callback is not None:
@@ -595,33 +596,39 @@ class TorcsRunner:
         action,
         reward,
         off_track,
+        *,
+        agent=None,
     ):
         track_sensors = self._track_sensor_values(telemetry)
         front_sensor = track_sensors[9] if len(track_sensors) > 9 else None
         min_track_sensor = min(track_sensors) if track_sensors else None
-        results["telemetry_samples"].append(
-            {
-                "step": results["steps"],
-                "dist_from_start": telemetry.get("distFromStart"),
-                "dist_raced": telemetry.get("distRaced"),
-                "speed_x": telemetry.get("speedX"),
-                "speed_y": telemetry.get("speedY"),
-                "angle": telemetry.get("angle"),
-                "track_pos": telemetry.get("trackPos"),
-                "damage": telemetry.get("damage"),
-                "steer": action.get("steer") if isinstance(action, Mapping) else None,
-                "accel": action.get("accel") if isinstance(action, Mapping) else None,
-                "brake": action.get("brake") if isinstance(action, Mapping) else None,
-                "gear": action.get("gear") if isinstance(action, Mapping) else None,
-                "reward": reward,
-                "off_track": off_track,
-                "front_sensor": front_sensor,
-                "min_track_sensor": min_track_sensor,
-                "track_sensors": track_sensors,
-                "cur_lap_time": telemetry.get("curLapTime"),
-                "last_lap_time": telemetry.get("lastLapTime"),
-            }
-        )
+        sample = {
+            "step": results["steps"],
+            "dist_from_start": telemetry.get("distFromStart"),
+            "dist_raced": telemetry.get("distRaced"),
+            "speed_x": telemetry.get("speedX"),
+            "speed_y": telemetry.get("speedY"),
+            "angle": telemetry.get("angle"),
+            "track_pos": telemetry.get("trackPos"),
+            "damage": telemetry.get("damage"),
+            "steer": action.get("steer") if isinstance(action, Mapping) else None,
+            "accel": action.get("accel") if isinstance(action, Mapping) else None,
+            "brake": action.get("brake") if isinstance(action, Mapping) else None,
+            "gear": action.get("gear") if isinstance(action, Mapping) else None,
+            "reward": reward,
+            "off_track": off_track,
+            "front_sensor": front_sensor,
+            "min_track_sensor": min_track_sensor,
+            "track_sensors": track_sensors,
+            "cur_lap_time": telemetry.get("curLapTime"),
+            "last_lap_time": telemetry.get("lastLapTime"),
+        }
+        debug_snapshot = getattr(agent, "telemetry_debug", None)
+        if callable(debug_snapshot):
+            extra = debug_snapshot()
+            if isinstance(extra, Mapping):
+                sample.update(extra)
+        results["telemetry_samples"].append(sample)
 
     @staticmethod
     def _track_sensor_values(telemetry):

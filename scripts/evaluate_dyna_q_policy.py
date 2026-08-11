@@ -88,6 +88,12 @@ def main() -> int:
         help="Minimum finalised progress in metres required for best promotion.",
     )
     parser.add_argument(
+        "--max-promotion-off-track",
+        type=int,
+        default=None,
+        help="Optional maximum off-track sample count allowed for best promotion.",
+    )
+    parser.add_argument(
         "--promote-final",
         action="store_true",
         help="Copy the evaluated policy to the finalised policy path after the run.",
@@ -95,6 +101,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.min_promotion_progress < 0.0:
         parser.error("--min-promotion-progress cannot be negative")
+    if args.max_promotion_off_track is not None and args.max_promotion_off_track < 0:
+        parser.error("--max-promotion-off-track cannot be negative")
 
     # gym_torcs/snakeoil parses sys.argv internally. Hide evaluator-only flags.
     sys.argv = [sys.argv[0]]
@@ -131,6 +139,7 @@ def main() -> int:
             evaluation_progress_m=summary.progress_m,
             evaluation_results=results,
             min_evaluation_progress_m=args.min_promotion_progress,
+            max_evaluation_off_track=args.max_promotion_off_track,
         )
         if updated:
             print(

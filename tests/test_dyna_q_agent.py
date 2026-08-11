@@ -141,6 +141,22 @@ class DynaQAgentTests(unittest.TestCase):
             agent.calculate_reward(previous, stuck),
         )
 
+    def test_telemetry_debug_reports_learning_state(self):
+        agent = DynaQLearningAgent(seed=123, load_existing=False)
+        agent.epsilon_start = 0.0
+        agent.epsilon_min = 0.0
+
+        agent.act(None, _telemetry(distance=100.0, raced=100.0, speed=80.0))
+        debug = agent.telemetry_debug()
+
+        self.assertTrue(debug["dyna_q_learning_enabled"])
+        self.assertFalse(debug["dyna_q_finalised"])
+        self.assertIsInstance(debug["dyna_q_state"], str)
+        self.assertIsInstance(debug["dyna_q_action_label"], str)
+        self.assertEqual(debug["dyna_q_action_source"], "greedy")
+        self.assertEqual(debug["dyna_q_epsilon"], 0.0)
+        self.assertEqual(debug["dyna_q_q_states"], len(agent.q_values))
+
     def test_reward_prefers_recovering_from_edge(self):
         agent = DynaQBaseAgent(seed=1)
         previous = {
@@ -202,6 +218,53 @@ class DynaQAgentTests(unittest.TestCase):
         self.assertLess(
             agent.calculate_reward(previous, outside),
             agent.calculate_reward(previous, inside) - 80.0,
+        )
+
+    def test_reward_prefers_clean_progress_over_off_track_shortcut(self):
+        agent = DynaQBaseAgent(seed=1)
+        previous = _telemetry(distance=100.0, raced=100.0, speed=70.0)
+        clean = {
+            **_telemetry(distance=106.0, raced=106.0, speed=72.0),
+            "trackPos": 0.18,
+            "angle": 0.08,
+            "speedY": 0.8,
+        }
+        off_track_shortcut = {
+            **_telemetry(distance=106.0, raced=106.0, speed=72.0),
+            "trackPos": 1.06,
+            "angle": 0.08,
+            "speedY": 0.8,
+            "track": [-1.0] * 19,
+        }
+
+        self.assertGreater(
+            agent.calculate_reward(previous, clean),
+            agent.calculate_reward(previous, off_track_shortcut) + 100.0,
+        )
+
+    def test_reward_prefers_slow_edge_recovery_over_fast_edge_riding(self):
+        agent = DynaQBaseAgent(seed=1)
+        previous = {
+            **_telemetry(distance=100.0, raced=100.0, speed=44.0),
+            "trackPos": 0.98,
+        }
+        slow_recovery = {
+            **_telemetry(distance=102.0, raced=102.0, speed=22.0),
+            "trackPos": 0.86,
+            "angle": 0.16,
+            "speedY": -1.2,
+        }
+        fast_edge_ride = {
+            **_telemetry(distance=102.0, raced=102.0, speed=72.0),
+            "trackPos": 1.02,
+            "angle": 0.16,
+            "speedY": 5.0,
+            "track": [-1.0] * 19,
+        }
+
+        self.assertGreater(
+            agent.calculate_reward(previous, slow_recovery),
+            agent.calculate_reward(previous, fast_edge_ride),
         )
 
     def test_launch_action_mask_prevents_brake_when_stable_and_slow(self):

@@ -567,6 +567,11 @@ def _template_for(agent_type: str) -> dict[str, Any]:
                     "Finalised mode loads a saved policy, switches exploration off, "
                     "and always chooses the best-known action."
                 ),
+                (
+                    "The live dashboard exposes the current state, chosen action, "
+                    "reward, TD error, epsilon, Q-table size, and planning replay "
+                    "count so the learning process is visible while TORCS runs."
+                ),
             ),
             "decision_steps": (
                 "Read speed, angle, side speed, track position, lap distance, and road sensors.",
@@ -576,6 +581,7 @@ def _template_for(agent_type: str) -> dict[str, Any]:
                 "On the next telemetry frame, calculate reward from progress, speed, stability, and safety.",
                 "Update the Q-table from the real transition.",
                 "Replay stored transitions internally for extra Dyna-Q planning updates.",
+                "Show the current reward, TD error, Q-table size, and replay count in the live dashboard.",
             ),
             "algorithm_summary": (
                 "Dyna-Q combines direct reinforcement learning with lightweight planning.",

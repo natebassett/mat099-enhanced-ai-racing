@@ -25,6 +25,19 @@ class TelemetrySnapshot:
     track_sensors: tuple[float, ...]
     cur_lap_time: float | None
     last_lap_time: float | None
+    dyna_q_learning_enabled: bool
+    dyna_q_finalised: bool
+    dyna_q_state: str
+    dyna_q_action_label: str
+    dyna_q_action_source: str
+    dyna_q_reward: float | None
+    dyna_q_td_error: float | None
+    dyna_q_selected_q: float | None
+    dyna_q_epsilon: float | None
+    dyna_q_q_states: int | None
+    dyna_q_model_states: int | None
+    dyna_q_real_updates: int | None
+    dyna_q_planning_updates: int | None
 
     @classmethod
     def from_sample(cls, sample: Mapping[str, Any]) -> "TelemetrySnapshot":
@@ -46,6 +59,23 @@ class TelemetrySnapshot:
             track_sensors=_to_float_tuple(sample.get("track_sensors", ())),
             cur_lap_time=_to_float(sample.get("cur_lap_time")),
             last_lap_time=_to_float(sample.get("last_lap_time")),
+            dyna_q_learning_enabled=_to_bool(
+                sample.get("dyna_q_learning_enabled")
+            ),
+            dyna_q_finalised=_to_bool(sample.get("dyna_q_finalised")),
+            dyna_q_state=str(sample.get("dyna_q_state") or ""),
+            dyna_q_action_label=str(sample.get("dyna_q_action_label") or ""),
+            dyna_q_action_source=str(sample.get("dyna_q_action_source") or ""),
+            dyna_q_reward=_to_float(sample.get("dyna_q_reward")),
+            dyna_q_td_error=_to_float(sample.get("dyna_q_td_error")),
+            dyna_q_selected_q=_to_float(sample.get("dyna_q_selected_q")),
+            dyna_q_epsilon=_to_float(sample.get("dyna_q_epsilon")),
+            dyna_q_q_states=_to_int(sample.get("dyna_q_q_states")),
+            dyna_q_model_states=_to_int(sample.get("dyna_q_model_states")),
+            dyna_q_real_updates=_to_int(sample.get("dyna_q_real_updates")),
+            dyna_q_planning_updates=_to_int(
+                sample.get("dyna_q_planning_updates")
+            ),
         )
 
 
@@ -432,6 +462,14 @@ def _to_float_tuple(values: Any) -> tuple[float, ...]:
         )
     except TypeError:
         return ()
+
+
+def _to_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 def _to_int(value: Any) -> int | None:

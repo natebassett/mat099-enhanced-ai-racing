@@ -149,6 +149,8 @@ class MainWindow(QMainWindow):
         self.explanation_state_label = QLabel("Telemetry idle.")
         self.explanation_reason_label = QLabel("- No live sample yet.")
         self.explanation_box = QTextEdit()
+        self.dyna_q_learning_group: QGroupBox | None = None
+        self.dyna_q_value_labels: dict[str, QLabel] = {}
         self.run_history_table = QTableWidget(0, 8)
         self.run_history_source_label = QLabel()
         self.tabs: QTabWidget | None = None
@@ -266,6 +268,7 @@ class MainWindow(QMainWindow):
         self._update_agent_education()
         self._connect_signals()
         self._update_selection_details()
+        self._update_dyna_q_panel_visibility()
 
     def _configure_controls(self) -> None:
         self._populate_combo(self.agent_combo, self.project_options.agents)
@@ -501,6 +504,8 @@ class MainWindow(QMainWindow):
         current_layout.addWidget(self.explanation_state_label)
         layout.addWidget(current_group)
 
+        layout.addWidget(self._build_dyna_q_learning_panel())
+
         reason_group = QGroupBox("Why")
         reason_layout = QVBoxLayout(reason_group)
         reason_layout.addWidget(self.explanation_reason_label)
@@ -512,6 +517,34 @@ class MainWindow(QMainWindow):
         layout.addWidget(log_group, 1)
 
         return panel
+
+    def _build_dyna_q_learning_panel(self) -> QWidget:
+        group = QGroupBox("Dyna-Q Decision View")
+        self.dyna_q_learning_group = group
+        layout = QGridLayout(group)
+        metrics = [
+            ("mode", "Mode"),
+            ("action", "Decision"),
+            ("source", "Picked By"),
+            ("state", "Situation Code"),
+            ("reward", "Last Reward"),
+            ("td_error", "Learning Correction"),
+            ("selected_q", "Action Score"),
+            ("epsilon", "Explore Chance"),
+            ("q_states", "Known Situations"),
+            ("model_states", "Learned Outcomes"),
+            ("real_updates", "Real Experiences"),
+            ("planning_updates", "Replay Practice"),
+        ]
+        for index, (key, label_text) in enumerate(metrics):
+            label = QLabel(label_text)
+            value = QLabel("--")
+            value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            value.setWordWrap(True)
+            self.dyna_q_value_labels[key] = value
+            layout.addWidget(label, index, 0)
+            layout.addWidget(value, index, 1)
+        return group
 
     def _build_run_history_tab(self) -> QWidget:
         page = QWidget()
@@ -1151,6 +1184,8 @@ class MainWindow(QMainWindow):
         self._refresh_track_options(
             preferred_track_id=previous_track.track_id if previous_track else None
         )
+        self._reset_dyna_q_values()
+        self._update_dyna_q_panel_visibility()
         self._update_selection_details()
 
     def _refresh_track_options(self, preferred_track_id: str | None = None) -> None:
@@ -2005,8 +2040,10 @@ class MainWindow(QMainWindow):
         track = self.selected_track()
         car = self.selected_car()
         if agent is None or track is None or car is None:
+            self._update_dyna_q_panel_visibility()
             return
 
+        self._update_dyna_q_panel_visibility()
         self.statusBar().showMessage(
             f"{self._discovery_summary()} Selected: {agent.agent_type} / "
             f"{track.track_id} / {car.car_id}. "
@@ -2038,6 +2075,7 @@ class MainWindow(QMainWindow):
 
         self.telemetry_history.append(snapshot)
         self._update_metric_values(snapshot)
+        self._update_dyna_q_values(snapshot)
         self.track_position_widget.set_snapshot(snapshot)
         self.road_sensor_widget.set_snapshot(snapshot)
         self._update_telemetry_charts()
@@ -2114,6 +2152,7 @@ class MainWindow(QMainWindow):
         for key, label in self.metric_value_labels.items():
             unit = _metric_unit(key)
             label.setText("--" if not unit else f"-- {unit}")
+        self._reset_dyna_q_values()
         self.track_position_widget.set_snapshot(None)
         self.road_sensor_widget.set_snapshot(None)
         self._update_telemetry_charts()
@@ -2140,6 +2179,75 @@ class MainWindow(QMainWindow):
             return
         unit = _metric_unit(key)
         label.setText(value if not unit else f"{value} {unit}")
+
+    def _update_dyna_q_values(self, snapshot: TelemetrySnapshot) -> None:
+        if not _has_dyna_q_stats(snapshot):
+            self._reset_dyna_q_values()
+            self._update_dyna_q_panel_visibility()
+            return
+
+        self._update_dyna_q_panel_visibility(show=True)
+        mode = "Finalised" if snapshot.dyna_q_finalised else "Learning"
+        if not snapshot.dyna_q_learning_enabled and not snapshot.dyna_q_finalised:
+            mode = "--"
+        self._set_dyna_q_value("mode", mode)
+        self._set_dyna_q_value("action", snapshot.dyna_q_action_label or "--")
+        self._set_dyna_q_value(
+            "source",
+            _dyna_q_choice_label(snapshot.dyna_q_action_source),
+        )
+        self._set_dyna_q_value("state", snapshot.dyna_q_state or "--")
+        self._set_dyna_q_value(
+            "reward",
+            format_value(snapshot.dyna_q_reward, ".3f"),
+        )
+        self._set_dyna_q_value(
+            "td_error",
+            format_value(snapshot.dyna_q_td_error, ".3f"),
+        )
+        self._set_dyna_q_value(
+            "selected_q",
+            format_value(snapshot.dyna_q_selected_q, ".3f"),
+        )
+        self._set_dyna_q_value(
+            "epsilon",
+            format_value(snapshot.dyna_q_epsilon, ".1%"),
+        )
+        self._set_dyna_q_value(
+            "q_states",
+            _format_optional(snapshot.dyna_q_q_states),
+        )
+        self._set_dyna_q_value(
+            "model_states",
+            _format_optional(snapshot.dyna_q_model_states),
+        )
+        self._set_dyna_q_value(
+            "real_updates",
+            _format_optional(snapshot.dyna_q_real_updates),
+        )
+        self._set_dyna_q_value(
+            "planning_updates",
+            _format_optional(snapshot.dyna_q_planning_updates),
+        )
+
+    def _reset_dyna_q_values(self) -> None:
+        for label in self.dyna_q_value_labels.values():
+            label.setText("--")
+
+    def _set_dyna_q_value(self, key: str, value: str) -> None:
+        label = self.dyna_q_value_labels.get(key)
+        if label is not None:
+            label.setText(value)
+
+    def _update_dyna_q_panel_visibility(self, *, show: bool | None = None) -> None:
+        if self.dyna_q_learning_group is None:
+            return
+        visible = (
+            _selected_agent_is_dyna_q(self.selected_agent())
+            if show is None
+            else show
+        )
+        self.dyna_q_learning_group.setVisible(visible)
 
     def _update_telemetry_charts(self) -> None:
         x_values, speed_values = self.telemetry_history.windowed_series(
@@ -2815,6 +2923,27 @@ def _metric_unit(key: str) -> str:
         "brake": "%",
         "lap_time": "s",
     }.get(key, "")
+
+
+def _has_dyna_q_stats(snapshot: TelemetrySnapshot) -> bool:
+    return (
+        snapshot.dyna_q_state != ""
+        or snapshot.dyna_q_action_label != ""
+        or snapshot.dyna_q_epsilon is not None
+        or snapshot.dyna_q_q_states is not None
+    )
+
+
+def _selected_agent_is_dyna_q(agent: AgentOption | None) -> bool:
+    return bool(agent is not None and agent.agent_type.startswith("dyna_q"))
+
+
+def _dyna_q_choice_label(source: str) -> str:
+    if source == "greedy":
+        return "Best-known action"
+    if source == "explore":
+        return "Trying something"
+    return "--" if not source else source.title()
 
 
 def _completion_status(termination: object) -> str:

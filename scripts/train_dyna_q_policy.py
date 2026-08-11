@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, redirect_stdout
+from io import StringIO
 import json
 import shutil
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -28,7 +32,7 @@ from gui.torcs_config import TorcsRaceSetup, TorcsRuntimeConfig  # noqa: E402
 DEFAULT_TRACK_ID = "g-track-3"
 DEFAULT_TRACK_CATEGORY = "road"
 DEFAULT_CAR_ID = "car1-ow1"
-VISIBLE_EPISODE_ROWS = 14
+VISIBLE_EPISODE_ROWS = 8
 DEFAULT_PREVIOUS_POLICY_PATH = DEFAULT_LATEST_POLICY_PATH.with_name(
     "dyna_q_g_track_3_previous.json"
 )
@@ -49,6 +53,8 @@ class EpisodeSummary:
     final_track_pos: float | None = None
     final_angle: float | None = None
     final_front: float | None = None
+    off_track: int | None = None
+    avg_speed: float | None = None
 
 
 @dataclass(frozen=True)
@@ -125,11 +131,29 @@ def main() -> int:
         help="When evaluation gating is enabled, evaluate every N episodes.",
     )
     parser.add_argument(
+        "--best-evaluation-repeats",
+        type=int,
+        default=1,
+        help=(
+            "When evaluation gating is enabled, run N greedy evaluations and "
+            "promote only from the repeated aggregate result."
+        ),
+    )
+    parser.add_argument(
         "--best-evaluation-min-progress",
         type=float,
         default=0.0,
         help=(
             "Minimum greedy evaluation progress in metres required before an "
+            "evaluation-gated best checkpoint can be promoted."
+        ),
+    )
+    parser.add_argument(
+        "--best-evaluation-max-off-track",
+        type=int,
+        default=None,
+        help=(
+            "Optional maximum off-track sample count allowed before an "
             "evaluation-gated best checkpoint can be promoted."
         ),
     )
@@ -141,8 +165,15 @@ def main() -> int:
         parser.error("--exploration-boost must be between 0.0 and 1.0")
     if args.best_evaluation_frequency < 1:
         parser.error("--best-evaluation-frequency must be at least 1")
+    if args.best_evaluation_repeats < 1:
+        parser.error("--best-evaluation-repeats must be at least 1")
     if args.best_evaluation_min_progress < 0.0:
         parser.error("--best-evaluation-min-progress cannot be negative")
+    if (
+        args.best_evaluation_max_off_track is not None
+        and args.best_evaluation_max_off_track < 0
+    ):
+        parser.error("--best-evaluation-max-off-track cannot be negative")
 
     # gym_torcs/snakeoil reads sys.argv internally and rejects script-level
     # flags such as --from-scratch. Keep only the program name before TORCS
@@ -192,7 +223,7 @@ def main() -> int:
         runner = None
         try:
             console.render(summaries, "Launching TORCS...")
-            runner = _start_runner(args.track)
+            runner = _start_runner(args.track, quiet=console.dynamic)
             episode = 1
             retry_count = 0
             while episode <= episode_total:
@@ -204,7 +235,8 @@ def main() -> int:
                 if args.exploration_boost is not None:
                     agent.exploration_override = args.exploration_boost
                 try:
-                    results = runner.run(agent, shutdown_on_finish=False)
+                    with _quiet_stdout(console.dynamic):
+                        results = runner.run(agent, shutdown_on_finish=False)
                 except (ConnectionError, OSError) as error:
                     if retry_count >= max(0, args.reconnect_attempts):
                         raise
@@ -217,8 +249,9 @@ def main() -> int:
                             f"{max(0, args.reconnect_attempts)})..."
                         ),
                     )
-                    runner.shutdown()
-                    runner = _start_runner(args.track)
+                    with _quiet_stdout(console.dynamic):
+                        runner.shutdown()
+                    runner = _start_runner(args.track, quiet=console.dynamic)
                     continue
 
                 retry_count = 0
@@ -246,7 +279,7 @@ def main() -> int:
                                 f"checkpoint update after episode {episode}..."
                             ),
                         )
-                        runner, evaluation_results = _run_gated_evaluation(
+                        runner, evaluation_results = _run_gated_evaluations(
                             runner,
                             policy_path=args.policy_path,
                             track=args.track,
@@ -254,8 +287,11 @@ def main() -> int:
                             console=console,
                             summaries=summaries,
                             episode=episode,
+                            repeats=args.best_evaluation_repeats,
                         )
-                        evaluation_progress_m = _episode_progress_m(evaluation_results)
+                        evaluation_progress_m = _results_progress_m(
+                            evaluation_results
+                        )
                     _maybe_update_best_policy(
                         args.policy_path,
                         args.best_policy_path,
@@ -263,6 +299,7 @@ def main() -> int:
                         evaluation_progress_m=evaluation_progress_m,
                         evaluation_results=evaluation_results,
                         min_evaluation_progress_m=args.best_evaluation_min_progress,
+                        max_evaluation_off_track=args.best_evaluation_max_off_track,
                     )
                 console.render(
                     summaries,
@@ -271,7 +308,8 @@ def main() -> int:
                 episode += 1
         finally:
             if runner is not None:
-                runner.shutdown()
+                with _quiet_stdout(console.dynamic):
+                    runner.shutdown()
 
     console.render(
         summaries,
@@ -308,6 +346,8 @@ class TrainingConsole:
         self.dynamic = dynamic and sys.stdout.isatty()
         self._printed_header = False
         self._printed_rows = 0
+        self._dynamic_line_count = 0
+        self._started_at = time.monotonic()
 
     def render(
         self,
@@ -321,9 +361,17 @@ class TrainingConsole:
             total_episodes=self.total_episodes,
             policy_path=self.policy_path,
             status=status,
+            elapsed_seconds=time.monotonic() - self._started_at,
+            final=final,
         )
         if self.dynamic:
-            print("\033[2J\033[H" + dashboard, end="", flush=True)
+            prefix = (
+                f"\033[{self._dynamic_line_count}F\033[J"
+                if self._dynamic_line_count
+                else ""
+            )
+            print(prefix + dashboard, end="", flush=True)
+            self._dynamic_line_count = dashboard.count("\n")
             if final:
                 print()
             return
@@ -336,13 +384,14 @@ class TrainingConsole:
         self._printed_rows = len(summaries)
 
 
-def _start_runner(track: str) -> TorcsRunner:
+def _start_runner(track: str, *, quiet: bool = False) -> TorcsRunner:
     from runner.torcs_runner import TorcsRunner  # noqa: PLC0415
 
     runner = TorcsRunner()
-    runner.launch()
-    runner.connect()
-    runner.load_track(track)
+    with _quiet_stdout(quiet):
+        runner.launch()
+        runner.connect()
+        runner.load_track(track)
     return runner
 
 
@@ -358,10 +407,12 @@ def _run_gated_evaluation(
 ) -> tuple[object, dict[str, object]]:
     retry_count = 0
     max_reconnects = max(0, reconnect_attempts)
+    quiet = bool(getattr(console, "dynamic", False))
     while True:
         evaluation_agent = DynaQFinalisedAgent(policy_path=policy_path)
         try:
-            results = runner.run(evaluation_agent, shutdown_on_finish=False)
+            with _quiet_stdout(quiet):
+                results = runner.run(evaluation_agent, shutdown_on_finish=False)
             return runner, results
         except (ConnectionError, OSError):
             if retry_count >= max_reconnects:
@@ -375,8 +426,45 @@ def _run_gated_evaluation(
                     f"{max_reconnects})..."
                 ),
             )
-            runner.shutdown()
-            runner = _start_runner(track)
+            with _quiet_stdout(quiet):
+                runner.shutdown()
+            runner = _start_runner(track, quiet=quiet)
+
+
+def _run_gated_evaluations(
+    runner: object,
+    *,
+    policy_path: Path,
+    track: str,
+    reconnect_attempts: int,
+    console: TrainingConsole,
+    summaries: list[EpisodeSummary],
+    episode: int,
+    repeats: int,
+) -> tuple[object, dict[str, object]]:
+    evaluation_results = []
+    repeat_total = max(1, repeats)
+    for repeat in range(1, repeat_total + 1):
+        console.render(
+            summaries,
+            (
+                f"Greedy best-check evaluation {repeat}/{repeat_total} "
+                f"after episode {episode}..."
+            ),
+        )
+        runner, results = _run_gated_evaluation(
+            runner,
+            policy_path=policy_path,
+            track=track,
+            reconnect_attempts=reconnect_attempts,
+            console=console,
+            summaries=summaries,
+            episode=episode,
+        )
+        evaluation_results.append(results)
+    if len(evaluation_results) == 1:
+        return runner, evaluation_results[0]
+    return runner, _aggregate_evaluation_results(evaluation_results)
 
 
 def _episode_summary(
@@ -399,6 +487,8 @@ def _episode_summary(
         final_track_pos=_last_sample_float(results, "track_pos"),
         final_angle=_last_sample_float(results, "angle"),
         final_front=_last_sample_float(results, "front_sensor"),
+        off_track=_optional_int(results.get("off_track")),
+        avg_speed=_optional_float(results.get("avg_speed")),
     )
 
 
@@ -408,37 +498,41 @@ def _dashboard_text(
     total_episodes: int,
     policy_path: Path,
     status: str,
+    elapsed_seconds: float | None = None,
+    final: bool = False,
 ) -> str:
-    best_progress = max((summary.progress_m for summary in summaries), default=0.0)
-    best_percent = min(100.0, best_progress / G_TRACK_3_LENGTH_METRES * 100.0)
-    best_lap = min(
-        (
-            summary.best_lap
-            for summary in summaries
-            if summary.best_lap is not None
-        ),
-        default=None,
-    )
-    lap_text = "--" if best_lap is None else f"{best_lap:.3f}s"
+    best_progress_summary = _best_progress_episode(summaries)
+    best_lap_summary = _best_lap_episode(summaries)
+    latest = summaries[-1] if summaries else None
     hidden_rows = max(0, len(summaries) - VISIBLE_EPISODE_ROWS)
     visible = summaries[-VISIBLE_EPISODE_ROWS:]
     lines = [
         "Dyna-Q TORCS Training",
         f"Status: {status}",
-        f"Policy: {policy_path}",
+        f"Policy: {_display_path(policy_path)}",
         (
             f"Episodes: {len(summaries)}/{total_episodes} | "
-            f"Best progress: {best_progress:.0f}m ({best_percent:.1f}%) | "
-            f"Best lap: {lap_text}"
+            f"Best progress: {_best_progress_text(best_progress_summary)} | "
+            f"Best lap: {_best_lap_text(best_lap_summary)}"
         ),
+        _time_status_text(
+            completed_episodes=len(summaries),
+            total_episodes=total_episodes,
+            elapsed_seconds=elapsed_seconds,
+            final=final,
+        ),
+        f"Latest: {_episode_detail_text(latest)}",
+        f"Best progress run: {_episode_detail_text(best_progress_summary)}",
+        f"Best lap run: {_episode_detail_text(best_lap_summary)}",
         "",
+        "Recent episodes",
         (
-            "Episode | Result              | Steps | Progress | Lap % | Laps | EndV | "
-            "EndPos | EndAng | Front | Q states | Epsilon"
+            "Ep | Result              | Steps | Progress | Lap % | Lap Time | Off | "
+            "Avg km/h | Q states | Eps"
         ),
         (
-            "--------+---------------------+-------+----------+-------+------+------+"
-            "--------+--------+-------+----------+--------"
+            "---+---------------------+-------+----------+-------+----------+-----+"
+            "---------+----------+------"
         ),
     ]
     if hidden_rows:
@@ -446,8 +540,8 @@ def _dashboard_text(
     lines.extend(_episode_row(summary) for summary in visible)
     if not visible:
         lines.append(
-            "      -- | waiting             |    -- |       -- |    -- |   -- |   -- |"
-            "     -- |     -- |    -- |       -- | --"
+            "-- | waiting             |    -- |       -- |    -- |       -- |  -- |"
+            "      -- |       -- | --"
         )
     return "\n".join(lines) + "\n"
 
@@ -455,16 +549,14 @@ def _dashboard_text(
 def _episode_row(summary: EpisodeSummary) -> str:
     lap_percent = min(100.0, summary.progress_percent)
     return (
-        f"{summary.episode:7d} | "
+        f"{summary.episode:2d} | "
         f"{summary.reason:<19} | "
         f"{summary.steps:5d} | "
         f"{summary.progress_m:7.0f}m | "
         f"{lap_percent:5.1f} | "
-        f"{summary.laps:4d} | "
-        f"{_format_optional_float(summary.final_speed, width=4, precision=0)} | "
-        f"{_format_optional_float(summary.final_track_pos, width=6, precision=2, sign=True)} | "
-        f"{_format_optional_float(summary.final_angle, width=6, precision=2, sign=True)} | "
-        f"{_format_optional_float(summary.final_front, width=5, precision=0)} | "
+        f"{_format_lap_time(summary.best_lap):>8} | "
+        f"{_format_optional_int(summary.off_track, width=3)} | "
+        f"{_format_avg_speed(summary.avg_speed):>7} | "
         f"{summary.q_states:8d} | "
         f"{summary.epsilon:.3f}"
     )
@@ -478,15 +570,121 @@ def _static_table_header(total_episodes: int, policy_path: Path) -> str:
             f"Episodes: 0/{total_episodes}",
             "",
             (
-                "Episode | Result              | Steps | Progress | Lap % | Laps | EndV | "
-                "EndPos | EndAng | Front | Q states | Epsilon"
+                "Ep | Result              | Steps | Progress | Lap % | Lap Time | Off | "
+                "Avg km/h | Q states | Eps"
             ),
             (
-                "--------+---------------------+-------+----------+-------+------+------+"
-                "--------+--------+-------+----------+--------"
+                "---+---------------------+-------+----------+-------+----------+-----+"
+                "---------+----------+------"
             ),
         ]
     )
+
+
+def _best_progress_episode(
+    summaries: list[EpisodeSummary],
+) -> EpisodeSummary | None:
+    if not summaries:
+        return None
+    return max(
+        summaries,
+        key=lambda summary: (
+            summary.progress_m,
+            summary.laps,
+            -(summary.best_lap or float("inf")),
+        ),
+    )
+
+
+def _best_lap_episode(
+    summaries: list[EpisodeSummary],
+) -> EpisodeSummary | None:
+    completed = [summary for summary in summaries if summary.best_lap is not None]
+    if not completed:
+        return None
+    return min(completed, key=lambda summary: summary.best_lap or float("inf"))
+
+
+def _best_progress_text(summary: EpisodeSummary | None) -> str:
+    if summary is None:
+        return "--"
+    return (
+        f"ep {summary.episode} "
+        f"{summary.progress_m:.0f}m ({summary.progress_percent:.1f}%)"
+    )
+
+
+def _best_lap_text(summary: EpisodeSummary | None) -> str:
+    if summary is None or summary.best_lap is None:
+        return "--"
+    return f"ep {summary.episode} {summary.best_lap:.3f}s"
+
+
+def _episode_detail_text(summary: EpisodeSummary | None) -> str:
+    if summary is None:
+        return "--"
+    return (
+        f"ep {summary.episode} | {summary.reason} | "
+        f"{summary.progress_m:.0f}m ({summary.progress_percent:.1f}%) | "
+        f"lap={_format_lap_time(summary.best_lap)} | "
+        f"off={_format_optional_int(summary.off_track, width=1)} | "
+        f"avg={_format_avg_speed(summary.avg_speed)}km/h | "
+        f"q={summary.q_states} | eps={summary.epsilon:.3f}"
+    )
+
+
+def _time_status_text(
+    *,
+    completed_episodes: int,
+    total_episodes: int,
+    elapsed_seconds: float | None,
+    final: bool,
+) -> str:
+    if elapsed_seconds is None:
+        return "Time: elapsed -- | ETA -- | avg/episode --"
+    elapsed_text = _format_duration(elapsed_seconds)
+    if final or completed_episodes >= total_episodes:
+        average_text = _average_episode_time_text(
+            completed_episodes,
+            elapsed_seconds,
+        )
+        return (
+            f"Time: elapsed {elapsed_text} | ETA done | "
+            f"avg/episode {average_text}"
+        )
+    if completed_episodes <= 0:
+        return f"Time: elapsed {elapsed_text} | ETA calculating | avg/episode --"
+    remaining = max(0, total_episodes - completed_episodes)
+    average_seconds = elapsed_seconds / completed_episodes
+    eta_seconds = average_seconds * remaining
+    return (
+        f"Time: elapsed {elapsed_text} | ETA {_format_duration(eta_seconds)} | "
+        f"avg/episode {_format_duration(average_seconds)}"
+    )
+
+
+def _average_episode_time_text(completed_episodes: int, elapsed_seconds: float) -> str:
+    if completed_episodes <= 0:
+        return "--"
+    return _format_duration(elapsed_seconds / completed_episodes)
+
+
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes:d}m {secs:02d}s"
+    return f"{secs:d}s"
+
+
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path)
 
 
 def _episode_progress_m(
@@ -525,6 +723,93 @@ def _episode_progress_m(
     return max(0.0, min(track_length_m, max(progress_values)))
 
 
+def _results_progress_m(
+    results: dict[str, object],
+    *,
+    track_length_m: float = G_TRACK_3_LENGTH_METRES,
+) -> float:
+    explicit_progress = _optional_float(results.get("evaluation_progress_m"))
+    if explicit_progress is None:
+        explicit_progress = _optional_float(results.get("progress_m"))
+    if explicit_progress is not None:
+        return max(0.0, min(track_length_m, explicit_progress))
+    return _episode_progress_m(results, track_length_m=track_length_m)
+
+
+def _aggregate_evaluation_results(
+    results: list[dict[str, object]],
+    *,
+    track_length_m: float = G_TRACK_3_LENGTH_METRES,
+) -> dict[str, object]:
+    if not results:
+        raise ValueError("At least one evaluation result is required")
+
+    progresses = [
+        _results_progress_m(result, track_length_m=track_length_m)
+        for result in results
+    ]
+    laps = [
+        max(0, _optional_int(result.get("laps_completed")) or 0)
+        for result in results
+    ]
+    lap_times = [
+        value
+        for result in results
+        for value in [_optional_float(result.get("best_lap_time_seconds"))]
+        if value is not None
+    ]
+    off_track_values = [
+        value
+        for result in results
+        for value in [_optional_int(result.get("off_track"))]
+        if value is not None
+    ]
+    avg_speed_values = [
+        value
+        for result in results
+        for value in [_optional_float(result.get("avg_speed"))]
+        if value is not None
+    ]
+    step_values = [
+        value
+        for result in results
+        for value in [_optional_int(result.get("steps"))]
+        if value is not None
+    ]
+    reasons = [
+        str(result.get("termination_reason", ""))
+        for result in results
+        if result.get("termination_reason") is not None
+    ]
+
+    repeat_count = len(results)
+    completed_repeats = sum(1 for lap_count in laps if lap_count > 0)
+    repeated_laps = min(laps) if laps else 0
+    lap_time = (
+        _median_float(lap_times)
+        if repeated_laps > 0 and completed_repeats == repeat_count
+        else None
+    )
+    progress_m = min(progresses) if progresses else 0.0
+    reason = (
+        reasons[0]
+        if reasons and all(reason == reasons[0] for reason in reasons)
+        else "repeat_evaluations"
+    )
+
+    return {
+        "termination_reason": reason,
+        "steps": _median_int(step_values),
+        "laps_completed": repeated_laps,
+        "best_lap_time_seconds": lap_time,
+        "off_track": _median_int(off_track_values),
+        "avg_speed": _median_float(avg_speed_values),
+        "evaluation_progress_m": progress_m,
+        "evaluation_repeats": repeat_count,
+        "evaluation_completed_repeats": completed_repeats,
+    }
+
+
 def _optional_float(value: object) -> float | None:
     if value in {None, ""}:
         return None
@@ -557,6 +842,34 @@ def _format_optional_float(
     return f"{value:{sign_flag}{width}.{precision}f}"
 
 
+def _format_optional_int(value: int | None, *, width: int) -> str:
+    if value is None:
+        return "--".rjust(width)
+    return f"{value:{width}d}"
+
+
+def _format_lap_time(value: float | None) -> str:
+    if value is None:
+        return "--"
+    return f"{value:.3f}s"
+
+
+def _format_avg_speed(value: float | None) -> str:
+    speed = _scaled_speed_kmh(value)
+    if speed is None:
+        return "--"
+    return f"{speed:.1f}"
+
+
+@contextmanager
+def _quiet_stdout(enabled: bool):
+    if not enabled:
+        yield
+        return
+    with redirect_stdout(StringIO()):
+        yield
+
+
 def _policy_summary(path: Path) -> str:
     payload = json.loads(path.read_text(encoding="utf-8"))
     return (
@@ -576,6 +889,7 @@ def _maybe_update_best_policy(
     evaluation_progress_m: float | None = None,
     evaluation_results: dict[str, object] | None = None,
     min_evaluation_progress_m: float = 0.0,
+    max_evaluation_off_track: int | None = None,
 ) -> bool:
     if not policy_path.is_file():
         return False
@@ -597,6 +911,11 @@ def _maybe_update_best_policy(
             evaluation_progress_m,
             evaluation_results,
         )
+        if max_evaluation_off_track is not None and (
+            candidate_quality.off_track is None
+            or candidate_quality.off_track > max_evaluation_off_track
+        ):
+            return False
         previous_quality = _policy_best_quality(best_policy_path)
         if previous_quality is not None and not _quality_is_better(
             candidate_quality,
@@ -627,6 +946,10 @@ def _maybe_update_best_policy(
                 "best_evaluation_avg_speed": candidate_quality.avg_speed,
             }
         )
+        if max_evaluation_off_track is not None:
+            metadata["best_evaluation_max_off_track_gate"] = (
+                max_evaluation_off_track
+            )
         if candidate_quality.avg_speed is not None:
             metadata["best_evaluation_avg_speed_kmh"] = (
                 candidate_quality.avg_speed * 50.0
@@ -653,6 +976,16 @@ def _maybe_update_best_policy(
                     ),
                 }
             )
+            evaluation_repeats = _optional_int(
+                evaluation_results.get("evaluation_repeats")
+            )
+            completed_repeats = _optional_int(
+                evaluation_results.get("evaluation_completed_repeats")
+            )
+            if evaluation_repeats is not None:
+                metadata["best_evaluation_repeats"] = evaluation_repeats
+            if completed_repeats is not None:
+                metadata["best_evaluation_completed_repeats"] = completed_repeats
 
     if evaluation_progress_m is None and previous_best is not None and score_m <= previous_best:
         return False
@@ -697,10 +1030,20 @@ def _annotate_policy(path: Path, **metadata: object) -> None:
         return
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload.update(metadata)
-    path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    _write_policy_payload(path, payload)
+
+
+def _write_policy_payload(path: Path, payload: dict[str, object]) -> None:
+    temp_path = path.with_name(f"{path.name}.tmp")
+    try:
+        temp_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        temp_path.replace(path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def _policy_best_progress(path: Path) -> float | None:
@@ -859,6 +1202,18 @@ def _optional_int(value: object) -> int | None:
         return None
 
 
+def _median_float(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(median(values))
+
+
+def _median_int(values: list[int]) -> int:
+    if not values:
+        return 0
+    return int(round(float(median(values))))
+
+
 def _scaled_speed_kmh(value: object) -> float | None:
     speed = _optional_float(value)
     if speed is None:
@@ -888,14 +1243,23 @@ def _best_policy_summary(path: Path) -> str:
         lap_time = _optional_float(payload.get("best_evaluation_lap_time"))
         off_track = _optional_int(payload.get("best_evaluation_off_track"))
         avg_speed = _optional_float(payload.get("best_evaluation_avg_speed_kmh"))
+        repeats = _optional_int(payload.get("best_evaluation_repeats"))
+        completed_repeats = _optional_int(
+            payload.get("best_evaluation_completed_repeats")
+        )
         lap_text = "" if laps is None else f" | laps={laps}"
         lap_time_text = "" if lap_time is None else f" | lap={lap_time:.3f}s"
         off_track_text = "" if off_track is None else f" | off_track={off_track}"
         avg_speed_text = "" if avg_speed is None else f" | avg={avg_speed:.1f}km/h"
+        repeat_text = (
+            ""
+            if repeats is None
+            else f" | evals={completed_repeats or 0}/{repeats}"
+        )
         return (
             f"best_eval_progress={evaluation_progress:.0f}m "
             f"({evaluation_percent:.1f}%){lap_text}{lap_time_text}"
-            f"{off_track_text}{avg_speed_text}{training_text} | "
+            f"{off_track_text}{avg_speed_text}{repeat_text}{training_text} | "
             f"q_values={len(payload.get('q_values', {}))} | "
             f"trained_steps={payload.get('steps_trained')}"
         )
