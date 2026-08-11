@@ -62,11 +62,26 @@ class DynaQAgentTests(unittest.TestCase):
             finalised_agent = DynaQFinalisedAgent(seed=999, policy_path=policy_path)
 
         self.assertEqual(finalised_agent.epsilon, 0.0)
+        self.assertEqual(finalised_agent.seed, 999)
         self.assertFalse(finalised_agent.learning_enabled)
         self.assertAlmostEqual(
             finalised_agent.q_value(state, 3),
             learning_agent.q_value(state, 3),
         )
+
+    def test_finalised_agent_uses_saved_policy_seed_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "policy.json"
+            learning_agent = DynaQLearningAgent(
+                seed=456,
+                policy_path=policy_path,
+                load_existing=False,
+            )
+            learning_agent.save(policy_path)
+
+            finalised_agent = DynaQFinalisedAgent(policy_path=policy_path)
+
+        self.assertEqual(finalised_agent.seed, 456)
 
     def test_finalised_agent_reports_missing_policy(self):
         with tempfile.TemporaryDirectory() as directory:

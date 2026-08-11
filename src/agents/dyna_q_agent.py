@@ -139,6 +139,7 @@ class DynaQBaseAgent:
         finalised: bool = False,
     ) -> None:
         self.seed = seed if seed is not None else secrets.randbits(32)
+        self._explicit_seed = seed is not None
         self.policy_path = Path(policy_path or DEFAULT_LATEST_POLICY_PATH)
         self.load_existing = False
         self.save_policy = save_policy
@@ -813,6 +814,11 @@ class DynaQBaseAgent:
             str(key): float(value)
             for key, value in dict(payload.get("q_values", {})).items()
         }
+        if self.finalised and not self._explicit_seed:
+            saved_seed = payload.get("seed")
+            if isinstance(saved_seed, int):
+                self.seed = saved_seed
+                self._random.seed(self.seed)
         self.model = {}
         for key, value in dict(payload.get("model", {})).items():
             if not isinstance(value, Mapping):

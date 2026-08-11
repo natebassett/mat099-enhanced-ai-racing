@@ -62,6 +62,15 @@ def main() -> int:
     parser.add_argument("--track", default=DEFAULT_TRACK_ID)
     parser.add_argument("--track-category", default=DEFAULT_TRACK_CATEGORY)
     parser.add_argument("--car", default=DEFAULT_CAR_ID)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "Optional finalised-agent tie-break seed. By default the evaluator "
+            "uses the seed stored in the policy file."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
         "--no-save-telemetry",
@@ -112,6 +121,7 @@ def main() -> int:
         track=args.track,
         track_category=args.track_category,
         car=args.car,
+        seed=args.seed,
     )
     summary = _evaluation_summary(args.policy_path, args.track, results)
     print(_summary_text(summary))
@@ -164,6 +174,7 @@ def _run_evaluation(
     track: str,
     track_category: str,
     car: str,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     from runner.torcs_runner import TorcsRunner  # noqa: PLC0415
 
@@ -178,7 +189,7 @@ def _run_evaluation(
             runner.launch()
             runner.connect()
             runner.load_track(track)
-            agent = DynaQFinalisedAgent(policy_path=policy_path)
+            agent = DynaQFinalisedAgent(policy_path=policy_path, seed=seed)
             return runner.run(agent)
         finally:
             runner.shutdown()
