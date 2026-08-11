@@ -77,7 +77,7 @@ class TrainDynaQPolicyTests(unittest.TestCase):
 
         self.assertEqual(progress, 450.0)
 
-    def test_repeated_evaluation_aggregate_requires_every_run_to_finish_lap(self):
+    def test_repeated_evaluation_aggregate_records_partial_completion(self):
         aggregate = train_dyna_q_policy._aggregate_evaluation_results(
             [
                 {
@@ -102,11 +102,13 @@ class TrainDynaQPolicyTests(unittest.TestCase):
             track_length_m=1000.0,
         )
 
-        self.assertEqual(aggregate["laps_completed"], 0)
+        self.assertEqual(aggregate["laps_completed"], 1)
         self.assertEqual(aggregate["evaluation_repeats"], 2)
         self.assertEqual(aggregate["evaluation_completed_repeats"], 1)
-        self.assertEqual(aggregate["evaluation_progress_m"], 620.0)
-        self.assertIsNone(aggregate["best_lap_time_seconds"])
+        self.assertEqual(aggregate["evaluation_min_progress_m"], 620.0)
+        self.assertEqual(aggregate["evaluation_max_progress_m"], 1000.0)
+        self.assertEqual(aggregate["evaluation_progress_m"], 810.0)
+        self.assertEqual(aggregate["best_lap_time_seconds"], 330.0)
 
     def test_repeated_evaluation_aggregate_uses_stable_medians(self):
         aggregate = train_dyna_q_policy._aggregate_evaluation_results(
@@ -304,6 +306,36 @@ class TrainDynaQPolicyTests(unittest.TestCase):
                     "avg_speed": 0.72,
                 },
                 max_evaluation_off_track=150,
+            )
+
+        self.assertFalse(updated)
+        self.assertFalse(best_path.exists())
+
+    def test_evaluation_gate_respects_minimum_completed_repeats(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "latest.json"
+            best_path = Path(directory) / "best.json"
+            policy_path.write_text(
+                json.dumps({"algorithm": "dyna_q", "q_values": {"candidate": 1}}),
+                encoding="utf-8",
+            )
+
+            updated = train_dyna_q_policy._maybe_update_best_policy(
+                policy_path,
+                best_path,
+                2843.0,
+                evaluation_progress_m=2843.0,
+                evaluation_results={
+                    "termination_reason": "repeat_evaluations",
+                    "steps": 16000,
+                    "laps_completed": 0,
+                    "best_lap_time_seconds": None,
+                    "off_track": 80,
+                    "avg_speed": 0.72,
+                    "evaluation_repeats": 3,
+                    "evaluation_completed_repeats": 0,
+                },
+                min_evaluation_completions=1,
             )
 
         self.assertFalse(updated)
@@ -677,6 +709,94 @@ class TrainDynaQPolicyTests(unittest.TestCase):
 
         self.assertEqual(payload, {"algorithm": "dyna_q", "new": True})
         self.assertFalse(policy_path.with_name(f"{policy_path.name}.tmp").exists())
+
+    def test_auto_promote_final_archives_old_final_and_syncs_latest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            best_path = root / "best.json"
+            final_path = root / "final.json"
+            latest_path = root / "latest.json"
+            archive_dir = root / "archive"
+            best_path.write_text(
+                json.dumps(
+                    {
+                        "algorithm": "dyna_q",
+                        "q_values": {"best": 1},
+                        "best_evaluation_progress_m": 2843.0,
+                        "best_evaluation_laps": 1,
+                        "best_evaluation_lap_time": 268.0,
+                        "best_evaluation_off_track": 24,
+                        "best_evaluation_avg_speed": 0.80,
+                        "best_evaluation_repeats": 3,
+                        "best_evaluation_completed_repeats": 3,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            final_path.write_text(
+                json.dumps(
+                    {
+                        "algorithm": "dyna_q",
+                        "q_values": {"final": 2},
+                        "best_evaluation_progress_m": 2843.0,
+                        "best_evaluation_laps": 1,
+                        "best_evaluation_lap_time": 316.0,
+                        "best_evaluation_off_track": 194,
+                        "best_evaluation_avg_speed": 0.68,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            decision = train_dyna_q_policy._auto_promote_final_policy(
+                best_policy_path=best_path,
+                final_policy_path=final_path,
+                latest_policy_path=latest_path,
+                archive_dir=archive_dir,
+                archive_existing=True,
+            )
+            final_payload = json.loads(final_path.read_text(encoding="utf-8"))
+            latest_payload = json.loads(latest_path.read_text(encoding="utf-8"))
+            archives = list(archive_dir.glob("*.json"))
+
+        self.assertTrue(decision.promoted)
+        self.assertEqual(decision.confidence, "high")
+        self.assertEqual(final_payload["q_values"], {"best": 1})
+        self.assertEqual(final_payload["checkpoint_type"], "final")
+        self.assertEqual(latest_payload["q_values"], {"best": 1})
+        self.assertEqual(latest_payload["checkpoint_type"], "latest")
+        self.assertEqual(len(archives), 1)
+
+    def test_auto_promote_final_rejects_candidate_without_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            best_path = root / "best.json"
+            final_path = root / "final.json"
+            latest_path = root / "latest.json"
+            best_path.write_text(
+                json.dumps(
+                    {
+                        "algorithm": "dyna_q",
+                        "q_values": {"candidate": 1},
+                        "best_evaluation_progress_m": 2843.0,
+                        "best_evaluation_laps": 0,
+                        "best_evaluation_off_track": 12,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            decision = train_dyna_q_policy._auto_promote_final_policy(
+                best_policy_path=best_path,
+                final_policy_path=final_path,
+                latest_policy_path=latest_path,
+                archive_dir=root / "archive",
+                archive_existing=True,
+            )
+
+        self.assertFalse(decision.promoted)
+        self.assertFalse(final_path.exists())
+        self.assertFalse(latest_path.exists())
 
 
 if __name__ == "__main__":

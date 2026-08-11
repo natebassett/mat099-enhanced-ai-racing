@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager, redirect_stdout
+from datetime import datetime
 from io import StringIO
 import json
 import shutil
@@ -36,6 +37,7 @@ VISIBLE_EPISODE_ROWS = 8
 DEFAULT_PREVIOUS_POLICY_PATH = DEFAULT_LATEST_POLICY_PATH.with_name(
     "dyna_q_g_track_3_previous.json"
 )
+DEFAULT_POLICY_ARCHIVE_DIR = DEFAULT_LATEST_POLICY_PATH.parent / "archive"
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,18 @@ class PolicyQuality:
     off_track: int | None
     avg_speed: float | None
     progress_m: float
+    evaluation_repeats: int | None = None
+    completed_repeats: int | None = None
+
+
+@dataclass(frozen=True)
+class FinalPromotionDecision:
+    promoted: bool
+    confidence: str
+    reason: str
+    previous_final: PolicyQuality | None
+    candidate: PolicyQuality | None
+    archive_path: Path | None = None
 
 
 def main() -> int:
@@ -157,6 +171,43 @@ def main() -> int:
             "evaluation-gated best checkpoint can be promoted."
         ),
     )
+    parser.add_argument(
+        "--best-evaluation-min-completions",
+        type=int,
+        default=1,
+        help=(
+            "Minimum completed greedy evaluation laps required before an "
+            "evaluation-gated best checkpoint can be promoted. Use 1 to allow "
+            "breakthrough candidates while still rejecting policies that never "
+            "finish the map."
+        ),
+    )
+    parser.add_argument(
+        "--auto-promote-final",
+        action="store_true",
+        help=(
+            "After training, compare best against the current final policy. If "
+            "best is better, archive final locally, copy best to final, and sync "
+            "latest to best. Git is never touched."
+        ),
+    )
+    parser.add_argument(
+        "--final-policy-path",
+        type=Path,
+        default=DEFAULT_FINAL_POLICY_PATH,
+        help="Policy file used by --auto-promote-final.",
+    )
+    parser.add_argument(
+        "--policy-archive-dir",
+        type=Path,
+        default=DEFAULT_POLICY_ARCHIVE_DIR,
+        help="Archive directory used before replacing a final policy.",
+    )
+    parser.add_argument(
+        "--no-final-archive",
+        action="store_true",
+        help="Disable archiving the old final policy during auto-promotion.",
+    )
     parser.add_argument("--promote-final", action="store_true")
     args = parser.parse_args()
     if args.from_scratch and args.resume_best:
@@ -174,6 +225,8 @@ def main() -> int:
         and args.best_evaluation_max_off_track < 0
     ):
         parser.error("--best-evaluation-max-off-track cannot be negative")
+    if args.best_evaluation_min_completions < 0:
+        parser.error("--best-evaluation-min-completions cannot be negative")
 
     # gym_torcs/snakeoil reads sys.argv internally and rejects script-level
     # flags such as --from-scratch. Keep only the program name before TORCS
@@ -300,6 +353,9 @@ def main() -> int:
                         evaluation_results=evaluation_results,
                         min_evaluation_progress_m=args.best_evaluation_min_progress,
                         max_evaluation_off_track=args.best_evaluation_max_off_track,
+                        min_evaluation_completions=(
+                            args.best_evaluation_min_completions
+                        ),
                     )
                 console.render(
                     summaries,
@@ -322,6 +378,17 @@ def main() -> int:
         print(f"Learning totals: {_policy_summary(args.policy_path)}")
     if not args.no_checkpoints and args.best_policy_path.is_file():
         print(f"Best checkpoint: {args.best_policy_path} | {_best_policy_summary(args.best_policy_path)}")
+
+    if args.auto_promote_final:
+        decision = _auto_promote_final_policy(
+            best_policy_path=args.best_policy_path,
+            final_policy_path=args.final_policy_path,
+            latest_policy_path=args.policy_path,
+            archive_dir=args.policy_archive_dir,
+            archive_existing=not args.no_final_archive,
+        )
+        print()
+        print(_final_promotion_summary(decision))
 
     if args.promote_final and args.policy_path.is_file():
         DEFAULT_FINAL_POLICY_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -752,10 +819,33 @@ def _aggregate_evaluation_results(
         max(0, _optional_int(result.get("laps_completed")) or 0)
         for result in results
     ]
-    lap_times = [
-        value
+    completed_results = [
+        result
         for result in results
+        if max(0, _optional_int(result.get("laps_completed")) or 0) > 0
+    ]
+    completed_lap_times = [
+        value
+        for result in completed_results
         for value in [_optional_float(result.get("best_lap_time_seconds"))]
+        if value is not None
+    ]
+    completed_off_track_values = [
+        value
+        for result in completed_results
+        for value in [_optional_int(result.get("off_track"))]
+        if value is not None
+    ]
+    completed_avg_speed_values = [
+        value
+        for result in completed_results
+        for value in [_optional_float(result.get("avg_speed"))]
+        if value is not None
+    ]
+    completed_step_values = [
+        value
+        for result in completed_results
+        for value in [_optional_int(result.get("steps"))]
         if value is not None
     ]
     off_track_values = [
@@ -784,13 +874,9 @@ def _aggregate_evaluation_results(
 
     repeat_count = len(results)
     completed_repeats = sum(1 for lap_count in laps if lap_count > 0)
-    repeated_laps = min(laps) if laps else 0
-    lap_time = (
-        _median_float(lap_times)
-        if repeated_laps > 0 and completed_repeats == repeat_count
-        else None
-    )
-    progress_m = min(progresses) if progresses else 0.0
+    repeated_laps = 1 if completed_repeats > 0 else 0
+    lap_time = _median_float(completed_lap_times)
+    progress_m = _median_float(progresses) or 0.0
     reason = (
         reasons[0]
         if reasons and all(reason == reasons[0] for reason in reasons)
@@ -799,12 +885,15 @@ def _aggregate_evaluation_results(
 
     return {
         "termination_reason": reason,
-        "steps": _median_int(step_values),
+        "steps": _median_int(completed_step_values or step_values),
         "laps_completed": repeated_laps,
         "best_lap_time_seconds": lap_time,
-        "off_track": _median_int(off_track_values),
-        "avg_speed": _median_float(avg_speed_values),
+        "off_track": _median_int(completed_off_track_values or off_track_values),
+        "avg_speed": _median_float(completed_avg_speed_values or avg_speed_values),
         "evaluation_progress_m": progress_m,
+        "evaluation_min_progress_m": min(progresses) if progresses else 0.0,
+        "evaluation_max_progress_m": max(progresses) if progresses else 0.0,
+        "evaluation_median_progress_m": progress_m,
         "evaluation_repeats": repeat_count,
         "evaluation_completed_repeats": completed_repeats,
     }
@@ -890,6 +979,7 @@ def _maybe_update_best_policy(
     evaluation_results: dict[str, object] | None = None,
     min_evaluation_progress_m: float = 0.0,
     max_evaluation_off_track: int | None = None,
+    min_evaluation_completions: int = 0,
 ) -> bool:
     if not policy_path.is_file():
         return False
@@ -911,6 +1001,16 @@ def _maybe_update_best_policy(
             evaluation_progress_m,
             evaluation_results,
         )
+        if (
+            candidate_quality.completed_repeats is not None
+            and candidate_quality.completed_repeats < min_evaluation_completions
+        ):
+            return False
+        if (
+            candidate_quality.completed_repeats is None
+            and candidate_quality.completed_laps < min_evaluation_completions
+        ):
+            return False
         if max_evaluation_off_track is not None and (
             candidate_quality.off_track is None
             or candidate_quality.off_track > max_evaluation_off_track
@@ -950,6 +1050,10 @@ def _maybe_update_best_policy(
             metadata["best_evaluation_max_off_track_gate"] = (
                 max_evaluation_off_track
             )
+        if min_evaluation_completions:
+            metadata["best_evaluation_min_completions_gate"] = (
+                min_evaluation_completions
+            )
         if candidate_quality.avg_speed is not None:
             metadata["best_evaluation_avg_speed_kmh"] = (
                 candidate_quality.avg_speed * 50.0
@@ -986,6 +1090,21 @@ def _maybe_update_best_policy(
                 metadata["best_evaluation_repeats"] = evaluation_repeats
             if completed_repeats is not None:
                 metadata["best_evaluation_completed_repeats"] = completed_repeats
+            min_progress = _optional_float(
+                evaluation_results.get("evaluation_min_progress_m")
+            )
+            max_progress = _optional_float(
+                evaluation_results.get("evaluation_max_progress_m")
+            )
+            median_progress = _optional_float(
+                evaluation_results.get("evaluation_median_progress_m")
+            )
+            if min_progress is not None:
+                metadata["best_evaluation_min_progress_m"] = min_progress
+            if max_progress is not None:
+                metadata["best_evaluation_max_progress_m"] = max_progress
+            if median_progress is not None:
+                metadata["best_evaluation_median_progress_m"] = median_progress
 
     if evaluation_progress_m is None and previous_best is not None and score_m <= previous_best:
         return False
@@ -994,6 +1113,150 @@ def _maybe_update_best_policy(
     shutil.copyfile(policy_path, best_policy_path)
     _annotate_policy(best_policy_path, **metadata)
     return True
+
+
+def _auto_promote_final_policy(
+    *,
+    best_policy_path: Path,
+    final_policy_path: Path,
+    latest_policy_path: Path,
+    archive_dir: Path,
+    archive_existing: bool,
+) -> FinalPromotionDecision:
+    candidate = _policy_best_quality(best_policy_path)
+    previous_final = _policy_best_quality(final_policy_path)
+    if candidate is None:
+        return FinalPromotionDecision(
+            promoted=False,
+            confidence="none",
+            reason=f"No readable best checkpoint found at {best_policy_path}.",
+            previous_final=previous_final,
+            candidate=None,
+        )
+    if candidate.completed_laps <= 0:
+        return FinalPromotionDecision(
+            promoted=False,
+            confidence="rejected",
+            reason="Best checkpoint has no completed finalised evaluation lap.",
+            previous_final=previous_final,
+            candidate=candidate,
+        )
+    completed_repeats = candidate.completed_repeats
+    if completed_repeats is not None and completed_repeats <= 0:
+        return FinalPromotionDecision(
+            promoted=False,
+            confidence="rejected",
+            reason="Best checkpoint completed 0 evaluation repeats.",
+            previous_final=previous_final,
+            candidate=candidate,
+        )
+
+    if previous_final is not None and not _quality_is_better(
+        candidate,
+        previous_final,
+    ):
+        return FinalPromotionDecision(
+            promoted=False,
+            confidence="rejected",
+            reason="Best checkpoint does not beat the current final policy.",
+            previous_final=previous_final,
+            candidate=candidate,
+        )
+
+    archive_path = None
+    if archive_existing and final_policy_path.is_file():
+        archive_path = _archive_policy(final_policy_path, archive_dir)
+
+    final_policy_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(best_policy_path, final_policy_path)
+    _annotate_policy(
+        final_policy_path,
+        checkpoint_type="final",
+        promoted_from_best=str(best_policy_path),
+    )
+
+    latest_policy_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(best_policy_path, latest_policy_path)
+    _annotate_policy(
+        latest_policy_path,
+        checkpoint_type="latest",
+        synced_from_best_after_final_promotion=str(best_policy_path),
+    )
+
+    return FinalPromotionDecision(
+        promoted=True,
+        confidence=_promotion_confidence(candidate),
+        reason="Best checkpoint beats the current final policy.",
+        previous_final=previous_final,
+        candidate=candidate,
+        archive_path=archive_path,
+    )
+
+
+def _archive_policy(path: Path, archive_dir: Path) -> Path:
+    quality = _policy_best_quality(path)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if quality is None:
+        metrics = "unknown"
+    else:
+        lap = "nolap" if quality.best_lap is None else f"{quality.best_lap:.0f}s"
+        off = "offna" if quality.off_track is None else f"{quality.off_track}off"
+        metrics = f"{lap}_{off}"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = archive_dir / f"{path.stem}_{metrics}_{timestamp}{path.suffix}"
+    shutil.copyfile(path, archive_path)
+    _annotate_policy(
+        archive_path,
+        checkpoint_type="archived_final",
+        archived_from=str(path),
+    )
+    return archive_path
+
+
+def _promotion_confidence(candidate: PolicyQuality) -> str:
+    repeats = candidate.evaluation_repeats
+    completed = candidate.completed_repeats
+    if repeats is None or completed is None:
+        return "single-evaluation"
+    if completed >= repeats:
+        return "high"
+    if completed >= max(1, repeats - 1):
+        return "medium"
+    return "breakthrough"
+
+
+def _final_promotion_summary(decision: FinalPromotionDecision) -> str:
+    lines = [
+        "Final policy decision:",
+        f"Previous final: {_quality_summary(decision.previous_final)}",
+        f"Candidate best: {_quality_summary(decision.candidate)}",
+        f"Decision: {'promoted' if decision.promoted else 'rejected'}",
+        f"Confidence: {decision.confidence}",
+        f"Reason: {decision.reason}",
+    ]
+    if decision.archive_path is not None:
+        lines.append(f"Archived previous final: {decision.archive_path}")
+    lines.append("Git: unchanged; commit/push manually when you are ready.")
+    return "\n".join(lines)
+
+
+def _quality_summary(quality: PolicyQuality | None) -> str:
+    if quality is None:
+        return "--"
+    repeats = ""
+    if quality.evaluation_repeats is not None:
+        repeats = (
+            f" | evals={quality.completed_repeats or 0}/"
+            f"{quality.evaluation_repeats}"
+        )
+    avg_speed = _scaled_speed_kmh(quality.avg_speed)
+    avg_text = "" if avg_speed is None else f" | avg={avg_speed:.1f}km/h"
+    lap_text = "--" if quality.best_lap is None else f"{quality.best_lap:.3f}s"
+    off_text = "--" if quality.off_track is None else str(quality.off_track)
+    return (
+        f"lap={lap_text} | off_track={off_text} | "
+        f"progress={quality.progress_m:.0f}m{avg_text}{repeats}"
+    )
 
 
 def _resume_best_policy(
@@ -1078,12 +1341,16 @@ def _evaluation_quality(
             avg_speed=None,
             progress_m=progress_m,
         )
+    evaluation_repeats = _optional_int(results.get("evaluation_repeats"))
+    completed_repeats = _optional_int(results.get("evaluation_completed_repeats"))
     return PolicyQuality(
         completed_laps=max(0, _optional_int(results.get("laps_completed")) or 0),
         best_lap=_optional_float(results.get("best_lap_time_seconds")),
         off_track=_optional_int(results.get("off_track")),
         avg_speed=_optional_float(results.get("avg_speed")),
         progress_m=progress_m,
+        evaluation_repeats=evaluation_repeats,
+        completed_repeats=completed_repeats,
     )
 
 
@@ -1110,6 +1377,10 @@ def _policy_best_quality(path: Path) -> PolicyQuality | None:
         off_track=_optional_int(payload.get("best_evaluation_off_track")),
         avg_speed=_optional_float(payload.get("best_evaluation_avg_speed")),
         progress_m=progress_m,
+        evaluation_repeats=_optional_int(payload.get("best_evaluation_repeats")),
+        completed_repeats=_optional_int(
+            payload.get("best_evaluation_completed_repeats")
+        ),
     )
 
 
