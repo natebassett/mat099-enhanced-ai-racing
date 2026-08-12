@@ -1,124 +1,203 @@
 # MAT099 Enhanced AI Racing
 
-**Status:** Dissertation research codebase  
-**Primary platform:** Windows desktop  
-**Simulator:** TORCS, integrated through a local `gym_torcs` wrapper
+**An AI racing research and learning platform for creating, testing, comparing, and explaining autonomous driving agents in TORCS.**
 
-MAT099 Enhanced AI Racing is a Python-based research project that connects AI
-driving agents to TORCS, records race telemetry, and provides tooling for
-training, evaluating, and reviewing autonomous racing behaviour.
+MAT099 Enhanced AI Racing is my dissertation project. It combines autonomous
+racing agent development with an educational interface for understanding how AI
+agents behave.
 
-The repository is maintained as a solo dissertation project, but it is organised
-like a small research software codebase: the implementation, experiment scripts,
-tests, generated artefact locations, and simulator integration are kept in one
-place so that the work can be inspected and reproduced.
+The project allows different types of driving agents to be created, tested, and
+compared in TORCS, including rule-based agents, racing-line agents, and
+reinforcement learning agents. Alongside the agent development work, the project
+presents telemetry, race behaviour, and evaluation results in a way that helps
+people who are new to AI understand what the agent is doing and why.
 
-## Overview
+The aim is not only to make a car drive around a track. The aim is to research
+different approaches to AI control and present them clearly enough that the
+process can be inspected, explained, and learned from.
 
-The project investigates how different agent strategies perform in a simulated
-racing environment. It includes simple baseline agents, rule-based control,
-map-aware racing-line control, and a Dyna-Q learning agent trained on TORCS
-telemetry.
+## Project Aim
 
-The application supports two main modes of use:
+This project has two connected goals:
 
-- A desktop GUI for selecting agents, running races, reviewing telemetry, and
-  comparing saved runs.
-- Command-line scripts for training Dyna-Q policies, evaluating saved policies,
-  generating racing lines, and replaying telemetry offline.
+1. **Agent development and research**
 
-## Key Features
+   Build autonomous driving agents that can control a car in TORCS, then compare
+   how different AI approaches perform around a track.
 
-- TORCS launch and SCR socket integration from Python.
-- PySide6 desktop dashboard for live runs, run history, telemetry review, agent
-  explanation, and racing-line visualisation.
-- Multiple driving agents:
-  - random baseline agent
-  - rule-based anti-spin agent
-  - map-aware racing-line agent
-  - Dyna-Q learning agent
-  - finalised Dyna-Q evaluation agent
-- SQLite-backed storage for race summaries, metrics, and telemetry samples.
-- Training and evaluation workflows for saved Dyna-Q policies.
-- Racing-line generation and offline telemetry replay tools.
-- Unit tests covering agents, telemetry models, storage, runner startup logic,
-  map-aware tools, and training/evaluation helpers.
+2. **AI learning and explanation**
 
-## System Architecture
+   Present agent behaviour through a GUI, telemetry, explanations, and comparison
+   tools so that readers who are unfamiliar with AI can understand the main
+   concepts behind autonomous decision-making.
+
+In simple terms, the project asks:
+
+```text
+How can autonomous racing agents be built, tested, compared, and explained in a
+way that supports both dissertation research and AI learning?
+```
+
+## Research Focus
+
+The dissertation investigates how different agent strategies can be used for
+autonomous racing.
+
+The current project focuses on:
+
+- **Rule-based control**  
+  Agents that use hand-written driving rules, such as steering correction,
+  speed control, braking rules, and anti-spin behaviour.
+
+- **Map-aware and racing-line control**  
+  Agents that use track information and a planned racing line to make more
+  informed driving decisions.
+
+- **Reinforcement learning**  
+  A Dyna-Q learning agent that learns from repeated interaction with TORCS and
+  saves a policy for later evaluation.
+
+- **Deep reinforcement learning as an extension area**  
+  The project structure is intended to support future DRL work, where neural
+  networks could be used to learn driving behaviour from state, reward, and
+  telemetry data.
+
+The project compares these approaches using measurable race outputs such as
+progress, lap completion, speed, off-track events, crashes, rewards, and
+telemetry patterns.
+
+## Educational Focus
+
+A second purpose of the project is to make AI behaviour easier to understand.
+Instead of only showing final scores, the project records and displays the
+decision-making process behind a race.
+
+The educational side of the project is designed to help learners understand:
+
+- what an AI agent is
+- how an agent receives information from an environment
+- how sensor data becomes an action
+- how rule-based logic differs from learning-based logic
+- what reinforcement learning means in a practical racing example
+- how rewards influence future decisions
+- why telemetry is useful for explaining agent behaviour
+- how trained policies can be evaluated after learning
+
+The racing environment makes these ideas easier to see because decisions have
+visible consequences: the car can stay on track, take a corner well, spin,
+crash, slow down, recover, or complete a lap.
+
+## How The System Works
+
+At a high level, the project follows an agent-environment loop:
+
+1. TORCS runs the racing simulation.
+2. Python receives live sensor data from the car.
+3. A selected agent analyses the current situation.
+4. The agent chooses steering, throttle, braking, and gear actions.
+5. TORCS applies the action and updates the simulation.
+6. The project records telemetry and race results.
+7. The GUI and scripts allow the results to be reviewed and compared.
 
 ```mermaid
 flowchart LR
-    GUI["PySide6 GUI"] --> Worker["Race worker"]
-    Console["Console menu"] --> Runner["TORCS runner"]
-    Scripts["Training and evaluation scripts"] --> Runner
-    Worker --> Runner
-    Runner --> Agents["Driving agents"]
-    Agents --> Runner
-    Runner --> Adapter["gym_torcs / SCR socket"]
-    Adapter --> TORCS["TORCS simulator"]
-    Runner --> Storage["SQLite race repository"]
-    Runner --> Telemetry["Telemetry samples"]
-    Telemetry --> Review["GUI review and comparison"]
-    Scripts --> Policies["Dyna-Q policy files"]
+    TORCS["TORCS simulator"] --> Sensors["Sensor data"]
+    Sensors --> Agent["Driving agent"]
+    Agent --> Action["Steer / throttle / brake / gear"]
+    Action --> TORCS
+    Sensors --> Telemetry["Telemetry recording"]
+    Telemetry --> GUI["GUI explanation and review"]
+    Telemetry --> Evaluation["Evaluation scripts"]
+    Training["Training scripts"] --> Agent
+    Agent --> Policy["Saved policy files"]
+    Policy --> Evaluation
 ```
+
+This loop is the core AI idea behind the project: the agent observes the
+environment, acts, receives feedback, and can be evaluated or improved.
+
+## Agents Included
+
+| Agent | Purpose |
+| --- | --- |
+| Random Agent | A simple baseline that demonstrates uncontrolled or weak decision-making. |
+| Rule-Based Anti-Spin Agent | Uses hand-written rules to stabilise the car and reduce poor driving behaviour. |
+| Map-Aware Racing-Line Agent | Uses track and racing-line information to guide the car around the circuit. |
+| Dyna-Q Learning Agent | Learns from experience using reinforcement learning and saves a policy. |
+| Dyna-Q Finalised Agent | Loads a trained policy and drives without further learning or exploration. |
+
+These agents allow the project to show a progression from simple behaviour to
+more structured and learning-based decision-making.
+
+## What The Interface Helps Explain
+
+The GUI is not only a control panel. It is also part of the educational design
+of the project.
+
+It is used to:
+
+- select and run different agents
+- view live telemetry while the agent drives
+- review saved race runs
+- compare different agents or runs
+- inspect racing-line behaviour
+- show explanations for agent decisions and state
+- make the learning process easier to follow visually
+
+This is important because AI systems can be difficult to understand if only the
+code or final score is shown. The interface helps connect the technical logic to
+observable behaviour.
+
+## Key Concepts
+
+| Concept | Meaning in this project |
+| --- | --- |
+| Agent | The Python driver that decides how the car should move. |
+| Environment | The TORCS racing simulator. |
+| Sensor data | Information received from TORCS, such as speed, angle, track position, and road sensors. |
+| Action | A control decision sent back to TORCS, such as steering or braking. |
+| Telemetry | Recorded data that shows what happened during the race. |
+| Reward | A score used by a learning agent to judge whether behaviour was useful. |
+| Policy | Saved decision-making knowledge used by the Dyna-Q agent. |
+| Training | Repeated runs where a learning agent updates its policy. |
+| Evaluation | Testing an agent or saved policy and measuring the result. |
+| Racing line | A planned route around the track used to guide driving decisions. |
 
 ## Repository Structure
 
-| Path | Purpose |
+| Path | What it contains |
 | --- | --- |
-| `src/agents/` | Driving agents and policy logic. |
-| `src/gui/` | PySide6 desktop application, telemetry views, comparison tools, and project discovery. |
-| `src/runner/` | TORCS process control, SCR connection handling, lap tracking, and race execution. |
-| `src/racing_line/` | Track map parsing, racing-line optimisation, and control helpers. |
-| `src/storage/` | SQLite repository and database migrations for race results and telemetry. |
-| `scripts/` | Training, evaluation, racing-line generation, and telemetry replay utilities. |
-| `tests/` | Unit tests for core project behaviour. |
-| `data/policies/` | Saved Dyna-Q policy checkpoints. |
-| `data/racing_lines/` | Saved racing-line definitions and reference visual output. |
-| `data/generated/` | Runtime-generated database and telemetry files. |
-| `data/evaluation/` | Evaluation outputs produced by policy evaluation scripts. |
-| `torcs/` | Local Windows TORCS installation used by the project. |
-| `torcs-wrapper/gym_torcs/` | Local TORCS gym/SCR wrapper used by the runner. |
+| `src/agents/` | Driving agents and decision-making logic. |
+| `src/gui/` | Desktop application for running, reviewing, comparing, and explaining races. |
+| `src/runner/` | TORCS launch, connection, lap tracking, and race execution code. |
+| `src/racing_line/` | Track map parsing, racing-line generation, and control helpers. |
+| `src/storage/` | SQLite storage for race results, metrics, and telemetry. |
+| `scripts/` | Training, evaluation, plotting, and replay utilities. |
+| `tests/` | Automated tests for the main project components. |
+| `data/policies/` | Saved Dyna-Q policy files. |
+| `data/racing_lines/` | Saved racing-line files and related outputs. |
+| `data/generated/` | Local generated data, including race databases and telemetry files. |
+| `data/evaluation/` | Evaluation outputs from policy testing. |
+| `torcs/` | Local Windows TORCS simulator files used by the project. |
+| `torcs-wrapper/gym_torcs/` | Python wrapper used to communicate with TORCS. |
 
-## Requirements
+## Running The Project
 
-The project is developed against Python 3.12 on Windows. Real TORCS runs require
-the bundled Windows executable at:
+The project is developed for Windows with Python 3.12.
 
-```text
-torcs\wtorcs.exe
-```
-
-Core Python packages used by the current codebase are:
-
-- `numpy`
-- `gym`
-- `PySide6`
-- `pyqtgraph`
-
-The dependency manifest is part of the repository cleanup work. Until it is
-added, install the required packages manually in a virtual environment.
-
-## Setup
-
-Run these commands from the repository root:
+Create and activate a virtual environment:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+```
+
+Install the main Python packages:
+
+```powershell
 python -m pip install --upgrade pip
 python -m pip install numpy gym PySide6 pyqtgraph
 ```
-
-If PowerShell blocks virtual environment activation, allow scripts for the
-current shell session:
-
-```powershell
-Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
-.\.venv\Scripts\Activate.ps1
-```
-
-## Quick Start
 
 Launch the desktop application:
 
@@ -132,122 +211,115 @@ Launch the console menu:
 python src\main.py
 ```
 
-Run the test suite:
+Run the tests:
 
 ```powershell
 python -m unittest discover -s tests
 ```
 
-## Common Workflows
+## Main Commands
 
-Train the Dyna-Q policy for the default `g-track-3` setup:
+Train the Dyna-Q learning agent:
 
 ```powershell
 python scripts\train_dyna_q_policy.py --episodes 5
 ```
 
-Evaluate the best saved Dyna-Q policy without further learning:
+Evaluate a saved Dyna-Q policy:
 
 ```powershell
 python scripts\evaluate_dyna_q_policy.py --policy-path data\policies\dyna_q_g_track_3_best.json
 ```
 
-Generate a racing line for `g-track-3`:
+Generate a racing line for the default track:
 
 ```powershell
 python scripts\generate_racing_line.py torcs\tracks\road\g-track-3\g-track-3.xml data\racing_lines\g-track-3.json --measured-length 2843.0934
 ```
 
-Replay map-aware telemetry through the current controller logic:
+Replay map-aware telemetry without moving TORCS:
 
 ```powershell
 python scripts\replay_map_aware_telemetry.py --input data\generated\map_aware_telemetry.csv --output data\generated\map_aware_replay_eval.csv
 ```
 
-Plot map-aware racing-line tracking from recorded telemetry:
+Plot racing-line tracking from recorded telemetry:
 
 ```powershell
 python scripts\plot_raceline_tracking.py --input data\generated\map_aware_telemetry.csv --output data\generated\map_aware_tracking.svg
 ```
 
+## Recommended Learning Path
+
+For someone new to AI, the project is easiest to understand in this order:
+
+1. Run the GUI.
+2. Watch the Random Agent to see a weak baseline.
+3. Run the Rule-Based Agent and compare the improvement.
+4. Review telemetry to connect behaviour with data.
+5. Run the Map-Aware Agent to see how track knowledge changes behaviour.
+6. Train or evaluate the Dyna-Q agent.
+7. Compare saved runs and observe how learning-based behaviour differs from
+   hand-written rules.
+
+This path moves from visible behaviour to the underlying AI concepts.
+
 ## TORCS Notes
 
-The runner starts the bundled Windows TORCS executable and attempts to advance
-the simulator into Practice mode automatically. If automatic startup does not
-open the SCR socket, TORCS remains open and the runner waits while Practice mode
-is started manually.
-
-The default SCR UDP port used by the project is `3001`.
-
-## Data and Outputs
-
-Race runs are stored in SQLite when the application records results:
+TORCS must be available at:
 
 ```text
-data\generated\race_results.db
+torcs\wtorcs.exe
 ```
 
-Dyna-Q policy checkpoints are stored under:
+The Python runner attempts to start TORCS and open a Practice race
+automatically. If that does not happen, TORCS can be started manually from the
+simulator menu while the Python runner waits.
+
+The default TORCS communication port is:
 
 ```text
-data\policies\
+3001
 ```
 
-Evaluation telemetry is written under:
+## Outputs And Results
 
-```text
-data\evaluation\
-```
+| Output | Location |
+| --- | --- |
+| Race database | `data/generated/race_results.db` |
+| Dyna-Q policies | `data/policies/` |
+| Evaluation outputs | `data/evaluation/` |
+| Generated telemetry | `data/generated/` |
+| Racing lines | `data/racing_lines/` |
 
-Map-aware telemetry and replay outputs are written under:
-
-```text
-data\generated\
-```
-
-Generated data should be reviewed before committing. The repository cleanup
-branch will separate durable dissertation artefacts from local run outputs.
-
-## Testing
-
-The tests are written with Python's standard `unittest` framework:
-
-```powershell
-python -m unittest discover -s tests
-```
-
-Some tests exercise offline models and helper functions only. Full live race
-validation still requires a Windows desktop session with TORCS available.
-
-## Project Handbook
-
-This README is the short project entry point. The next documentation artefact
-for the cleanup branch is a dissertation-oriented handbook under `docs/`, with:
-
-- installation notes
-- all repeatable commands
-- troubleshooting guidance
-- experiment and evaluation notes
-- glossary of project terms
-- reproducibility checklist
+Generated files should be reviewed before committing because some are durable
+experiment artefacts and others are temporary local outputs.
 
 ## Troubleshooting
 
-If TORCS does not start, confirm that `torcs\wtorcs.exe` exists and that the
+If TORCS does not open, check that `torcs\wtorcs.exe` exists and that the
 project is being run on Windows.
 
-If the race does not begin automatically, use the TORCS menu to start a Practice
-race while the runner is waiting.
+If the race does not start automatically, open TORCS and start a Practice race
+manually.
 
-If imports fail, confirm that the virtual environment is active and that the
-packages listed in `Requirements` are installed.
+If Python imports fail, check that the virtual environment is active and that
+the required packages are installed.
 
-If run history is empty in the GUI, run at least one race or check whether
-`data\generated\race_results.db` or `latest_race_runs.csv` exists.
+If the GUI shows no run history, run at least one race or check whether
+`data\generated\race_results.db` exists.
+
+If training or evaluation appears slow, remember that TORCS is running a live
+simulation and the agent is making decisions step by step.
 
 ## Dissertation Context
 
-This repository supports the MAT099 dissertation project. Its goal is not to be
-a general-purpose racing simulator package; its purpose is to make the research
-implementation, experimental workflow, and evaluation artefacts clear enough to
-review, reproduce, and extend.
+This repository supports my MAT099 dissertation. It is not intended to be a
+general-purpose racing simulator package. It is a research and learning
+environment for developing autonomous racing agents and presenting their
+behaviour in a way that can be understood by readers with different levels of AI
+experience.
+
+The project is designed to make the relationship between simulation, agent
+logic, reinforcement learning, telemetry, evaluation, and explanation easier to
+see.
