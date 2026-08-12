@@ -183,12 +183,30 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--candidate-min-training-laps",
+        type=int,
+        default=0,
+        help=(
+            "When evaluation gating is enabled, skip the expensive greedy "
+            "evaluation unless the learning episode completed at least this "
+            "many laps. Use 1 when improving an already lap-capable policy."
+        ),
+    )
+    parser.add_argument(
         "--auto-promote-final",
         action="store_true",
         help=(
             "After training, compare best against the current final policy. If "
             "best is better, archive final locally, copy best to final, and sync "
             "latest to best. Git is never touched."
+        ),
+    )
+    parser.add_argument(
+        "--restore-latest-after-rejected-evaluation",
+        action="store_true",
+        help=(
+            "When evaluation gating rejects a candidate, copy the protected "
+            "best checkpoint back to the latest policy before the next episode."
         ),
     )
     parser.add_argument(
@@ -227,6 +245,22 @@ def main() -> int:
         parser.error("--best-evaluation-max-off-track cannot be negative")
     if args.best_evaluation_min_completions < 0:
         parser.error("--best-evaluation-min-completions cannot be negative")
+    if args.candidate_min_training_laps < 0:
+        parser.error("--candidate-min-training-laps cannot be negative")
+    if args.candidate_min_training_laps and not args.gate_best_with_evaluation:
+        parser.error("--candidate-min-training-laps requires --gate-best-with-evaluation")
+    if args.restore_latest_after_rejected_evaluation and args.no_checkpoints:
+        parser.error(
+            "--restore-latest-after-rejected-evaluation requires checkpoints"
+        )
+    if (
+        args.restore_latest_after_rejected_evaluation
+        and not args.gate_best_with_evaluation
+    ):
+        parser.error(
+            "--restore-latest-after-rejected-evaluation requires "
+            "--gate-best-with-evaluation"
+        )
 
     # gym_torcs/snakeoil reads sys.argv internally and rejects script-level
     # flags such as --from-scratch. Keep only the program name before TORCS
@@ -321,42 +355,87 @@ def main() -> int:
                 if not args.no_checkpoints:
                     evaluation_results = None
                     evaluation_progress_m = None
+                    should_update_best = not args.gate_best_with_evaluation
                     if (
                         args.gate_best_with_evaluation
                         and episode % args.best_evaluation_frequency == 0
                     ):
-                        console.render(
-                            summaries,
-                            (
-                                "Evaluating saved policy greedily before best "
-                                f"checkpoint update after episode {episode}..."
+                        if _candidate_training_gate_passed(
+                            summary,
+                            min_training_laps=args.candidate_min_training_laps,
+                        ):
+                            console.render(
+                                summaries,
+                                (
+                                    "Evaluating saved policy greedily before best "
+                                    f"checkpoint update after episode {episode}..."
+                                ),
+                            )
+                            runner, evaluation_results = _run_gated_evaluations(
+                                runner,
+                                policy_path=args.policy_path,
+                                track=args.track,
+                                reconnect_attempts=args.reconnect_attempts,
+                                console=console,
+                                summaries=summaries,
+                                episode=episode,
+                                repeats=args.best_evaluation_repeats,
+                            )
+                            evaluation_progress_m = _results_progress_m(
+                                evaluation_results
+                            )
+                            should_update_best = True
+                        else:
+                            restored = False
+                            if args.restore_latest_after_rejected_evaluation:
+                                restored = _restore_latest_from_best_policy(
+                                    policy_path=args.policy_path,
+                                    best_policy_path=args.best_policy_path,
+                                    episode=episode,
+                                    reason="skipped_incomplete_training_lap",
+                                )
+                            message = (
+                                "Skipped greedy evaluation because the learning "
+                                f"episode completed {summary.laps} lap(s)."
+                            )
+                            if restored:
+                                message += " Restored latest policy from best."
+                            console.render(summaries, message)
+                    if should_update_best:
+                        updated_best = _maybe_update_best_policy(
+                            args.policy_path,
+                            args.best_policy_path,
+                            summary.progress_m,
+                            evaluation_progress_m=evaluation_progress_m,
+                            evaluation_results=evaluation_results,
+                            min_evaluation_progress_m=(
+                                args.best_evaluation_min_progress
+                            ),
+                            max_evaluation_off_track=(
+                                args.best_evaluation_max_off_track
+                            ),
+                            min_evaluation_completions=(
+                                args.best_evaluation_min_completions
                             ),
                         )
-                        runner, evaluation_results = _run_gated_evaluations(
-                            runner,
-                            policy_path=args.policy_path,
-                            track=args.track,
-                            reconnect_attempts=args.reconnect_attempts,
-                            console=console,
-                            summaries=summaries,
-                            episode=episode,
-                            repeats=args.best_evaluation_repeats,
-                        )
-                        evaluation_progress_m = _results_progress_m(
-                            evaluation_results
-                        )
-                    _maybe_update_best_policy(
-                        args.policy_path,
-                        args.best_policy_path,
-                        summary.progress_m,
-                        evaluation_progress_m=evaluation_progress_m,
-                        evaluation_results=evaluation_results,
-                        min_evaluation_progress_m=args.best_evaluation_min_progress,
-                        max_evaluation_off_track=args.best_evaluation_max_off_track,
-                        min_evaluation_completions=(
-                            args.best_evaluation_min_completions
-                        ),
-                    )
+                        if (
+                            args.restore_latest_after_rejected_evaluation
+                            and evaluation_results is not None
+                            and not updated_best
+                        ):
+                            restored = _restore_latest_from_best_policy(
+                                policy_path=args.policy_path,
+                                best_policy_path=args.best_policy_path,
+                                episode=episode,
+                            )
+                            if restored:
+                                console.render(
+                                    summaries,
+                                    (
+                                        "Candidate rejected; restored latest policy "
+                                        f"from best after episode {episode}."
+                                    ),
+                                )
                 console.render(
                     summaries,
                     f"Completed episode {episode}/{episode_total}.",
@@ -1286,6 +1365,53 @@ def _resume_best_policy(
         resumed_from_best=str(best_policy_path),
     )
     return previous_saved
+
+
+def _candidate_training_gate_passed(
+    summary: EpisodeSummary,
+    *,
+    min_training_laps: int,
+) -> bool:
+    return summary.laps >= min_training_laps
+
+
+def _restore_latest_from_best_policy(
+    *,
+    policy_path: Path,
+    best_policy_path: Path,
+    episode: int,
+    reason: str = "rejected_evaluation",
+) -> bool:
+    if not best_policy_path.is_file():
+        return False
+
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(best_policy_path, policy_path)
+    metadata: dict[str, object] = {
+        "checkpoint_type": "latest",
+        "restored_from_best_reason": reason,
+        "restored_from_best_episode": episode,
+    }
+    if reason == "rejected_evaluation":
+        metadata.update(
+            {
+                "restored_from_best_after_rejected_evaluation": str(
+                    best_policy_path
+                ),
+                "restored_after_rejected_evaluation_episode": episode,
+            }
+        )
+    elif reason == "skipped_incomplete_training_lap":
+        metadata.update(
+            {
+                "restored_from_best_after_skipped_evaluation": str(
+                    best_policy_path
+                ),
+                "restored_after_skipped_evaluation_episode": episode,
+            }
+        )
+    _annotate_policy(policy_path, **metadata)
+    return True
 
 
 def _annotate_policy(path: Path, **metadata: object) -> None:

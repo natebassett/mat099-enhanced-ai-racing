@@ -693,6 +693,120 @@ class TrainDynaQPolicyTests(unittest.TestCase):
         self.assertEqual(previous_payload["q_values"], {"old": 1})
         self.assertEqual(previous_payload["checkpoint_type"], "previous")
 
+    def test_candidate_training_gate_can_require_completed_lap(self):
+        failed_summary = train_dyna_q_policy.EpisodeSummary(
+            episode=1,
+            reason="out of bounds",
+            steps=1000,
+            laps=0,
+            best_lap=None,
+            progress_m=334.0,
+            progress_percent=11.7,
+            q_states=10,
+            epsilon=0.004,
+        )
+        completed_summary = train_dyna_q_policy.EpisodeSummary(
+            episode=2,
+            reason="target_laps_completed",
+            steps=14000,
+            laps=1,
+            best_lap=286.0,
+            progress_m=2843.0,
+            progress_percent=100.0,
+            q_states=20,
+            epsilon=0.004,
+        )
+
+        self.assertTrue(
+            train_dyna_q_policy._candidate_training_gate_passed(
+                failed_summary,
+                min_training_laps=0,
+            )
+        )
+        self.assertFalse(
+            train_dyna_q_policy._candidate_training_gate_passed(
+                failed_summary,
+                min_training_laps=1,
+            )
+        )
+        self.assertTrue(
+            train_dyna_q_policy._candidate_training_gate_passed(
+                completed_summary,
+                min_training_laps=1,
+            )
+        )
+
+    def test_restore_latest_from_best_policy_after_rejected_evaluation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "latest.json"
+            best_path = Path(directory) / "best.json"
+            policy_path.write_text(
+                json.dumps({"algorithm": "dyna_q", "q_values": {"drifted": 1}}),
+                encoding="utf-8",
+            )
+            best_path.write_text(
+                json.dumps(
+                    {
+                        "algorithm": "dyna_q",
+                        "best_evaluation_lap_time": 268.0,
+                        "best_evaluation_off_track": 24,
+                        "q_values": {"best": 2},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            restored = train_dyna_q_policy._restore_latest_from_best_policy(
+                policy_path=policy_path,
+                best_policy_path=best_path,
+                episode=7,
+            )
+            latest_payload = json.loads(policy_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(restored)
+        self.assertEqual(latest_payload["q_values"], {"best": 2})
+        self.assertEqual(latest_payload["checkpoint_type"], "latest")
+        self.assertEqual(
+            latest_payload["restored_from_best_after_rejected_evaluation"],
+            str(best_path),
+        )
+        self.assertEqual(
+            latest_payload["restored_after_rejected_evaluation_episode"],
+            7,
+        )
+
+    def test_restore_latest_from_best_policy_after_skipped_evaluation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "latest.json"
+            best_path = Path(directory) / "best.json"
+            policy_path.write_text(
+                json.dumps({"algorithm": "dyna_q", "q_values": {"drifted": 1}}),
+                encoding="utf-8",
+            )
+            best_path.write_text(
+                json.dumps({"algorithm": "dyna_q", "q_values": {"best": 2}}),
+                encoding="utf-8",
+            )
+
+            restored = train_dyna_q_policy._restore_latest_from_best_policy(
+                policy_path=policy_path,
+                best_policy_path=best_path,
+                episode=3,
+                reason="skipped_incomplete_training_lap",
+            )
+            latest_payload = json.loads(policy_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(restored)
+        self.assertEqual(latest_payload["q_values"], {"best": 2})
+        self.assertEqual(
+            latest_payload["restored_from_best_reason"],
+            "skipped_incomplete_training_lap",
+        )
+        self.assertEqual(
+            latest_payload["restored_after_skipped_evaluation_episode"],
+            3,
+        )
+
     def test_policy_payload_write_replaces_file_and_removes_temp(self):
         with tempfile.TemporaryDirectory() as directory:
             policy_path = Path(directory) / "policy.json"
