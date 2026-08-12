@@ -15,6 +15,7 @@ if str(SRC_DIR) not in sys.path:
 from gui.telemetry_model import (  # noqa: E402
     TelemetryHistory,
     TelemetrySnapshot,
+    build_dyna_q_learning_frame,
     build_explanation_frame,
     explain_snapshot,
     explanation_event_key,
@@ -134,6 +135,55 @@ class TelemetryModelTests(unittest.TestCase):
         self.assertIn("track edge", explanation)
         self.assertIn("Braking at 30%", explanation)
         self.assertIn("Steering right", explanation)
+
+    def test_dyna_q_learning_frame_explains_exploration_plainly(self):
+        snapshot = TelemetrySnapshot.from_sample(
+            {
+                "dyna_q_learning_enabled": True,
+                "dyna_q_state": "47,1,1,4,3,3,2",
+                "dyna_q_action_label": "hard right / rotate",
+                "dyna_q_action_source": "explore",
+                "dyna_q_reward": -0.37,
+                "dyna_q_td_error": 0.126,
+                "dyna_q_selected_q": 8.358,
+                "dyna_q_epsilon": 0.035,
+                "dyna_q_q_states": 92432,
+                "dyna_q_model_states": 92432,
+                "dyna_q_real_updates": 298412,
+                "dyna_q_planning_updates": 4774592,
+            }
+        )
+
+        frame = build_dyna_q_learning_frame(snapshot)
+
+        self.assertEqual(frame.status, "Exploring")
+        self.assertEqual(frame.active_loop_step, "Act")
+        self.assertIn("exploration is still allowed", frame.why)
+        self.assertGreaterEqual(frame.maturity_percent, 80)
+        self.assertIn(("Action score", "8.358"), frame.q_table_summary)
+
+    def test_dyna_q_learning_frame_marks_finalised_policy_as_best_known(self):
+        snapshot = TelemetrySnapshot.from_sample(
+            {
+                "dyna_q_finalised": True,
+                "dyna_q_state": "12,2,1,3,2,2,1",
+                "dyna_q_action_label": "straight / maintain",
+                "dyna_q_action_source": "greedy",
+                "dyna_q_selected_q": 12.25,
+                "dyna_q_epsilon": 0.0,
+                "dyna_q_q_states": 86803,
+                "dyna_q_model_states": 86803,
+                "dyna_q_real_updates": 307907,
+                "dyna_q_planning_updates": 4926512,
+            }
+        )
+
+        frame = build_dyna_q_learning_frame(snapshot)
+
+        self.assertEqual(frame.status, "Choosing best-known action")
+        self.assertEqual(frame.active_loop_step, "Act")
+        self.assertIn("saved Q-table", frame.why)
+        self.assertGreaterEqual(frame.maturity_percent, 92)
 
     def test_explanation_entry_is_timestamped_for_scannable_log(self):
         snapshot = TelemetrySnapshot.from_sample(

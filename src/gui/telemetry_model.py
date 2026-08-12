@@ -88,6 +88,19 @@ class ExplanationFrame:
     event: str
 
 
+@dataclass(frozen=True)
+class DynaQLearningFrame:
+    status: str
+    status_detail: str
+    loop_steps: tuple[str, ...]
+    active_loop_step: str
+    why: str
+    q_table_summary: tuple[tuple[str, str], ...]
+    maturity_label: str
+    maturity_percent: int
+    maturity_detail: str
+
+
 class TelemetryHistory:
     def __init__(self, max_points: int = 300) -> None:
         self._snapshots: deque[TelemetrySnapshot] = deque(maxlen=max_points)
@@ -158,6 +171,64 @@ def explain_snapshot(snapshot: TelemetrySnapshot) -> str:
     messages = [frame.headline, *frame.reasons]
 
     return "\n".join(messages)
+
+
+def build_dyna_q_learning_frame(snapshot: TelemetrySnapshot) -> DynaQLearningFrame:
+    loop_steps = (
+        "Observe",
+        "Act",
+        "Reward",
+        "Update Q-table",
+        "Replay memory",
+    )
+    if not _has_dyna_q_stats(snapshot):
+        return DynaQLearningFrame(
+            status="Waiting for Dyna-Q telemetry",
+            status_detail="Start a Dyna-Q agent to watch the learning loop.",
+            loop_steps=loop_steps,
+            active_loop_step="Observe",
+            why="No live Dyna-Q decision has been received yet.",
+            q_table_summary=(("Current state", "--"), ("Action score", "--")),
+            maturity_label="No data",
+            maturity_percent=0,
+            maturity_detail="The agent has not reported a Q-table yet.",
+        )
+
+    source = snapshot.dyna_q_action_source
+    if snapshot.dyna_q_finalised:
+        status = "Choosing best-known action"
+        status_detail = "Finalised mode: exploration and Q-table updates are off."
+        active_step = "Act"
+    elif source == "explore":
+        status = "Exploring"
+        status_detail = "Learning mode: trying an action so the reward can teach it."
+        active_step = "Act"
+    elif snapshot.dyna_q_td_error is not None and abs(snapshot.dyna_q_td_error) >= 0.25:
+        status = "Updating Q-table"
+        status_detail = "The last reward changed what the agent believes about this action."
+        active_step = "Update Q-table"
+    elif (snapshot.dyna_q_planning_updates or 0) > 0:
+        status = "Repeating a remembered situation"
+        status_detail = "Dyna-Q is replaying learned transitions as extra practice."
+        active_step = "Replay memory"
+    else:
+        status = "Choosing best-known action"
+        status_detail = "The current Q-table says this action has the best score."
+        active_step = "Act"
+
+    why = _dyna_q_why_text(snapshot, status)
+    maturity_percent, maturity_label, maturity_detail = _dyna_q_maturity(snapshot)
+    return DynaQLearningFrame(
+        status=status,
+        status_detail=status_detail,
+        loop_steps=loop_steps,
+        active_loop_step=active_step,
+        why=why,
+        q_table_summary=_dyna_q_table_summary(snapshot),
+        maturity_label=maturity_label,
+        maturity_percent=maturity_percent,
+        maturity_detail=maturity_detail,
+    )
 
 
 def build_explanation_frame(snapshot: TelemetrySnapshot) -> ExplanationFrame:
@@ -309,6 +380,105 @@ def _reason_breakdown(snapshot: TelemetrySnapshot) -> list[str]:
         messages.append("Telemetry is steady; no caution reason is active.")
 
     return messages
+
+
+def _has_dyna_q_stats(snapshot: TelemetrySnapshot) -> bool:
+    return (
+        snapshot.dyna_q_state != ""
+        or snapshot.dyna_q_action_label != ""
+        or snapshot.dyna_q_epsilon is not None
+        or snapshot.dyna_q_q_states is not None
+    )
+
+
+def _dyna_q_why_text(snapshot: TelemetrySnapshot, status: str) -> str:
+    action = snapshot.dyna_q_action_label or "this action"
+    score = format_value(snapshot.dyna_q_selected_q, ".3f")
+    reward = format_value(snapshot.dyna_q_reward, ".3f")
+
+    if snapshot.dyna_q_finalised:
+        return (
+            f"It chose '{action}' because the saved Q-table rates it as the "
+            f"best-known action for this situation. Current action score: {score}."
+        )
+    if status == "Exploring":
+        return (
+            f"It chose '{action}' because exploration is still allowed. The reward "
+            f"from this attempt was {reward}, so the Q-table can learn whether "
+            "that choice helped."
+        )
+    if status == "Updating Q-table":
+        return (
+            f"The reward was {reward}. Dyna-Q is moving the score for '{action}' "
+            "toward what actually happened on track."
+        )
+    if status == "Repeating a remembered situation":
+        return (
+            "After learning from the real driving step, Dyna-Q practises stored "
+            "state-action outcomes so useful lessons spread faster."
+        )
+    return (
+        f"It chose '{action}' because that action currently has the strongest "
+        f"Q-table score for this situation: {score}."
+    )
+
+
+def _dyna_q_table_summary(snapshot: TelemetrySnapshot) -> tuple[tuple[str, str], ...]:
+    reward = format_value(snapshot.dyna_q_reward, ".3f")
+    td_error = format_value(snapshot.dyna_q_td_error, ".3f")
+    selected_q = format_value(snapshot.dyna_q_selected_q, ".3f")
+    epsilon = format_value(snapshot.dyna_q_epsilon, ".1%")
+    return (
+        ("Current state", snapshot.dyna_q_state or "--"),
+        ("Chosen action", snapshot.dyna_q_action_label or "--"),
+        ("Action score", selected_q),
+        ("Last reward", reward),
+        ("Learning correction", td_error),
+        ("Explore chance", epsilon),
+        ("Known situations", _format_optional(snapshot.dyna_q_q_states)),
+        ("Learned outcomes", _format_optional(snapshot.dyna_q_model_states)),
+        ("Real experiences", _format_optional(snapshot.dyna_q_real_updates)),
+        ("Replay practice", _format_optional(snapshot.dyna_q_planning_updates)),
+    )
+
+
+def _dyna_q_maturity(snapshot: TelemetrySnapshot) -> tuple[int, str, str]:
+    q_states = max(0, snapshot.dyna_q_q_states or 0)
+    model_states = max(0, snapshot.dyna_q_model_states or 0)
+    real_updates = max(0, snapshot.dyna_q_real_updates or 0)
+    replay_updates = max(0, snapshot.dyna_q_planning_updates or 0)
+    epsilon = snapshot.dyna_q_epsilon
+
+    q_score = min(1.0, q_states / 85000.0) * 34.0
+    model_score = min(1.0, model_states / 85000.0) * 22.0
+    real_score = min(1.0, real_updates / 150000.0) * 12.0
+    replay_score = min(1.0, replay_updates / 3000000.0) * 16.0
+    if epsilon is None:
+        epsilon_score = 0.0
+    else:
+        epsilon_score = (1.0 - min(1.0, max(0.0, epsilon) / 0.24)) * 16.0
+
+    percent = int(round(q_score + model_score + real_score + replay_score + epsilon_score))
+    if snapshot.dyna_q_finalised:
+        percent = max(percent, 92)
+    percent = max(0, min(100, percent))
+
+    if percent < 20:
+        label = "New"
+    elif percent < 45:
+        label = "Exploring"
+    elif percent < 70:
+        label = "Building memory"
+    elif percent < 88:
+        label = "Mostly confident"
+    else:
+        label = "Finalised-ready"
+
+    detail = (
+        f"{q_states:,} known situations, {model_states:,} learned outcomes, "
+        f"{replay_updates:,} replay updates."
+    )
+    return percent, label, detail
 
 
 def format_value(value: float | int | None, precision: str = ".2f") -> str:

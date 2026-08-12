@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -69,6 +70,7 @@ try:
         TelemetryHistory,
         TelemetrySnapshot,
         build_explanation_frame,
+        build_dyna_q_learning_frame,
         format_explanation_entry,
         format_value,
         summarize_run_explanation,
@@ -114,6 +116,7 @@ except ImportError:
         TelemetryHistory,
         TelemetrySnapshot,
         build_explanation_frame,
+        build_dyna_q_learning_frame,
         format_explanation_entry,
         format_value,
         summarize_run_explanation,
@@ -150,6 +153,17 @@ class MainWindow(QMainWindow):
         self.explanation_reason_label = QLabel("- No live sample yet.")
         self.explanation_box = QTextEdit()
         self.dyna_q_learning_group: QGroupBox | None = None
+        self.dyna_q_status_label = QLabel("Waiting for Dyna-Q telemetry")
+        self.dyna_q_status_detail_label = QLabel(
+            "Start a Dyna-Q agent to watch the learning loop."
+        )
+        self.dyna_q_loop_labels: list[QLabel] = []
+        self.dyna_q_why_label = QLabel("No live Dyna-Q decision has been received yet.")
+        self.dyna_q_maturity_label = QLabel("Learning maturity: No data")
+        self.dyna_q_maturity_detail_label = QLabel(
+            "The agent has not reported a Q-table yet."
+        )
+        self.dyna_q_maturity_bar = QProgressBar()
         self.dyna_q_value_labels: dict[str, QLabel] = {}
         self.run_history_table = QTableWidget(0, 8)
         self.run_history_source_label = QLabel()
@@ -295,6 +309,17 @@ class MainWindow(QMainWindow):
         self.explanation_box.setReadOnly(True)
         self.explanation_box.document().setMaximumBlockCount(240)
         self.explanation_box.setText("Race log idle.")
+        self.dyna_q_status_label.setAlignment(Qt.AlignCenter)
+        self.dyna_q_status_label.setMinimumHeight(28)
+        self.dyna_q_status_label.setStyleSheet(_dyna_q_status_style("waiting"))
+        self.dyna_q_status_detail_label.setWordWrap(True)
+        self.dyna_q_why_label.setWordWrap(True)
+        self.dyna_q_why_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.dyna_q_maturity_label.setWordWrap(True)
+        self.dyna_q_maturity_detail_label.setWordWrap(True)
+        self.dyna_q_maturity_bar.setRange(0, 100)
+        self.dyna_q_maturity_bar.setValue(0)
+        self.dyna_q_maturity_bar.setTextVisible(True)
 
         self.review_title_label.setFont(_section_font())
         self.review_status_label.setAlignment(Qt.AlignCenter)
@@ -519,14 +544,51 @@ class MainWindow(QMainWindow):
         return panel
 
     def _build_dyna_q_learning_panel(self) -> QWidget:
-        group = QGroupBox("Dyna-Q Decision View")
+        group = QGroupBox("Dyna-Q Learning Brain")
         self.dyna_q_learning_group = group
-        layout = QGridLayout(group)
+        layout = QVBoxLayout(group)
+
+        layout.addWidget(self.dyna_q_status_label)
+        layout.addWidget(self.dyna_q_status_detail_label)
+
+        loop_group = QGroupBox("Learning Loop")
+        loop_layout = QHBoxLayout(loop_group)
+        loop_layout.setSpacing(6)
+        for index, step in enumerate(
+            ("Observe", "Act", "Reward", "Update Q-table", "Replay memory")
+        ):
+            if index:
+                arrow = QLabel(">")
+                arrow.setAlignment(Qt.AlignCenter)
+                loop_layout.addWidget(arrow)
+            step_label = QLabel(step)
+            step_label.setAlignment(Qt.AlignCenter)
+            step_label.setWordWrap(True)
+            step_label.setMinimumHeight(34)
+            step_label.setStyleSheet(_dyna_q_loop_style(active=False))
+            self.dyna_q_loop_labels.append(step_label)
+            loop_layout.addWidget(step_label, 1)
+        layout.addWidget(loop_group)
+
+        why_group = QGroupBox("Why This Action?")
+        why_layout = QVBoxLayout(why_group)
+        why_layout.addWidget(self.dyna_q_why_label)
+        layout.addWidget(why_group)
+
+        maturity_group = QGroupBox("Learning Maturity")
+        maturity_layout = QVBoxLayout(maturity_group)
+        maturity_layout.addWidget(self.dyna_q_maturity_label)
+        maturity_layout.addWidget(self.dyna_q_maturity_bar)
+        maturity_layout.addWidget(self.dyna_q_maturity_detail_label)
+        layout.addWidget(maturity_group)
+
+        q_table_group = QGroupBox("Q-table Snapshot")
+        q_table_layout = QGridLayout(q_table_group)
         metrics = [
             ("mode", "Mode"),
-            ("action", "Decision"),
+            ("action", "Chosen Action"),
             ("source", "Picked By"),
-            ("state", "Situation Code"),
+            ("state", "Current State"),
             ("reward", "Last Reward"),
             ("td_error", "Learning Correction"),
             ("selected_q", "Action Score"),
@@ -542,8 +604,9 @@ class MainWindow(QMainWindow):
             value.setTextInteractionFlags(Qt.TextSelectableByMouse)
             value.setWordWrap(True)
             self.dyna_q_value_labels[key] = value
-            layout.addWidget(label, index, 0)
-            layout.addWidget(value, index, 1)
+            q_table_layout.addWidget(label, index, 0)
+            q_table_layout.addWidget(value, index, 1)
+        layout.addWidget(q_table_group)
         return group
 
     def _build_run_history_tab(self) -> QWidget:
@@ -2187,6 +2250,8 @@ class MainWindow(QMainWindow):
             return
 
         self._update_dyna_q_panel_visibility(show=True)
+        dyna_q_frame = build_dyna_q_learning_frame(snapshot)
+        self._apply_dyna_q_learning_frame(dyna_q_frame)
         mode = "Finalised" if snapshot.dyna_q_finalised else "Learning"
         if not snapshot.dyna_q_learning_enabled and not snapshot.dyna_q_finalised:
             mode = "--"
@@ -2233,6 +2298,35 @@ class MainWindow(QMainWindow):
     def _reset_dyna_q_values(self) -> None:
         for label in self.dyna_q_value_labels.values():
             label.setText("--")
+        self._apply_dyna_q_learning_frame(
+            build_dyna_q_learning_frame(TelemetrySnapshot.from_sample({}))
+        )
+
+    def _apply_dyna_q_learning_frame(self, frame: object) -> None:
+        if not hasattr(frame, "status"):
+            return
+
+        status = str(getattr(frame, "status"))
+        self.dyna_q_status_label.setText(status)
+        self.dyna_q_status_label.setStyleSheet(
+            _dyna_q_status_style(_dyna_q_status_key(status))
+        )
+        self.dyna_q_status_detail_label.setText(str(getattr(frame, "status_detail")))
+        self.dyna_q_why_label.setText(str(getattr(frame, "why")))
+        maturity_label = str(getattr(frame, "maturity_label"))
+        maturity_percent = int(getattr(frame, "maturity_percent"))
+        self.dyna_q_maturity_label.setText(
+            f"Learning maturity: {maturity_label} ({maturity_percent}%)"
+        )
+        self.dyna_q_maturity_bar.setValue(maturity_percent)
+        self.dyna_q_maturity_detail_label.setText(
+            str(getattr(frame, "maturity_detail"))
+        )
+
+        active_step = str(getattr(frame, "active_loop_step"))
+        for label in self.dyna_q_loop_labels:
+            active = label.text() == active_step
+            label.setStyleSheet(_dyna_q_loop_style(active=active))
 
     def _set_dyna_q_value(self, key: str, value: str) -> None:
         label = self.dyna_q_value_labels.get(key)
@@ -2978,6 +3072,56 @@ def _severity_style(severity: str) -> str:
         "border-radius: 4px; "
         "font-weight: 700; "
         "padding: 4px 8px;"
+    )
+
+
+def _dyna_q_status_key(status: str) -> str:
+    normalized = status.casefold()
+    if "exploring" in normalized:
+        return "explore"
+    if "repeating" in normalized:
+        return "replay"
+    if "updating" in normalized:
+        return "update"
+    if "best-known" in normalized:
+        return "greedy"
+    return "waiting"
+
+
+def _dyna_q_status_style(status_key: str) -> str:
+    palette = {
+        "waiting": ("#3b3b3b", "#d0d0d0"),
+        "explore": ("#8a5a00", "#ffffff"),
+        "greedy": ("#1f7a4d", "#ffffff"),
+        "update": ("#265d97", "#ffffff"),
+        "replay": ("#5a3f91", "#ffffff"),
+    }
+    background, foreground = palette.get(status_key, palette["waiting"])
+    return (
+        f"background-color: {background}; "
+        f"color: {foreground}; "
+        "border-radius: 4px; "
+        "font-weight: 700; "
+        "padding: 4px 8px;"
+    )
+
+
+def _dyna_q_loop_style(*, active: bool) -> str:
+    if active:
+        return (
+            "background-color: #265d97; "
+            "color: #ffffff; "
+            "border: 1px solid #6fa8dc; "
+            "border-radius: 4px; "
+            "font-weight: 700; "
+            "padding: 4px;"
+        )
+    return (
+        "background-color: #303030; "
+        "color: #d0d0d0; "
+        "border: 1px solid #454545; "
+        "border-radius: 4px; "
+        "padding: 4px;"
     )
 
 
