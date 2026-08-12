@@ -181,6 +181,14 @@ observable behaviour.
 | `torcs/` | Local Windows TORCS simulator files used by the project. |
 | `torcs-wrapper/gym_torcs/` | Python wrapper used to communicate with TORCS. |
 
+## Project Handbook
+
+The main dissertation wiki-style reference is stored in `docs/`:
+
+- `docs/MAT099_Project_Handbook.docx` is the polished Word handbook for review.
+- `docs/project-handbook.md` is the editable Markdown source summary.
+- `docs/assets/` contains the architecture diagram and placeholder locations for future screenshots.
+
 ## Running The Project
 
 The project is developed for Windows with Python 3.12.
@@ -196,7 +204,7 @@ Install the main Python packages:
 
 ```powershell
 python -m pip install --upgrade pip
-python -m pip install numpy gym PySide6 pyqtgraph
+python -m pip install -r requirements.txt
 ```
 
 Launch the desktop application:

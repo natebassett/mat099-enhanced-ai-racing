@@ -1,0 +1,7 @@
+# Runtime dependencies for MAT099 Enhanced AI Racing.
+# Developed with Python 3.12 on Windows.
+
+numpy
+gym
+PySide6
+pyqtgraph

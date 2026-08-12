@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title desc">
+  <title id="title">Racing line visualisation placeholder</title>
+  <desc id="desc">Placeholder for the racing-line visualisation screenshot.</desc>
+  <rect width="1280" height="720" fill="#f4f6f9"/>
+  <rect x="64" y="64" width="1152" height="592" rx="18" fill="#ffffff" stroke="#2e74b5" stroke-width="4"/>
+  <path d="M 310 480 C 160 360 215 185 405 165 C 575 145 710 240 850 210 C 1035 170 1130 335 1005 465 C 890 585 690 515 565 550 C 455 582 382 540 310 480 Z" fill="none" stroke="#d7dbe2" stroke-width="48" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 310 480 C 160 360 215 185 405 165 C 575 145 710 240 850 210 C 1035 170 1130 335 1005 465 C 890 585 690 515 565 550 C 455 582 382 540 310 480 Z" fill="none" stroke="#434343" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M 330 458 C 205 352 250 220 420 202 C 570 188 710 278 855 248 C 1000 218 1062 335 962 438 C 870 532 690 468 560 510 C 462 542 390 510 330 458 Z" fill="none" stroke="#2e74b5" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="640" y="122" fill="#0b2545" font-family="Calibri, Arial, sans-serif" font-size="34" font-weight="700" text-anchor="middle">Racing-Line Placeholder</text>
+  <text x="640" y="166" fill="#434343" font-family="Calibri, Arial, sans-serif" font-size="22" text-anchor="middle">Replace with final racing-line or track visualisation screenshot</text>
+</svg>

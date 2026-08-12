@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title desc">
+  <title id="title">Telemetry review screenshot placeholder</title>
+  <desc id="desc">Placeholder for a telemetry review or comparison screenshot.</desc>
+  <rect width="1280" height="720" fill="#f4f6f9"/>
+  <rect x="64" y="64" width="1152" height="592" rx="18" fill="#ffffff" stroke="#2e74b5" stroke-width="4"/>
+  <polyline points="120,500 220,430 320,455 420,330 520,360 620,245 720,290 820,210 920,250 1020,185 1140,215" fill="none" stroke="#2e74b5" stroke-width="7"/>
+  <polyline points="120,540 220,520 320,480 420,500 520,430 620,455 720,390 820,420 920,360 1020,380 1140,330" fill="none" stroke="#7a5a00" stroke-width="5"/>
+  <line x1="120" y1="580" x2="1140" y2="580" stroke="#d7dbe2" stroke-width="3"/>
+  <line x1="120" y1="150" x2="120" y2="580" stroke="#d7dbe2" stroke-width="3"/>
+  <text x="640" y="122" fill="#0b2545" font-family="Calibri, Arial, sans-serif" font-size="34" font-weight="700" text-anchor="middle">Telemetry Review Placeholder</text>
+  <text x="640" y="166" fill="#434343" font-family="Calibri, Arial, sans-serif" font-size="22" text-anchor="middle">Replace with saved run telemetry, comparison, or explanation screen</text>
+</svg>
