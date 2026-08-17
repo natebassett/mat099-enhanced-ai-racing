@@ -2,6 +2,7 @@ from agents.random_agent import RandomAgent
 from agents.map_aware_agent import MapAwareAgent
 from agents.rule_based_agent import RuleBasedAgent
 from agents.dyna_q_agent import DynaQFinalisedAgent, DynaQLearningAgent
+from agents.td3_agent import Td3ScratchAgent
 from runner.torcs_runner import TorcsRunner
 from storage import RaceRepository
 
@@ -44,11 +45,12 @@ def menu():
         print("[3] Map-Aware Racing-Line Agent")
         print("[4] Dyna-Q Learning Agent")
         print("[5] Dyna-Q Finalised Agent")
+        print("[6] TD3 Scratch Racer")
         print("[0] Exit\n")
 
         choice = input("Enter choice: ")
 
-        if choice in {"1", "2", "3", "4", "5"}:
+        if choice in {"1", "2", "3", "4", "5", "6"}:
 
             runner = TorcsRunner()
 
@@ -58,6 +60,7 @@ def menu():
                 "3": MapAwareAgent,
                 "4": DynaQLearningAgent,
                 "5": DynaQFinalisedAgent,
+                "6": Td3ScratchAgent,
             }
             agent = agents[choice]()
 

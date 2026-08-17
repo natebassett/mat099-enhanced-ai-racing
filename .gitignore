@@ -12,6 +12,7 @@ __pycache__/
 # Logs / models
 ppo_driver/logs/
 ppo_driver/models/
+models/
 *.log
 
 # Generated race data

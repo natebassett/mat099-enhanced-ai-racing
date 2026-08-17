@@ -100,6 +100,18 @@ class GuiAgentEducationModelTests(unittest.TestCase):
             any("live dashboard" in note.casefold() for note in profile.overview)
         )
 
+    def test_td3_profile_explains_reward_only_neural_control(self):
+        profile = build_agent_education_profile(
+            _agent("TD3 Scratch Racer", "td3_scratch", requires_line=False),
+            _tracks(),
+        )
+
+        self.assertEqual(profile.badge, "Reward-only neural reinforcement learner")
+        self.assertIn("from-scratch TD3", profile.headline)
+        self.assertTrue(any("Twin Critic Target" == note.title for note in profile.formula_notes))
+        self.assertTrue(any("build_td3_observation" in snippet.source for snippet in profile.code_snippets))
+        self.assertIn("No racing-line file required", dict(profile.metadata)["Track dependency"])
+
 
 def _agent(name: str, agent_type: str, *, requires_line: bool) -> AgentOption:
     return AgentOption(

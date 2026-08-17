@@ -58,6 +58,18 @@ class LapTrackerTests(unittest.TestCase):
             )
         )
 
+    def test_practice_finish_uses_agent_track_length_without_racing_line(self):
+        class ScratchAgent:
+            track_length_m = 1000.0
+
+        self.assertTrue(
+            practice_finish_is_plausible(
+                {"distRaced": 0.0, "distFromStart": 3600.0},
+                {"distRaced": 850.0, "distFromStart": 850.0},
+                ScratchAgent(),
+            )
+        )
+
 
 class RaceRepositoryLapTimingTests(unittest.TestCase):
     def test_migrates_and_records_lap_metrics(self):

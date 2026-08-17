@@ -108,10 +108,12 @@ def discover_agents() -> list[AgentOption]:
     from agents.map_aware_agent import MapAwareAgent
     from agents.random_agent import RandomAgent
     from agents.rule_based_agent import RuleBasedAgent
+    from agents.td3_agent import Td3ScratchAgent
 
     return [
         _agent_option(DynaQLearningAgent),
         _agent_option(DynaQFinalisedAgent),
+        _agent_option(Td3ScratchAgent),
         _agent_option(MapAwareAgent),
         _agent_option(RuleBasedAgent),
         _agent_option(RandomAgent),

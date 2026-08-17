@@ -5,7 +5,8 @@ def practice_finish_is_plausible(initial_telemetry, final_telemetry, agent):
     distance_raced = max(0.0, final_distance - initial_distance)
     racing_line = getattr(agent, "racing_line", None)
     expected_length = float(
-        getattr(racing_line, "track_length", 0.0)
+        getattr(agent, "track_length_m", 0.0)
+        or getattr(racing_line, "track_length", 0.0)
         or initial_telemetry.get("distFromStart", 0.0)
         or 0.0
     )

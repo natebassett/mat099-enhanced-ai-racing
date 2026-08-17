@@ -734,6 +734,183 @@ def _template_for(agent_type: str) -> dict[str, Any]:
             ),
         }
 
+    if agent_type == "td3_scratch":
+        return {
+            "badge": "Reward-only neural reinforcement learner",
+            "headline": (
+                "This driver is a from-scratch TD3 continuous-control agent: a neural "
+                "policy directly outputs steering, throttle, and brake from TORCS telemetry."
+            ),
+            "overview": (
+                "It does not load Agent 3, copy a teacher, use behaviour cloning, or imitate a racing line.",
+                (
+                    "The policy sees raw driving signals such as speed, heading, road sensors, "
+                    "track position, wheel-spin balance, damage, lap time, and distance phase."
+                ),
+                (
+                    "TD3 is deterministic at deployment, while training adds exploration noise "
+                    "and learns from a replay buffer of reward-labelled transitions."
+                ),
+                (
+                    "The curriculum makes the problem tractable by starting with launch and "
+                    "stability, then moving to first-corner survival, sector progress, and full-lap attempts."
+                ),
+            ),
+            "decision_steps": (
+                "Read speed, side speed, angle, track position, distance, damage, wheel spin, and road sensors.",
+                "Normalise those raw values into the TD3 observation vector.",
+                "Ask the actor network for three continuous commands: steering, throttle, and brake.",
+                "Decode the commands into TORCS controls and apply automatic gear shifting.",
+                "During training, score the next telemetry frame with progress, stability, safety, and milestone rewards.",
+                "Store transitions in replay memory and update twin critics plus the delayed actor policy.",
+                "Save best-distance checkpoints separately from best-reward checkpoints.",
+            ),
+            "algorithm_summary": (
+                "TD3 stands for Twin Delayed Deep Deterministic Policy Gradient.",
+                (
+                    "The actor is a neural controller. It maps the current observation directly "
+                    "to a continuous action instead of selecting from a hand-written action list."
+                ),
+                (
+                    "Two critic networks estimate action value. Taking the smaller critic target "
+                    "helps reduce the value overestimation that can destabilise deterministic actor-critic learning."
+                ),
+                (
+                    "The actor is updated less frequently than the critics. This delayed update "
+                    "lets value estimates settle before the policy follows them."
+                ),
+                (
+                    "The reward is engineered around forward progress and survival, not around "
+                    "matching a saved route. Curriculum stages change the episode objective while keeping learning from scratch."
+                ),
+            ),
+            "pseudocode": (
+                "Start with random actor and critic network weights.",
+                "Reset TORCS into the current curriculum stage.",
+                "Observe raw telemetry and build the normalised feature vector.",
+                "Actor outputs steer, throttle, and brake; exploration noise is added during training.",
+                "Send controls to TORCS with automatic gear selection.",
+                "Reward forward progress, clean alignment, new furthest distance, and stage completion.",
+                "Penalise off-track, late braking, sliding, reversing, stuck behaviour, and damage.",
+                "Store observation, action, reward, next observation, and done flag in replay memory.",
+                "Update twin critics from replay; periodically update the actor and target networks.",
+            ),
+            "formula_notes": (
+                FormulaNote(
+                    title="Deterministic Actor",
+                    formula=r"$a_t = \mu_\theta(s_t)$",
+                    explanation=(
+                        "The actor network maps the current telemetry state directly to a "
+                        "continuous control vector. At runtime no random action sampling is needed."
+                    ),
+                ),
+                FormulaNote(
+                    title="Twin Critic Target",
+                    formula=(
+                        r"$y = r + \gamma \min_i Q_{\phi_i'}"
+                        r"(s', \mu_{\theta'}(s') + \epsilon)$"
+                    ),
+                    explanation=(
+                        "TD3 uses two target critics and keeps the smaller value estimate. "
+                        "The clipped target noise smooths the critic around nearby actions."
+                    ),
+                ),
+                FormulaNote(
+                    title="Scratch Progress Reward",
+                    formula=r"$R \approx w_p\Delta d + w_m\Delta d_{best} - P_{risk}$",
+                    explanation=(
+                        "The reward emphasises forward progress and each new furthest distance. "
+                        "Risk penalties come from off-track sensors, angle, slide, damage, and late braking."
+                    ),
+                ),
+            ),
+            "code_snippets": (
+                CodeSnippet(
+                    title="Raw telemetry observation",
+                    source="src/agents/td3_agent.py - build_td3_observation",
+                    explanation=(
+                        "The observation is built from TORCS telemetry only. There is no racing-line lookup "
+                        "and no teacher action in the feature vector."
+                    ),
+                    code=(
+                        "features = [\n"
+                        "    normalise_signed(speedX, 240.0),\n"
+                        "    normalise_signed(angle, 1.0),\n"
+                        "    normalise_signed(trackPos, 1.4),\n"
+                        "    normalise_sensor(front_sensor),\n"
+                        "    normalise_sensor(min_track_sensor),\n"
+                        "    distance_phase,\n"
+                        "    previous_steer,\n"
+                        "    previous_accel,\n"
+                        "    previous_brake,\n"
+                        "]"
+                    ),
+                ),
+                CodeSnippet(
+                    title="Direct continuous controls",
+                    source="src/agents/td3_agent.py - decode_td3_action",
+                    explanation=(
+                        "TD3 owns steering, throttle, and brake. The only engineered control left outside "
+                        "the learning problem is automatic gear selection."
+                    ),
+                    code=(
+                        "steer = clip(raw[0], -1, 1) * MAX_STEER\n"
+                        "accel = max(0.0, clip(raw[1], -1, 1))\n"
+                        "brake = max(0.0, clip(raw[2], -1, 1))\n"
+                        "gear = shift_gears(speed_kmh)"
+                    ),
+                ),
+                CodeSnippet(
+                    title="Curriculum reward",
+                    source="scripts/train_td3_agent.py - calculate_td3_reward",
+                    explanation=(
+                        "The reward does not compare against a racing line. It scores progress, "
+                        "new distance milestones, stability, late braking risk, and failures."
+                    ),
+                    code=(
+                        "reward = progress * stage.progress_weight\n"
+                        "reward += new_distance * stage.milestone_weight\n"
+                        "reward -= off_track_penalty\n"
+                        "reward -= late_braking_penalty\n"
+                        "if stage_success:\n"
+                        "    reward += stage.success_reward"
+                    ),
+                ),
+            ),
+            "math_notes": (
+                "The actor and critics start from random neural-network weights.",
+                "Replay buffer samples break the tight correlation between consecutive TORCS frames.",
+                "Best-distance checkpointing matters because shaped reward can improve before full laps appear.",
+                "Distance phase is map position information, not a racing-line target or imitation signal.",
+                "Automatic gear shifting narrows the learning problem to steering, throttle, and brake.",
+            ),
+            "key_takeaways": (
+                "This is the clean neural DRL showcase agent.",
+                "It learns from reward feedback rather than copied actions.",
+                "Curriculum learning makes from-scratch racing less brittle.",
+                "Training logs, reward curves, and best-distance checkpoints are dissertation evidence.",
+            ),
+            "input_signals": (
+                "Raw TORCS speed, angle, side speed, and track position.",
+                "Nineteen road range sensors.",
+                "Damage, lap time, distance around the lap, and wheel spin.",
+                "Previous control output for smooth policy context.",
+                "No racing-line file and no teacher action.",
+            ),
+            "strengths": (
+                "Direct neural continuous control.",
+                "No dependence on a precomputed racing line.",
+                "Replay-buffer learning is well suited to long-horizon control.",
+                "Best-distance checkpointing captures partial progress during long training.",
+            ),
+            "failure_signs": (
+                "Early training may produce stuck launches or immediate off-track exits.",
+                "Too little exploration noise can prevent discovering useful throttle and steering combinations.",
+                "Too much reward for speed can cause late braking and corner entry crashes.",
+                "It may need overnight or multi-day training before it becomes demonstrably competent.",
+            ),
+        }
+
     if agent_type == "random":
         return {
             "badge": "Baseline random driver",
