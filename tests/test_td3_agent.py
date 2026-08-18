@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -218,6 +219,30 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
         self.assertLess(reward, -120.0)
 
+    def test_reward_penalises_high_speed_oversteer(self):
+        stage = train_td3_agent.CURRICULUM[1]
+        previous = _telemetry(distance=260.0, raced=260.0, speed=112.0)
+        telemetry = _telemetry(distance=266.0, raced=266.0, speed=112.0)
+
+        smooth_reward = train_td3_agent.calculate_td3_reward(
+            telemetry,
+            {"steer": 0.10, "accel": 0.4, "brake": 0.0},
+            previous_telemetry=previous,
+            stage=stage,
+            episode_distance_m=266.0,
+            previous_furthest_distance_m=260.0,
+        )
+        oversteer_reward = train_td3_agent.calculate_td3_reward(
+            telemetry,
+            {"steer": 0.90, "accel": 0.4, "brake": 0.0},
+            previous_telemetry=previous,
+            stage=stage,
+            episode_distance_m=266.0,
+            previous_furthest_distance_m=260.0,
+        )
+
+        self.assertLess(oversteer_reward, smooth_reward - 4.0)
+
     def test_curriculum_stages_progress_from_launch_to_full_lap(self):
         stages = train_td3_agent.CURRICULUM
 
@@ -225,6 +250,48 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(stages[-1].stage_id, "full_lap")
         self.assertLess(stages[0].distance_target_m, stages[-1].distance_target_m)
         self.assertGreater(stages[-1].success_reward, stages[0].success_reward)
+
+    def test_curriculum_requires_repeatable_launch_success(self):
+        self.assertEqual(
+            train_td3_agent.required_successes_for_stage(
+                train_td3_agent.CURRICULUM[0]
+            ),
+            3,
+        )
+        self.assertEqual(train_td3_agent.required_successes_for_stage("first_corner"), 2)
+        self.assertEqual(train_td3_agent.required_successes_for_stage("unknown"), 1)
+
+    def test_default_training_args_use_stable_td3_warmup(self):
+        with mock.patch.object(sys, "argv", [str(SCRIPT_PATH)]):
+            args = train_td3_agent.parse_args()
+
+        self.assertEqual(args.learning_starts, 20_000)
+        self.assertEqual(args.action_noise_sigma, 0.12)
+        self.assertEqual(args.warmup_steer_std, 0.18)
+
+    def test_best_model_callback_preserves_previous_global_bests(self):
+        class FakeBaseCallback:
+            def __init__(self, verbose=0):
+                self.verbose = verbose
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            best_distance_path = directory_path / "best_distance.zip"
+            best_reward_path = directory_path / "best_reward.zip"
+            metadata_path_for_policy(best_distance_path).write_text(
+                '{"best_distance_episode": {"distance_m": 171.2}}',
+                encoding="utf-8",
+            )
+            metadata_path_for_policy(best_reward_path).write_text(
+                '{"best_reward_episode": {"reward": 304.6}}',
+                encoding="utf-8",
+            )
+
+            Callback = train_td3_agent.make_best_model_callback_class(FakeBaseCallback)
+            callback = Callback(best_distance_path, best_reward_path, {})
+
+        self.assertEqual(callback.best_distance_m, 171.2)
+        self.assertEqual(callback.best_reward, 304.6)
 
     def test_progress_line_reports_stage_and_best_distance(self):
         state = train_td3_agent.TrainingProgressState()

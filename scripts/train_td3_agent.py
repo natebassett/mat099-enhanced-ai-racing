@@ -40,6 +40,7 @@ from agents.td3_agent import (  # noqa: E402
     finite_float,
     metadata_path_for_policy,
     rate_limit_td3_action,
+    read_policy_metadata,
     shift_gears,
     track_sensors,
 )
@@ -61,6 +62,12 @@ SOFT_TRACK_BOUNDARY = 1.04
 STUCK_SPEED_LIMIT_KMH = 5.0
 STUCK_PROGRESS_LIMIT_M = 0.12
 STUCK_SECONDS_LIMIT = 3.0
+DEFAULT_STAGE_SUCCESS_REQUIREMENTS = {
+    "launch": 3,
+    "first_corner": 2,
+    "sector_progression": 1,
+    "full_lap": 1,
+}
 
 
 @dataclass(frozen=True)
@@ -145,6 +152,9 @@ EPISODE_COLUMNS = [
     "lap_completion_fraction",
     "off_track_steps",
     "max_stopped_seconds",
+    "stage_success_streak",
+    "stage_required_successes",
+    "stage_success_total",
     "termination_reason",
     "final_speed_kmh",
     "final_track_pos",
@@ -295,6 +305,11 @@ def calculate_lap_completion_fraction(distance_m: float) -> float:
     return clamp(max(0.0, distance_m) / G_TRACK_3_LENGTH_METRES, 0.0, 1.0)
 
 
+def required_successes_for_stage(stage: CurriculumStage | str) -> int:
+    stage_id = stage.stage_id if isinstance(stage, CurriculumStage) else str(stage)
+    return max(1, int(DEFAULT_STAGE_SUCCESS_REQUIREMENTS.get(stage_id, 1)))
+
+
 def calculate_td3_reward(
     telemetry: Mapping[str, Any],
     action: Mapping[str, Any],
@@ -317,6 +332,7 @@ def calculate_td3_reward(
     angle = finite_float(telemetry.get("angle"))
     track_position = finite_float(telemetry.get("trackPos"))
     lateral_speed = finite_float(telemetry.get("speedY"))
+    steer = abs(finite_float(action.get("steer")))
     damage = finite_float(telemetry.get("damage"), previous_damage)
     progress = calculate_progress_delta(previous_telemetry, telemetry)
     new_distance = max(0.0, episode_distance_m - previous_furthest_distance_m)
@@ -344,6 +360,15 @@ def calculate_td3_reward(
     reward -= max(0.0, abs(lateral_speed) - 4.0) * 0.10
     reward -= max(0.0, abs(lateral_speed) - 12.0) * 0.24
 
+    speed_pressure = clamp((speed - 40.0) / 115.0, 0.0, 1.0)
+    reward -= max(0.0, steer - 0.28) * speed_pressure * 5.5
+    reward -= max(0.0, steer - 0.55) * speed_pressure * 12.0
+    reward -= max(0.0, abs(angle) - 0.35) * speed_pressure * 7.0
+    reward -= max(0.0, abs(lateral_speed) - 7.0) * speed_pressure * 0.28
+    if abs(angle) > 1.05 and speed > 18.0:
+        spin_pressure = clamp((abs(angle) - 1.05) / 0.75, 0.0, 1.0)
+        reward -= 42.0 * spin_pressure
+
     closing_danger = front_sensor < 55.0 and speed > stage.safe_front_speed_kmh
     if closing_danger:
         brake = finite_float(action.get("brake"))
@@ -367,7 +392,7 @@ def calculate_td3_reward(
     if crashed:
         reward -= 65.0 + max(0.0, damage - previous_damage) * 0.15
     if backwards:
-        reward -= 95.0
+        reward -= 145.0 + clamp(abs(speed) / 120.0, 0.0, 1.0) * 55.0
     if stuck:
         reward -= 80.0
     if terminal_failure and completed_lap is None and not stage_success:
@@ -400,6 +425,8 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "racing_line_imitation": False,
         "automatic_gear_shift": True,
         "actuator_rate_limited": True,
+        "stage_success_requirements": dict(DEFAULT_STAGE_SUCCESS_REQUIREMENTS),
+        "curriculum_promotion": "success_streak_required",
         "curriculum": [stage.__dict__ for stage in CURRICULUM],
         "total_timesteps_requested": args.total_timesteps,
         "seed": args.seed,
@@ -543,6 +570,11 @@ def make_training_env_class(gym: Any, spaces: Any):
                 dtype=np.float32,
             )
             self.stage_index = 0
+            self.stage_success_streak = 0
+            self.stage_success_totals = {
+                stage.stage_id: 0
+                for stage in CURRICULUM
+            }
             self.episodes_started = 0
             self.total_steps = 0
             self.current_telemetry: dict[str, Any] | None = None
@@ -715,13 +747,34 @@ def make_training_env_class(gym: Any, spaces: Any):
 
             terminated = bool(stage_success or terminal_failure)
             truncated = self.steps >= self.current_stage.max_episode_steps
+            stage_required_successes = required_successes_for_stage(self.current_stage)
+            stage_success_total = self.stage_success_totals.get(
+                self.current_stage.stage_id,
+                0,
+            )
+            stage_completed = False
+            if terminated or truncated:
+                if stage_success:
+                    self.stage_success_streak += 1
+                    stage_success_total += 1
+                    self.stage_success_totals[self.current_stage.stage_id] = (
+                        stage_success_total
+                    )
+                    stage_completed = (
+                        completed_lap is not None
+                        or self.stage_success_streak >= stage_required_successes
+                    )
+                else:
+                    self.stage_success_streak = 0
             reason = ""
             if terminated or truncated:
                 reason = "truncated"
                 if completed_lap is not None:
                     reason = "target_laps_completed"
-                elif stage_success:
+                elif stage_completed:
                     reason = "curriculum_stage_completed"
+                elif stage_success:
+                    reason = "curriculum_stage_success"
                 elif crashed:
                     reason = "crashed"
                 elif off_track or left_track_bounds:
@@ -754,10 +807,17 @@ def make_training_env_class(gym: Any, spaces: Any):
                 "termination_reason": reason,
             }
             if terminated or truncated:
-                summary = self._episode_summary(reason, telemetry)
+                summary = self._episode_summary(
+                    reason,
+                    telemetry,
+                    stage_success_streak=self.stage_success_streak,
+                    stage_required_successes=stage_required_successes,
+                    stage_success_total=stage_success_total,
+                )
                 info["episode_summary"] = summary
-                if stage_success and self.stage_index < len(CURRICULUM) - 1:
+                if stage_completed and self.stage_index < len(CURRICULUM) - 1:
                     self.stage_index += 1
+                    self.stage_success_streak = 0
 
             return self._build_observation(), reward, terminated, truncated, info
 
@@ -781,9 +841,14 @@ def make_training_env_class(gym: Any, spaces: Any):
             self,
             reason: str,
             telemetry: Mapping[str, Any],
+            *,
+            stage_success_streak: int | None = None,
+            stage_required_successes: int | None = None,
+            stage_success_total: int | None = None,
         ) -> dict[str, Any]:
             sensors = track_sensors(telemetry)
             distance_m = self.episode_furthest_distance
+            stage_id = self.current_stage.stage_id
             duration_seconds = max(
                 0.0,
                 finite_float(telemetry.get("curLapTime")) - self.episode_start_time,
@@ -809,6 +874,21 @@ def make_training_env_class(gym: Any, spaces: Any):
                 "lap_completion_fraction": calculate_lap_completion_fraction(distance_m),
                 "off_track_steps": self.episode_off_track_steps,
                 "max_stopped_seconds": self.episode_max_stopped_seconds,
+                "stage_success_streak": (
+                    self.stage_success_streak
+                    if stage_success_streak is None
+                    else stage_success_streak
+                ),
+                "stage_required_successes": (
+                    required_successes_for_stage(self.current_stage)
+                    if stage_required_successes is None
+                    else stage_required_successes
+                ),
+                "stage_success_total": (
+                    self.stage_success_totals.get(stage_id, 0)
+                    if stage_success_total is None
+                    else stage_success_total
+                ),
                 "termination_reason": reason,
                 "final_speed_kmh": finite_float(telemetry.get("speedX")),
                 "final_track_pos": finite_float(telemetry.get("trackPos")),
@@ -1084,8 +1164,13 @@ def make_best_model_callback_class(BaseCallback: Any):
             self.best_reward_model_path = Path(best_reward_model_path)
             self.metadata = dict(metadata)
             self.progress_state = progress_state
-            self.best_distance_m: float | None = None
-            self.best_reward: float | None = None
+            self.best_distance_m = self._read_existing_best_distance()
+            self.best_reward = self._read_existing_best_reward()
+            if self.progress_state is not None:
+                if self.best_distance_m is not None:
+                    self.progress_state.record_best_distance(self.best_distance_m)
+                if self.best_reward is not None:
+                    self.progress_state.record_best_reward(self.best_reward)
 
         def _on_step(self):
             infos = self.locals.get("infos", [])
@@ -1138,6 +1223,22 @@ def make_best_model_callback_class(BaseCallback: Any):
                     },
                 },
             )
+
+        def _read_existing_best_distance(self) -> float | None:
+            metadata = read_policy_metadata(self.best_distance_model_path)
+            best_episode = metadata.get("best_distance_episode")
+            if not isinstance(best_episode, Mapping):
+                return None
+            distance_m = finite_float(best_episode.get("distance_m"), default=-1.0)
+            return distance_m if distance_m >= 0.0 else None
+
+        def _read_existing_best_reward(self) -> float | None:
+            metadata = read_policy_metadata(self.best_reward_model_path)
+            best_episode = metadata.get("best_reward_episode")
+            if not isinstance(best_episode, Mapping):
+                return None
+            reward = finite_float(best_episode.get("reward"), default=float("-inf"))
+            return reward if math.isfinite(reward) else None
 
     return BestModelCallback
 
@@ -1268,7 +1369,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--buffer-size", type=int, default=1_000_000)
-    parser.add_argument("--learning-starts", type=int, default=10_000)
+    parser.add_argument("--learning-starts", type=int, default=20_000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--tau", type=float, default=0.005)
@@ -1278,14 +1379,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-delay", type=int, default=2)
     parser.add_argument("--target-policy-noise", type=float, default=0.20)
     parser.add_argument("--target-noise-clip", type=float, default=0.50)
-    parser.add_argument("--action-noise-sigma", type=float, default=0.18)
+    parser.add_argument("--action-noise-sigma", type=float, default=0.12)
     parser.add_argument("--net-arch", type=int, nargs="+", default=[400, 300])
     parser.add_argument(
         "--warmup-action-mode",
         choices=("launch-biased", "uniform"),
         default="launch-biased",
     )
-    parser.add_argument("--warmup-steer-std", type=float, default=0.30)
+    parser.add_argument("--warmup-steer-std", type=float, default=0.18)
     parser.add_argument("--warmup-accel-min", type=float, default=0.25)
     parser.add_argument("--warmup-accel-max", type=float, default=1.00)
     parser.add_argument("--warmup-brake-probability", type=float, default=0.12)
