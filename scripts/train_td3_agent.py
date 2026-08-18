@@ -37,6 +37,7 @@ from agents.td3_agent import (  # noqa: E402
     build_td3_observation,
     clamp,
     decode_td3_action,
+    episode_metadata_is_policy_controlled,
     finite_float,
     metadata_path_for_policy,
     rate_limit_td3_action,
@@ -139,6 +140,7 @@ CURRICULUM: tuple[CurriculumStage, ...] = (
 EPISODE_COLUMNS = [
     "episodes_seen",
     "global_timestep",
+    "policy_controlled",
     "stage_id",
     "stage_name",
     "steps",
@@ -322,10 +324,21 @@ def curriculum_stage_can_advance(
     success_history: list[bool],
     *,
     completed_lap: float | None = None,
+    policy_controlled: bool = True,
 ) -> bool:
+    if not policy_controlled:
+        return False
     if completed_lap is not None:
         return True
     return recent_success_count(success_history) >= required_successes_for_stage(stage)
+
+
+def episode_is_policy_controlled(
+    episode_start_timestep: int,
+    learning_starts: int,
+) -> bool:
+    """Return true only when every action in the episode came from the policy."""
+    return int(episode_start_timestep) >= max(0, int(learning_starts))
 
 
 def calculate_td3_reward(
@@ -446,6 +459,8 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "stage_success_requirements": dict(DEFAULT_STAGE_SUCCESS_REQUIREMENTS),
         "stage_success_window_size": DEFAULT_STAGE_SUCCESS_WINDOW_SIZE,
         "curriculum_promotion": "successes_within_rolling_window",
+        "curriculum_counts_warmup_episodes": False,
+        "best_checkpoint_scope": "policy_controlled_training_episodes_only",
         "curriculum": [stage.__dict__ for stage in CURRICULUM],
         "total_timesteps_requested": args.total_timesteps,
         "seed": args.seed,
@@ -565,6 +580,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             warmup_accel_min: float = 0.25,
             warmup_accel_max: float = 1.00,
             warmup_brake_probability: float = 0.12,
+            learning_starts: int = 20_000,
         ) -> None:
             super().__init__()
             self.track_name = track_name
@@ -573,6 +589,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             self.reset_retries = max(0, int(reset_retries))
             self.quiet_reset_log = quiet_reset_log
             self.run_dir = Path(run_dir) if run_dir is not None else None
+            self.learning_starts = max(0, int(learning_starts))
             self.runner = make_torcs_runner()
             self.action_space = make_scratch_action_space(
                 spaces,
@@ -610,6 +627,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             self.episode_reward = 0.0
             self.episode_start_distance = 0.0
             self.episode_start_time = 0.0
+            self.episode_start_timestep = 0
             self.episode_max_speed = 0.0
             self.episode_off_track_steps = 0
             self.episode_furthest_distance = 0.0
@@ -652,6 +670,7 @@ def make_training_env_class(gym: Any, spaces: Any):
                 self.current_telemetry.get("distRaced")
             )
             self.episode_start_time = finite_float(self.current_telemetry.get("curLapTime"))
+            self.episode_start_timestep = self.total_steps
             self.episode_max_speed = finite_float(self.current_telemetry.get("speedX"))
             self.episode_off_track_steps = 0
             self.episode_furthest_distance = 0.0
@@ -770,6 +789,10 @@ def make_training_env_class(gym: Any, spaces: Any):
 
             terminated = bool(stage_success or terminal_failure)
             truncated = self.steps >= self.current_stage.max_episode_steps
+            policy_controlled = episode_is_policy_controlled(
+                self.episode_start_timestep,
+                self.learning_starts,
+            )
             stage_required_successes = required_successes_for_stage(self.current_stage)
             stage_success_total = self.stage_success_totals.get(
                 self.current_stage.stage_id,
@@ -781,30 +804,39 @@ def make_training_env_class(gym: Any, spaces: Any):
             stage_recent_successes = recent_success_count(stage_success_history)
             stage_completed = False
             if terminated or truncated:
-                if stage_success:
-                    self.stage_success_streak += 1
-                    stage_success_total += 1
-                    self.stage_success_totals[self.current_stage.stage_id] = (
-                        stage_success_total
+                if policy_controlled:
+                    if stage_success:
+                        self.stage_success_streak += 1
+                        stage_success_total += 1
+                        self.stage_success_totals[self.current_stage.stage_id] = (
+                            stage_success_total
+                        )
+                    else:
+                        self.stage_success_streak = 0
+                    stage_success_history.append(bool(stage_success))
+                    if len(stage_success_history) > DEFAULT_STAGE_SUCCESS_WINDOW_SIZE:
+                        del stage_success_history[
+                            : len(stage_success_history)
+                            - DEFAULT_STAGE_SUCCESS_WINDOW_SIZE
+                        ]
+                    stage_recent_successes = recent_success_count(
+                        stage_success_history
                     )
-                else:
-                    self.stage_success_streak = 0
-                stage_success_history.append(bool(stage_success))
-                if len(stage_success_history) > DEFAULT_STAGE_SUCCESS_WINDOW_SIZE:
-                    del stage_success_history[
-                        : len(stage_success_history) - DEFAULT_STAGE_SUCCESS_WINDOW_SIZE
-                    ]
-                stage_recent_successes = recent_success_count(stage_success_history)
-                stage_completed = curriculum_stage_can_advance(
-                    self.current_stage,
-                    stage_success_history,
-                    completed_lap=completed_lap,
-                )
+                    stage_completed = curriculum_stage_can_advance(
+                        self.current_stage,
+                        stage_success_history,
+                        completed_lap=completed_lap,
+                        policy_controlled=policy_controlled,
+                    )
             reason = ""
             if terminated or truncated:
                 reason = "truncated"
-                if completed_lap is not None:
+                if completed_lap is not None and not policy_controlled:
+                    reason = "warmup_lap_completed"
+                elif completed_lap is not None:
                     reason = "target_laps_completed"
+                elif stage_success and not policy_controlled:
+                    reason = "warmup_stage_success"
                 elif stage_completed:
                     reason = "curriculum_stage_completed"
                 elif stage_success:
@@ -831,6 +863,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             )
 
             info: dict[str, Any] = {
+                "policy_controlled": policy_controlled,
                 "stage_id": self.current_stage.stage_id,
                 "stage_name": self.current_stage.name,
                 "distance_m": self.episode_furthest_distance,
@@ -848,6 +881,7 @@ def make_training_env_class(gym: Any, spaces: Any):
                     stage_required_successes=stage_required_successes,
                     stage_recent_successes=stage_recent_successes,
                     stage_success_total=stage_success_total,
+                    policy_controlled=policy_controlled,
                 )
                 info["episode_summary"] = summary
                 if stage_completed and self.stage_index < len(CURRICULUM) - 1:
@@ -881,6 +915,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             stage_required_successes: int | None = None,
             stage_recent_successes: int | None = None,
             stage_success_total: int | None = None,
+            policy_controlled: bool | None = None,
         ) -> dict[str, Any]:
             sensors = track_sensors(telemetry)
             distance_m = self.episode_furthest_distance
@@ -895,7 +930,13 @@ def make_training_env_class(gym: Any, spaces: Any):
                 else 0.0
             )
             assert self.lap_tracker is not None
+            if policy_controlled is None:
+                policy_controlled = episode_is_policy_controlled(
+                    self.episode_start_timestep,
+                    self.learning_starts,
+                )
             return {
+                "policy_controlled": policy_controlled,
                 "stage_id": self.current_stage.stage_id,
                 "stage_name": self.current_stage.name,
                 "steps": self.steps,
@@ -1200,12 +1241,14 @@ def make_best_model_callback_class(BaseCallback: Any):
             best_reward_model_path: Path,
             metadata: Mapping[str, Any],
             progress_state: TrainingProgressState | None = None,
+            learning_starts: int = 0,
         ) -> None:
             super().__init__(verbose=0)
             self.best_distance_model_path = Path(best_distance_model_path)
             self.best_reward_model_path = Path(best_reward_model_path)
             self.metadata = dict(metadata)
             self.progress_state = progress_state
+            self.learning_starts = max(0, int(learning_starts))
             self.best_distance_m = self._read_existing_best_distance()
             self.best_reward = self._read_existing_best_reward()
             if self.progress_state is not None:
@@ -1219,6 +1262,11 @@ def make_best_model_callback_class(BaseCallback: Any):
             for info in infos:
                 summary = info.get("episode_summary") if isinstance(info, dict) else None
                 if summary is None:
+                    continue
+                if (
+                    not bool(summary.get("policy_controlled"))
+                    or self.num_timesteps <= self.learning_starts
+                ):
                     continue
                 distance_m = float(summary.get("distance_m") or 0.0)
                 reward = float(summary.get("reward") or 0.0)
@@ -1269,7 +1317,7 @@ def make_best_model_callback_class(BaseCallback: Any):
         def _read_existing_best_distance(self) -> float | None:
             metadata = read_policy_metadata(self.best_distance_model_path)
             best_episode = metadata.get("best_distance_episode")
-            if not isinstance(best_episode, Mapping):
+            if not self._is_verified_policy_episode(best_episode):
                 return None
             distance_m = finite_float(best_episode.get("distance_m"), default=-1.0)
             return distance_m if distance_m >= 0.0 else None
@@ -1277,10 +1325,14 @@ def make_best_model_callback_class(BaseCallback: Any):
         def _read_existing_best_reward(self) -> float | None:
             metadata = read_policy_metadata(self.best_reward_model_path)
             best_episode = metadata.get("best_reward_episode")
-            if not isinstance(best_episode, Mapping):
+            if not self._is_verified_policy_episode(best_episode):
                 return None
             reward = finite_float(best_episode.get("reward"), default=float("-inf"))
             return reward if math.isfinite(reward) else None
+
+        @staticmethod
+        def _is_verified_policy_episode(best_episode: Any) -> bool:
+            return episode_metadata_is_policy_controlled(best_episode)
 
     return BestModelCallback
 
@@ -1487,6 +1539,7 @@ def main() -> None:
         warmup_accel_min=args.warmup_accel_min,
         warmup_accel_max=args.warmup_accel_max,
         warmup_brake_probability=args.warmup_brake_probability,
+        learning_starts=args.learning_starts,
     )
     raw_env.action_space.seed(args.seed)
     raw_env.observation_space.seed(args.seed)
@@ -1499,6 +1552,7 @@ def main() -> None:
         raw_env,
         filename=str(run_dir / "monitor.csv"),
         info_keywords=(
+            "policy_controlled",
             "stage_id",
             "distance_m",
             "furthest_distance_m",
@@ -1552,6 +1606,7 @@ def main() -> None:
             args.best_reward_model_path,
             metadata,
             progress_state,
+            learning_starts=args.learning_starts,
         ),
     ]
     if not args.no_progress_bar and not args.verbose_training:

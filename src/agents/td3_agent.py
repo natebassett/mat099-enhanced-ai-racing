@@ -19,6 +19,9 @@ DEFAULT_BEST_DISTANCE_MODEL_PATH = (
 DEFAULT_BEST_REWARD_MODEL_PATH = (
     PROJECT_ROOT / "models" / "agent6_td3_scratch_racer_best_reward.zip"
 )
+DEFAULT_BEST_EVALUATION_MODEL_PATH = (
+    PROJECT_ROOT / "models" / "agent6_td3_scratch_racer_best_evaluation.zip"
+)
 
 AGENT6_MODEL_FAMILY = "agent6_td3_scratch_racer"
 AGENT6_OBSERVATION_VERSION = "agent6_td3_raw_telemetry_v1"
@@ -291,6 +294,31 @@ def read_policy_metadata(policy_path: Path | None) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def episode_metadata_is_policy_controlled(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    summary = value.get("episode_summary")
+    return isinstance(summary, Mapping) and bool(summary.get("policy_controlled"))
+
+
+def policy_checkpoint_is_verified(policy_path: Path, metadata_key: str) -> bool:
+    if not policy_path.is_file():
+        return False
+    metadata = read_policy_metadata(policy_path)
+    return episode_metadata_is_policy_controlled(metadata.get(metadata_key))
+
+
+def evaluation_checkpoint_is_verified(policy_path: Path) -> bool:
+    if not policy_path.is_file():
+        return False
+    evaluation = read_policy_metadata(policy_path).get("best_evaluation")
+    return (
+        isinstance(evaluation, Mapping)
+        and evaluation.get("deterministic") is True
+        and finite_float(evaluation.get("repeats")) >= 1.0
+    )
+
+
 def policy_contract_mismatches(metadata: Mapping[str, Any]) -> list[str]:
     if not metadata:
         return []
@@ -486,8 +514,16 @@ class Td3ScratchAgent:
 
 
 def _default_policy_path() -> Path:
-    if DEFAULT_BEST_DISTANCE_MODEL_PATH.is_file():
+    if evaluation_checkpoint_is_verified(DEFAULT_BEST_EVALUATION_MODEL_PATH):
+        return DEFAULT_BEST_EVALUATION_MODEL_PATH
+    if policy_checkpoint_is_verified(
+        DEFAULT_BEST_DISTANCE_MODEL_PATH,
+        "best_distance_episode",
+    ):
         return DEFAULT_BEST_DISTANCE_MODEL_PATH
-    if DEFAULT_BEST_REWARD_MODEL_PATH.is_file():
+    if policy_checkpoint_is_verified(
+        DEFAULT_BEST_REWARD_MODEL_PATH,
+        "best_reward_episode",
+    ):
         return DEFAULT_BEST_REWARD_MODEL_PATH
     return DEFAULT_MODEL_PATH

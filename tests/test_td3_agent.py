@@ -37,7 +37,9 @@ from agents.td3_agent import (  # noqa: E402
     Td3ScratchAgent,
     build_td3_observation,
     decode_td3_action,
+    episode_metadata_is_policy_controlled,
     metadata_path_for_policy,
+    policy_checkpoint_is_verified,
     policy_contract_mismatches,
     rate_limit_td3_action,
 )
@@ -150,6 +152,32 @@ class Td3ScratchAgentTests(unittest.TestCase):
             metadata_path_for_policy(Path("agent6.zip")),
             Path("agent6.metadata.json"),
         )
+
+    def test_verified_checkpoint_requires_policy_controlled_episode_metadata(self):
+        self.assertFalse(episode_metadata_is_policy_controlled({"distance_m": 182.3}))
+        self.assertTrue(
+            episode_metadata_is_policy_controlled(
+                {"episode_summary": {"policy_controlled": True}}
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "policy.zip"
+            policy_path.touch()
+            metadata_path_for_policy(policy_path).write_text(
+                (
+                    '{"best_distance_episode": {"episode_summary": '
+                    '{"policy_controlled": true}}}'
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertTrue(
+                policy_checkpoint_is_verified(
+                    policy_path,
+                    "best_distance_episode",
+                )
+            )
 
 
 class Td3ScratchTrainingUtilityTests(unittest.TestCase):
@@ -285,6 +313,33 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
         self.assertEqual(train_td3_agent.recent_success_count(history), 3)
 
+    def test_warmup_episodes_cannot_advance_curriculum(self):
+        launch = train_td3_agent.CURRICULUM[0]
+
+        self.assertFalse(
+            train_td3_agent.curriculum_stage_can_advance(
+                launch,
+                [True, True, True],
+                policy_controlled=False,
+            )
+        )
+        self.assertFalse(
+            train_td3_agent.curriculum_stage_can_advance(
+                launch,
+                [True, True, True],
+                completed_lap=120.0,
+                policy_controlled=False,
+            )
+        )
+
+    def test_policy_controlled_episode_must_start_after_warmup(self):
+        self.assertFalse(
+            train_td3_agent.episode_is_policy_controlled(19_999, 20_000)
+        )
+        self.assertTrue(
+            train_td3_agent.episode_is_policy_controlled(20_000, 20_000)
+        )
+
     def test_default_training_args_use_stable_td3_warmup(self):
         with mock.patch.object(sys, "argv", [str(SCRIPT_PATH)]):
             args = train_td3_agent.parse_args()
@@ -304,11 +359,17 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             best_distance_path = directory_path / "best_distance.zip"
             best_reward_path = directory_path / "best_reward.zip"
             metadata_path_for_policy(best_distance_path).write_text(
-                '{"best_distance_episode": {"distance_m": 171.2}}',
+                (
+                    '{"best_distance_episode": {"distance_m": 171.2, '
+                    '"episode_summary": {"policy_controlled": true}}}'
+                ),
                 encoding="utf-8",
             )
             metadata_path_for_policy(best_reward_path).write_text(
-                '{"best_reward_episode": {"reward": 304.6}}',
+                (
+                    '{"best_reward_episode": {"reward": 304.6, '
+                    '"episode_summary": {"policy_controlled": true}}}'
+                ),
                 encoding="utf-8",
             )
 
@@ -317,6 +378,74 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
         self.assertEqual(callback.best_distance_m, 171.2)
         self.assertEqual(callback.best_reward, 304.6)
+
+    def test_best_model_callback_ignores_warmup_and_legacy_bests(self):
+        class FakeBaseCallback:
+            def __init__(self, verbose=0):
+                self.verbose = verbose
+                self.locals = {}
+                self.model = mock.Mock()
+                self.num_timesteps = 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            best_distance_path = directory_path / "best_distance.zip"
+            best_reward_path = directory_path / "best_reward.zip"
+            metadata_path_for_policy(best_distance_path).write_text(
+                '{"best_distance_episode": {"distance_m": 182.3}}',
+                encoding="utf-8",
+            )
+            metadata_path_for_policy(best_reward_path).write_text(
+                '{"best_reward_episode": {"reward": 413.4}}',
+                encoding="utf-8",
+            )
+
+            Callback = train_td3_agent.make_best_model_callback_class(
+                FakeBaseCallback
+            )
+            callback = Callback(
+                best_distance_path,
+                best_reward_path,
+                {},
+                learning_starts=20_000,
+            )
+
+            self.assertIsNone(callback.best_distance_m)
+            self.assertIsNone(callback.best_reward)
+
+            callback.num_timesteps = 19_000
+            callback.locals = {
+                "infos": [
+                    {
+                        "episode_summary": {
+                            "policy_controlled": False,
+                            "distance_m": 200.0,
+                            "reward": 500.0,
+                        }
+                    }
+                ]
+            }
+            callback._on_step()
+
+            callback.model.save.assert_not_called()
+
+            callback.num_timesteps = 21_000
+            callback.locals = {
+                "infos": [
+                    {
+                        "episode_summary": {
+                            "policy_controlled": True,
+                            "distance_m": 80.0,
+                            "reward": -100.0,
+                        }
+                    }
+                ]
+            }
+            callback._on_step()
+
+            self.assertEqual(callback.best_distance_m, 80.0)
+            self.assertEqual(callback.best_reward, -100.0)
+            self.assertEqual(callback.model.save.call_count, 2)
 
     def test_progress_line_reports_stage_and_best_distance(self):
         state = train_td3_agent.TrainingProgressState()
