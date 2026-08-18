@@ -62,6 +62,7 @@ SOFT_TRACK_BOUNDARY = 1.04
 STUCK_SPEED_LIMIT_KMH = 5.0
 STUCK_PROGRESS_LIMIT_M = 0.12
 STUCK_SECONDS_LIMIT = 3.0
+DEFAULT_STAGE_SUCCESS_WINDOW_SIZE = 10
 DEFAULT_STAGE_SUCCESS_REQUIREMENTS = {
     "launch": 3,
     "first_corner": 2,
@@ -154,6 +155,8 @@ EPISODE_COLUMNS = [
     "max_stopped_seconds",
     "stage_success_streak",
     "stage_required_successes",
+    "stage_recent_successes",
+    "stage_success_window_size",
     "stage_success_total",
     "termination_reason",
     "final_speed_kmh",
@@ -310,6 +313,21 @@ def required_successes_for_stage(stage: CurriculumStage | str) -> int:
     return max(1, int(DEFAULT_STAGE_SUCCESS_REQUIREMENTS.get(stage_id, 1)))
 
 
+def recent_success_count(success_history: list[bool]) -> int:
+    return sum(1 for success in success_history[-DEFAULT_STAGE_SUCCESS_WINDOW_SIZE:] if success)
+
+
+def curriculum_stage_can_advance(
+    stage: CurriculumStage,
+    success_history: list[bool],
+    *,
+    completed_lap: float | None = None,
+) -> bool:
+    if completed_lap is not None:
+        return True
+    return recent_success_count(success_history) >= required_successes_for_stage(stage)
+
+
 def calculate_td3_reward(
     telemetry: Mapping[str, Any],
     action: Mapping[str, Any],
@@ -426,7 +444,8 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "automatic_gear_shift": True,
         "actuator_rate_limited": True,
         "stage_success_requirements": dict(DEFAULT_STAGE_SUCCESS_REQUIREMENTS),
-        "curriculum_promotion": "success_streak_required",
+        "stage_success_window_size": DEFAULT_STAGE_SUCCESS_WINDOW_SIZE,
+        "curriculum_promotion": "successes_within_rolling_window",
         "curriculum": [stage.__dict__ for stage in CURRICULUM],
         "total_timesteps_requested": args.total_timesteps,
         "seed": args.seed,
@@ -573,6 +592,10 @@ def make_training_env_class(gym: Any, spaces: Any):
             self.stage_success_streak = 0
             self.stage_success_totals = {
                 stage.stage_id: 0
+                for stage in CURRICULUM
+            }
+            self.stage_success_windows = {
+                stage.stage_id: []
                 for stage in CURRICULUM
             }
             self.episodes_started = 0
@@ -752,6 +775,10 @@ def make_training_env_class(gym: Any, spaces: Any):
                 self.current_stage.stage_id,
                 0,
             )
+            stage_success_history = self.stage_success_windows[
+                self.current_stage.stage_id
+            ]
+            stage_recent_successes = recent_success_count(stage_success_history)
             stage_completed = False
             if terminated or truncated:
                 if stage_success:
@@ -760,12 +787,19 @@ def make_training_env_class(gym: Any, spaces: Any):
                     self.stage_success_totals[self.current_stage.stage_id] = (
                         stage_success_total
                     )
-                    stage_completed = (
-                        completed_lap is not None
-                        or self.stage_success_streak >= stage_required_successes
-                    )
                 else:
                     self.stage_success_streak = 0
+                stage_success_history.append(bool(stage_success))
+                if len(stage_success_history) > DEFAULT_STAGE_SUCCESS_WINDOW_SIZE:
+                    del stage_success_history[
+                        : len(stage_success_history) - DEFAULT_STAGE_SUCCESS_WINDOW_SIZE
+                    ]
+                stage_recent_successes = recent_success_count(stage_success_history)
+                stage_completed = curriculum_stage_can_advance(
+                    self.current_stage,
+                    stage_success_history,
+                    completed_lap=completed_lap,
+                )
             reason = ""
             if terminated or truncated:
                 reason = "truncated"
@@ -812,6 +846,7 @@ def make_training_env_class(gym: Any, spaces: Any):
                     telemetry,
                     stage_success_streak=self.stage_success_streak,
                     stage_required_successes=stage_required_successes,
+                    stage_recent_successes=stage_recent_successes,
                     stage_success_total=stage_success_total,
                 )
                 info["episode_summary"] = summary
@@ -844,6 +879,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             *,
             stage_success_streak: int | None = None,
             stage_required_successes: int | None = None,
+            stage_recent_successes: int | None = None,
             stage_success_total: int | None = None,
         ) -> dict[str, Any]:
             sensors = track_sensors(telemetry)
@@ -884,6 +920,12 @@ def make_training_env_class(gym: Any, spaces: Any):
                     if stage_required_successes is None
                     else stage_required_successes
                 ),
+                "stage_recent_successes": (
+                    recent_success_count(self.stage_success_windows.get(stage_id, []))
+                    if stage_recent_successes is None
+                    else stage_recent_successes
+                ),
+                "stage_success_window_size": DEFAULT_STAGE_SUCCESS_WINDOW_SIZE,
                 "stage_success_total": (
                     self.stage_success_totals.get(stage_id, 0)
                     if stage_success_total is None
@@ -1373,7 +1415,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--tau", type=float, default=0.005)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--train-freq", type=int, default=1)
     parser.add_argument("--gradient-steps", type=int, default=1)
     parser.add_argument("--policy-delay", type=int, default=2)

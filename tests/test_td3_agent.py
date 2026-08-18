@@ -251,7 +251,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertLess(stages[0].distance_target_m, stages[-1].distance_target_m)
         self.assertGreater(stages[-1].success_reward, stages[0].success_reward)
 
-    def test_curriculum_requires_repeatable_launch_success(self):
+    def test_curriculum_requires_repeatable_launch_successes_in_recent_window(self):
         self.assertEqual(
             train_td3_agent.required_successes_for_stage(
                 train_td3_agent.CURRICULUM[0]
@@ -260,12 +260,37 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         )
         self.assertEqual(train_td3_agent.required_successes_for_stage("first_corner"), 2)
         self.assertEqual(train_td3_agent.required_successes_for_stage("unknown"), 1)
+        self.assertEqual(train_td3_agent.DEFAULT_STAGE_SUCCESS_WINDOW_SIZE, 10)
+
+        launch = train_td3_agent.CURRICULUM[0]
+        one_lucky_success = [False, False, True, False, False]
+        spaced_successes = [True, False, False, True, False, False, True]
+
+        self.assertFalse(
+            train_td3_agent.curriculum_stage_can_advance(
+                launch,
+                one_lucky_success,
+            )
+        )
+        self.assertTrue(
+            train_td3_agent.curriculum_stage_can_advance(
+                launch,
+                spaced_successes,
+            )
+        )
+
+    def test_recent_success_count_uses_last_ten_episodes(self):
+        history = [True, True, False, False, False, False, False, False, False, False]
+        history.extend([True, False, True, False, True])
+
+        self.assertEqual(train_td3_agent.recent_success_count(history), 3)
 
     def test_default_training_args_use_stable_td3_warmup(self):
         with mock.patch.object(sys, "argv", [str(SCRIPT_PATH)]):
             args = train_td3_agent.parse_args()
 
         self.assertEqual(args.learning_starts, 20_000)
+        self.assertEqual(args.learning_rate, 3e-4)
         self.assertEqual(args.action_noise_sigma, 0.12)
         self.assertEqual(args.warmup_steer_std, 0.18)
 
