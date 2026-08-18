@@ -37,7 +37,7 @@ from agents.td3_agent import (  # noqa: E402
     build_td3_observation,
     clamp,
     decode_td3_action,
-    episode_metadata_is_policy_controlled,
+    episode_metadata_is_deterministic_probe,
     finite_float,
     metadata_path_for_policy,
     rate_limit_td3_action,
@@ -55,6 +55,7 @@ DEFAULT_TENSORBOARD_DIR = PROJECT_ROOT / "models" / "tensorboard" / "agent6_td3_
 DEFAULT_REPLAY_BUFFER_PATH = PROJECT_ROOT / "models" / "replay_buffers" / "agent6_td3_scratch.pkl"
 DEFAULT_CHECKPOINT_FREQ = 100_000
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 1.0
+ACTION_NOISE_UPDATE_INTERVAL_STEPS = 1_000
 
 REWARD_VERSION = "agent6_td3_reward_v1_raw_progress_curriculum"
 OFF_TRACK_GRACE_STEPS = 4
@@ -141,6 +142,9 @@ EPISODE_COLUMNS = [
     "episodes_seen",
     "global_timestep",
     "policy_controlled",
+    "deterministic_probe",
+    "curriculum_eligible",
+    "action_noise_sigma",
     "stage_id",
     "stage_name",
     "steps",
@@ -324,9 +328,9 @@ def curriculum_stage_can_advance(
     success_history: list[bool],
     *,
     completed_lap: float | None = None,
-    policy_controlled: bool = True,
+    curriculum_eligible: bool = True,
 ) -> bool:
-    if not policy_controlled:
+    if not curriculum_eligible:
         return False
     if completed_lap is not None:
         return True
@@ -339,6 +343,44 @@ def episode_is_policy_controlled(
 ) -> bool:
     """Return true only when every action in the episode came from the policy."""
     return int(episode_start_timestep) >= max(0, int(learning_starts))
+
+
+def episode_is_curriculum_eligible(
+    *,
+    policy_controlled: bool,
+    deterministic_probe: bool,
+) -> bool:
+    return bool(policy_controlled and deterministic_probe)
+
+
+def action_noise_sigma_at_timestep(
+    timestep: int,
+    *,
+    learning_starts: int,
+    initial_sigma: float,
+    final_sigma: float,
+    decay_steps: int,
+) -> float:
+    initial = max(0.0, float(initial_sigma))
+    final = max(0.0, float(final_sigma))
+    elapsed = max(0, int(timestep) - max(0, int(learning_starts)))
+    progress = clamp(elapsed / max(1, int(decay_steps)), 0.0, 1.0)
+    return initial + (final - initial) * progress
+
+
+def should_schedule_policy_probe(
+    *,
+    timestep: int,
+    learning_starts: int,
+    probe_episodes_completed: int,
+    policy_episodes_since_probe: int,
+    probe_interval: int,
+) -> bool:
+    if int(timestep) < max(0, int(learning_starts)):
+        return False
+    if int(probe_episodes_completed) == 0:
+        return True
+    return int(policy_episodes_since_probe) >= max(1, int(probe_interval))
 
 
 def calculate_td3_reward(
@@ -458,9 +500,14 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "actuator_rate_limited": True,
         "stage_success_requirements": dict(DEFAULT_STAGE_SUCCESS_REQUIREMENTS),
         "stage_success_window_size": DEFAULT_STAGE_SUCCESS_WINDOW_SIZE,
-        "curriculum_promotion": "successes_within_rolling_window",
+        "curriculum_promotion": "deterministic_probe_successes_within_rolling_window",
         "curriculum_counts_warmup_episodes": False,
-        "best_checkpoint_scope": "policy_controlled_training_episodes_only",
+        "curriculum_counts_exploration_episodes": False,
+        "policy_probe_interval_episodes": args.policy_probe_interval,
+        "policy_probe_action_noise_sigma": 0.0,
+        "policy_probe_freezes_gradient_updates": True,
+        "policy_probe_writes_to_replay_buffer": True,
+        "best_checkpoint_scope": "deterministic_policy_probe_episodes_only",
         "curriculum": [stage.__dict__ for stage in CURRICULUM],
         "total_timesteps_requested": args.total_timesteps,
         "seed": args.seed,
@@ -493,7 +540,9 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "policy_delay": args.policy_delay,
             "target_policy_noise": args.target_policy_noise,
             "target_noise_clip": args.target_noise_clip,
-            "action_noise_sigma": args.action_noise_sigma,
+            "action_noise_initial_sigma": args.action_noise_sigma,
+            "action_noise_final_sigma": args.action_noise_final_sigma,
+            "action_noise_decay_steps": args.action_noise_decay_steps,
             "net_arch": args.net_arch,
             "device": args.device,
         },
@@ -628,6 +677,8 @@ def make_training_env_class(gym: Any, spaces: Any):
             self.episode_start_distance = 0.0
             self.episode_start_time = 0.0
             self.episode_start_timestep = 0
+            self.deterministic_probe = False
+            self.action_noise_sigma: float | None = None
             self.episode_max_speed = 0.0
             self.episode_off_track_steps = 0
             self.episode_furthest_distance = 0.0
@@ -641,6 +692,15 @@ def make_training_env_class(gym: Any, spaces: Any):
         @property
         def current_stage(self) -> CurriculumStage:
             return CURRICULUM[self.stage_index]
+
+        def set_policy_mode(
+            self,
+            *,
+            deterministic_probe: bool,
+            action_noise_sigma: float,
+        ) -> None:
+            self.deterministic_probe = bool(deterministic_probe)
+            self.action_noise_sigma = max(0.0, float(action_noise_sigma))
 
         def reset(self, *, seed: int | None = None, options: Mapping[str, Any] | None = None):
             super().reset(seed=seed)
@@ -793,6 +853,17 @@ def make_training_env_class(gym: Any, spaces: Any):
                 self.episode_start_timestep,
                 self.learning_starts,
             )
+            curriculum_eligible = episode_is_curriculum_eligible(
+                policy_controlled=policy_controlled,
+                deterministic_probe=self.deterministic_probe,
+            )
+            applied_action_noise_sigma = (
+                None
+                if not policy_controlled
+                else 0.0
+                if self.deterministic_probe
+                else self.action_noise_sigma
+            )
             stage_required_successes = required_successes_for_stage(self.current_stage)
             stage_success_total = self.stage_success_totals.get(
                 self.current_stage.stage_id,
@@ -804,7 +875,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             stage_recent_successes = recent_success_count(stage_success_history)
             stage_completed = False
             if terminated or truncated:
-                if policy_controlled:
+                if curriculum_eligible:
                     if stage_success:
                         self.stage_success_streak += 1
                         stage_success_total += 1
@@ -826,17 +897,21 @@ def make_training_env_class(gym: Any, spaces: Any):
                         self.current_stage,
                         stage_success_history,
                         completed_lap=completed_lap,
-                        policy_controlled=policy_controlled,
+                        curriculum_eligible=curriculum_eligible,
                     )
             reason = ""
             if terminated or truncated:
                 reason = "truncated"
                 if completed_lap is not None and not policy_controlled:
                     reason = "warmup_lap_completed"
+                elif completed_lap is not None and not curriculum_eligible:
+                    reason = "exploration_lap_completed"
                 elif completed_lap is not None:
                     reason = "target_laps_completed"
                 elif stage_success and not policy_controlled:
                     reason = "warmup_stage_success"
+                elif stage_success and not curriculum_eligible:
+                    reason = "exploration_stage_success"
                 elif stage_completed:
                     reason = "curriculum_stage_completed"
                 elif stage_success:
@@ -864,6 +939,9 @@ def make_training_env_class(gym: Any, spaces: Any):
 
             info: dict[str, Any] = {
                 "policy_controlled": policy_controlled,
+                "deterministic_probe": self.deterministic_probe,
+                "curriculum_eligible": curriculum_eligible,
+                "action_noise_sigma": applied_action_noise_sigma,
                 "stage_id": self.current_stage.stage_id,
                 "stage_name": self.current_stage.name,
                 "distance_m": self.episode_furthest_distance,
@@ -882,6 +960,8 @@ def make_training_env_class(gym: Any, spaces: Any):
                     stage_recent_successes=stage_recent_successes,
                     stage_success_total=stage_success_total,
                     policy_controlled=policy_controlled,
+                    deterministic_probe=self.deterministic_probe,
+                    curriculum_eligible=curriculum_eligible,
                 )
                 info["episode_summary"] = summary
                 if stage_completed and self.stage_index < len(CURRICULUM) - 1:
@@ -916,6 +996,8 @@ def make_training_env_class(gym: Any, spaces: Any):
             stage_recent_successes: int | None = None,
             stage_success_total: int | None = None,
             policy_controlled: bool | None = None,
+            deterministic_probe: bool | None = None,
+            curriculum_eligible: bool | None = None,
         ) -> dict[str, Any]:
             sensors = track_sensors(telemetry)
             distance_m = self.episode_furthest_distance
@@ -935,8 +1017,25 @@ def make_training_env_class(gym: Any, spaces: Any):
                     self.episode_start_timestep,
                     self.learning_starts,
                 )
+            if deterministic_probe is None:
+                deterministic_probe = self.deterministic_probe
+            if curriculum_eligible is None:
+                curriculum_eligible = episode_is_curriculum_eligible(
+                    policy_controlled=policy_controlled,
+                    deterministic_probe=deterministic_probe,
+                )
+            applied_action_noise_sigma = (
+                None
+                if not policy_controlled
+                else 0.0
+                if deterministic_probe
+                else self.action_noise_sigma
+            )
             return {
                 "policy_controlled": policy_controlled,
+                "deterministic_probe": deterministic_probe,
+                "curriculum_eligible": curriculum_eligible,
+                "action_noise_sigma": applied_action_noise_sigma,
                 "stage_id": self.current_stage.stage_id,
                 "stage_name": self.current_stage.name,
                 "steps": self.steps,
@@ -1233,6 +1332,116 @@ def make_episode_summary_callback_class(BaseCallback: Any):
     return EpisodeSummaryCallback
 
 
+def make_exploration_schedule_callback_class(BaseCallback: Any):
+    class ExplorationScheduleCallback(BaseCallback):
+        def __init__(
+            self,
+            raw_env: Any,
+            noise_factory: Any,
+            *,
+            learning_starts: int,
+            initial_sigma: float,
+            final_sigma: float,
+            decay_steps: int,
+            probe_interval: int,
+            training_gradient_steps: int,
+        ) -> None:
+            super().__init__(verbose=0)
+            self.raw_env = raw_env
+            self.noise_factory = noise_factory
+            self.learning_starts = max(0, int(learning_starts))
+            self.initial_sigma = max(0.0, float(initial_sigma))
+            self.final_sigma = max(0.0, float(final_sigma))
+            self.decay_steps = max(1, int(decay_steps))
+            self.probe_interval = max(1, int(probe_interval))
+            self.training_gradient_steps = int(training_gradient_steps)
+            self.probe_episodes_completed = 0
+            self.policy_episodes_since_probe = 0
+            self.current_episode_is_probe = False
+            self.last_noise_update_timestep = -ACTION_NOISE_UPDATE_INTERVAL_STEPS
+
+        def _on_training_start(self):
+            self._apply_policy_mode(deterministic_probe=False, force=True)
+
+        def _on_step(self):
+            completed_episode = False
+            infos = self.locals.get("infos", [])
+            for info in infos:
+                summary = info.get("episode_summary") if isinstance(info, dict) else None
+                if summary is None:
+                    continue
+                completed_episode = True
+                if bool(summary.get("policy_controlled")):
+                    if bool(summary.get("deterministic_probe")):
+                        self.probe_episodes_completed += 1
+                        self.policy_episodes_since_probe = 0
+                    else:
+                        self.policy_episodes_since_probe += 1
+
+            if completed_episode:
+                next_episode_is_probe = should_schedule_policy_probe(
+                    timestep=self.num_timesteps,
+                    learning_starts=self.learning_starts,
+                    probe_episodes_completed=self.probe_episodes_completed,
+                    policy_episodes_since_probe=self.policy_episodes_since_probe,
+                    probe_interval=self.probe_interval,
+                )
+                self._apply_policy_mode(
+                    deterministic_probe=next_episode_is_probe,
+                    force=True,
+                )
+            elif self.current_episode_is_probe:
+                # The first probe action is selected after the preceding rollout's
+                # final update. Freeze from this point until the probe terminates.
+                self.model.gradient_steps = 0
+            elif (
+                not self.current_episode_is_probe
+                and self.num_timesteps - self.last_noise_update_timestep
+                >= ACTION_NOISE_UPDATE_INTERVAL_STEPS
+            ):
+                self._apply_policy_mode(deterministic_probe=False, force=False)
+            return True
+
+        def _on_training_end(self):
+            sigma = action_noise_sigma_at_timestep(
+                self.num_timesteps,
+                learning_starts=self.learning_starts,
+                initial_sigma=self.initial_sigma,
+                final_sigma=self.final_sigma,
+                decay_steps=self.decay_steps,
+            )
+            self.model.action_noise = self.noise_factory(sigma)
+            self.model.gradient_steps = self.training_gradient_steps
+
+        def _apply_policy_mode(
+            self,
+            *,
+            deterministic_probe: bool,
+            force: bool,
+        ) -> None:
+            sigma = action_noise_sigma_at_timestep(
+                self.num_timesteps,
+                learning_starts=self.learning_starts,
+                initial_sigma=self.initial_sigma,
+                final_sigma=self.final_sigma,
+                decay_steps=self.decay_steps,
+            )
+            mode_changed = deterministic_probe != self.current_episode_is_probe
+            if force or mode_changed or not deterministic_probe:
+                self.model.action_noise = (
+                    None if deterministic_probe else self.noise_factory(sigma)
+                )
+            self.model.gradient_steps = self.training_gradient_steps
+            self.current_episode_is_probe = deterministic_probe
+            self.last_noise_update_timestep = self.num_timesteps
+            self.raw_env.set_policy_mode(
+                deterministic_probe=deterministic_probe,
+                action_noise_sigma=sigma,
+            )
+
+    return ExplorationScheduleCallback
+
+
 def make_best_model_callback_class(BaseCallback: Any):
     class BestModelCallback(BaseCallback):
         def __init__(
@@ -1264,7 +1473,7 @@ def make_best_model_callback_class(BaseCallback: Any):
                 if summary is None:
                     continue
                 if (
-                    not bool(summary.get("policy_controlled"))
+                    not bool(summary.get("curriculum_eligible"))
                     or self.num_timesteps <= self.learning_starts
                 ):
                     continue
@@ -1278,7 +1487,9 @@ def make_best_model_callback_class(BaseCallback: Any):
                         self.best_distance_model_path,
                         "best_distance_episode",
                         {
-                            "selection_reason": "furthest distance reached by scratch TD3",
+                            "selection_reason": (
+                                "furthest distance reached by deterministic TD3 probe"
+                            ),
                             "distance_m": distance_m,
                             "episode_summary": summary,
                         },
@@ -1291,7 +1502,9 @@ def make_best_model_callback_class(BaseCallback: Any):
                         self.best_reward_model_path,
                         "best_reward_episode",
                         {
-                            "selection_reason": "highest shaped reward reached by scratch TD3",
+                            "selection_reason": (
+                                "highest shaped reward reached by deterministic TD3 probe"
+                            ),
                             "reward": reward,
                             "distance_m": distance_m,
                             "episode_summary": summary,
@@ -1332,7 +1545,7 @@ def make_best_model_callback_class(BaseCallback: Any):
 
         @staticmethod
         def _is_verified_policy_episode(best_episode: Any) -> bool:
-            return episode_metadata_is_policy_controlled(best_episode)
+            return episode_metadata_is_deterministic_probe(best_episode)
 
     return BestModelCallback
 
@@ -1474,6 +1687,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-policy-noise", type=float, default=0.20)
     parser.add_argument("--target-noise-clip", type=float, default=0.50)
     parser.add_argument("--action-noise-sigma", type=float, default=0.12)
+    parser.add_argument("--action-noise-final-sigma", type=float, default=0.04)
+    parser.add_argument("--action-noise-decay-steps", type=int, default=200_000)
+    parser.add_argument("--policy-probe-interval", type=int, default=10)
     parser.add_argument("--net-arch", type=int, nargs="+", default=[400, 300])
     parser.add_argument(
         "--warmup-action-mode",
@@ -1495,7 +1711,21 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.action_noise_sigma < 0.0:
+        parser.error("--action-noise-sigma cannot be negative")
+    if not 0.0 <= args.action_noise_final_sigma <= args.action_noise_sigma:
+        parser.error(
+            "--action-noise-final-sigma must be between zero and "
+            "--action-noise-sigma"
+        )
+    if args.action_noise_decay_steps < 1:
+        parser.error("--action-noise-decay-steps must be at least 1")
+    if args.policy_probe_interval < 1:
+        parser.error("--policy-probe-interval must be at least 1")
+    if args.train_freq != 1:
+        parser.error("--train-freq must be 1 when deterministic probes are enabled")
+    return args
 
 
 def main() -> None:
@@ -1553,6 +1783,9 @@ def main() -> None:
         filename=str(run_dir / "monitor.csv"),
         info_keywords=(
             "policy_controlled",
+            "deterministic_probe",
+            "curriculum_eligible",
+            "action_noise_sigma",
             "stage_id",
             "distance_m",
             "furthest_distance_m",
@@ -1569,10 +1802,13 @@ def main() -> None:
         args.tensorboard_dir,
         disable_tensorboard=args.no_tensorboard,
     )
-    action_noise = NormalActionNoise(
-        mean=np.zeros(3, dtype=np.float32),
-        sigma=np.ones(3, dtype=np.float32) * args.action_noise_sigma,
-    )
+    def make_action_noise(sigma: float):
+        return NormalActionNoise(
+            mean=np.zeros(3, dtype=np.float32),
+            sigma=np.ones(3, dtype=np.float32) * max(0.0, float(sigma)),
+        )
+
+    action_noise = make_action_noise(args.action_noise_sigma)
     model = TD3(
         "MlpPolicy",
         env,
@@ -1596,9 +1832,22 @@ def main() -> None:
     )
 
     progress_state = TrainingProgressState()
+    ExplorationScheduleCallback = make_exploration_schedule_callback_class(
+        BaseCallback
+    )
     EpisodeSummaryCallback = make_episode_summary_callback_class(BaseCallback)
     BestModelCallback = make_best_model_callback_class(BaseCallback)
     callbacks = [
+        ExplorationScheduleCallback(
+            raw_env,
+            make_action_noise,
+            learning_starts=args.learning_starts,
+            initial_sigma=args.action_noise_sigma,
+            final_sigma=args.action_noise_final_sigma,
+            decay_steps=args.action_noise_decay_steps,
+            probe_interval=args.policy_probe_interval,
+            training_gradient_steps=args.gradient_steps,
+        ),
         make_checkpoint_callback(CheckpointCallback, args),
         EpisodeSummaryCallback(run_dir, progress_state),
         BestModelCallback(

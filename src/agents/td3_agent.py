@@ -301,11 +301,18 @@ def episode_metadata_is_policy_controlled(value: Any) -> bool:
     return isinstance(summary, Mapping) and bool(summary.get("policy_controlled"))
 
 
+def episode_metadata_is_deterministic_probe(value: Any) -> bool:
+    if not episode_metadata_is_policy_controlled(value):
+        return False
+    summary = value.get("episode_summary")
+    return isinstance(summary, Mapping) and bool(summary.get("deterministic_probe"))
+
+
 def policy_checkpoint_is_verified(policy_path: Path, metadata_key: str) -> bool:
     if not policy_path.is_file():
         return False
     metadata = read_policy_metadata(policy_path)
-    return episode_metadata_is_policy_controlled(metadata.get(metadata_key))
+    return episode_metadata_is_deterministic_probe(metadata.get(metadata_key))
 
 
 def evaluation_checkpoint_is_verified(policy_path: Path) -> bool:

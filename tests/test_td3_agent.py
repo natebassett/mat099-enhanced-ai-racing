@@ -37,6 +37,7 @@ from agents.td3_agent import (  # noqa: E402
     Td3ScratchAgent,
     build_td3_observation,
     decode_td3_action,
+    episode_metadata_is_deterministic_probe,
     episode_metadata_is_policy_controlled,
     metadata_path_for_policy,
     policy_checkpoint_is_verified,
@@ -153,11 +154,26 @@ class Td3ScratchAgentTests(unittest.TestCase):
             Path("agent6.metadata.json"),
         )
 
-    def test_verified_checkpoint_requires_policy_controlled_episode_metadata(self):
+    def test_verified_checkpoint_requires_deterministic_probe_metadata(self):
         self.assertFalse(episode_metadata_is_policy_controlled({"distance_m": 182.3}))
         self.assertTrue(
             episode_metadata_is_policy_controlled(
                 {"episode_summary": {"policy_controlled": True}}
+            )
+        )
+        self.assertFalse(
+            episode_metadata_is_deterministic_probe(
+                {"episode_summary": {"policy_controlled": True}}
+            )
+        )
+        self.assertTrue(
+            episode_metadata_is_deterministic_probe(
+                {
+                    "episode_summary": {
+                        "policy_controlled": True,
+                        "deterministic_probe": True,
+                    }
+                }
             )
         )
 
@@ -167,7 +183,7 @@ class Td3ScratchAgentTests(unittest.TestCase):
             metadata_path_for_policy(policy_path).write_text(
                 (
                     '{"best_distance_episode": {"episode_summary": '
-                    '{"policy_controlled": true}}}'
+                    '{"policy_controlled": true, "deterministic_probe": true}}}'
                 ),
                 encoding="utf-8",
             )
@@ -320,7 +336,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             train_td3_agent.curriculum_stage_can_advance(
                 launch,
                 [True, True, True],
-                policy_controlled=False,
+                curriculum_eligible=False,
             )
         )
         self.assertFalse(
@@ -328,7 +344,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                 launch,
                 [True, True, True],
                 completed_lap=120.0,
-                policy_controlled=False,
+                curriculum_eligible=False,
             )
         )
 
@@ -340,6 +356,160 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             train_td3_agent.episode_is_policy_controlled(20_000, 20_000)
         )
 
+    def test_only_deterministic_policy_probes_are_curriculum_eligible(self):
+        self.assertFalse(
+            train_td3_agent.episode_is_curriculum_eligible(
+                policy_controlled=False,
+                deterministic_probe=True,
+            )
+        )
+        self.assertFalse(
+            train_td3_agent.episode_is_curriculum_eligible(
+                policy_controlled=True,
+                deterministic_probe=False,
+            )
+        )
+        self.assertTrue(
+            train_td3_agent.episode_is_curriculum_eligible(
+                policy_controlled=True,
+                deterministic_probe=True,
+            )
+        )
+
+    def test_action_noise_decays_after_learning_starts(self):
+        def sigma(timestep):
+            return train_td3_agent.action_noise_sigma_at_timestep(
+                timestep,
+                learning_starts=20_000,
+                initial_sigma=0.12,
+                final_sigma=0.04,
+                decay_steps=200_000,
+            )
+
+        self.assertAlmostEqual(sigma(0), 0.12)
+        self.assertAlmostEqual(sigma(20_000), 0.12)
+        self.assertAlmostEqual(sigma(120_000), 0.08)
+        self.assertAlmostEqual(sigma(220_000), 0.04)
+        self.assertAlmostEqual(sigma(300_000), 0.04)
+
+    def test_policy_probe_schedule_starts_promptly_and_then_spaces_probes(self):
+        schedule = train_td3_agent.should_schedule_policy_probe
+
+        self.assertFalse(
+            schedule(
+                timestep=19_999,
+                learning_starts=20_000,
+                probe_episodes_completed=0,
+                policy_episodes_since_probe=0,
+                probe_interval=10,
+            )
+        )
+        self.assertTrue(
+            schedule(
+                timestep=20_000,
+                learning_starts=20_000,
+                probe_episodes_completed=0,
+                policy_episodes_since_probe=0,
+                probe_interval=10,
+            )
+        )
+        self.assertFalse(
+            schedule(
+                timestep=30_000,
+                learning_starts=20_000,
+                probe_episodes_completed=1,
+                policy_episodes_since_probe=9,
+                probe_interval=10,
+            )
+        )
+        self.assertTrue(
+            schedule(
+                timestep=31_000,
+                learning_starts=20_000,
+                probe_episodes_completed=1,
+                policy_episodes_since_probe=10,
+                probe_interval=10,
+            )
+        )
+
+    def test_exploration_callback_toggles_probe_mode_at_episode_boundaries(self):
+        class FakeBaseCallback:
+            def __init__(self, verbose=0):
+                self.verbose = verbose
+                self.locals = {}
+                self.model = types.SimpleNamespace(
+                    action_noise=None,
+                    gradient_steps=1,
+                )
+                self.num_timesteps = 0
+
+        class FakeEnv:
+            def __init__(self):
+                self.modes = []
+
+            def set_policy_mode(self, **mode):
+                self.modes.append(mode)
+
+        env = FakeEnv()
+        Callback = train_td3_agent.make_exploration_schedule_callback_class(
+            FakeBaseCallback
+        )
+        callback = Callback(
+            env,
+            lambda sigma: ("noise", sigma),
+            learning_starts=20_000,
+            initial_sigma=0.12,
+            final_sigma=0.04,
+            decay_steps=200_000,
+            probe_interval=10,
+            training_gradient_steps=1,
+        )
+        callback._on_training_start()
+
+        self.assertEqual(callback.model.action_noise, ("noise", 0.12))
+        self.assertEqual(callback.model.gradient_steps, 1)
+        self.assertFalse(env.modes[-1]["deterministic_probe"])
+
+        callback.num_timesteps = 20_100
+        callback.locals = {
+            "infos": [
+                {
+                    "episode_summary": {
+                        "policy_controlled": False,
+                        "deterministic_probe": False,
+                    }
+                }
+            ]
+        }
+        callback._on_step()
+
+        self.assertIsNone(callback.model.action_noise)
+        self.assertEqual(callback.model.gradient_steps, 1)
+        self.assertTrue(env.modes[-1]["deterministic_probe"])
+
+        callback.num_timesteps = 20_101
+        callback.locals = {"infos": [{}]}
+        callback._on_step()
+
+        self.assertEqual(callback.model.gradient_steps, 0)
+
+        callback.num_timesteps = 20_500
+        callback.locals = {
+            "infos": [
+                {
+                    "episode_summary": {
+                        "policy_controlled": True,
+                        "deterministic_probe": True,
+                    }
+                }
+            ]
+        }
+        callback._on_step()
+
+        self.assertIsNotNone(callback.model.action_noise)
+        self.assertEqual(callback.model.gradient_steps, 1)
+        self.assertFalse(env.modes[-1]["deterministic_probe"])
+
     def test_default_training_args_use_stable_td3_warmup(self):
         with mock.patch.object(sys, "argv", [str(SCRIPT_PATH)]):
             args = train_td3_agent.parse_args()
@@ -347,6 +517,9 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(args.learning_starts, 20_000)
         self.assertEqual(args.learning_rate, 3e-4)
         self.assertEqual(args.action_noise_sigma, 0.12)
+        self.assertEqual(args.action_noise_final_sigma, 0.04)
+        self.assertEqual(args.action_noise_decay_steps, 200_000)
+        self.assertEqual(args.policy_probe_interval, 10)
         self.assertEqual(args.warmup_steer_std, 0.18)
 
     def test_best_model_callback_preserves_previous_global_bests(self):
@@ -361,14 +534,16 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             metadata_path_for_policy(best_distance_path).write_text(
                 (
                     '{"best_distance_episode": {"distance_m": 171.2, '
-                    '"episode_summary": {"policy_controlled": true}}}'
+                    '"episode_summary": {"policy_controlled": true, '
+                    '"deterministic_probe": true}}}'
                 ),
                 encoding="utf-8",
             )
             metadata_path_for_policy(best_reward_path).write_text(
                 (
                     '{"best_reward_episode": {"reward": 304.6, '
-                    '"episode_summary": {"policy_controlled": true}}}'
+                    '"episode_summary": {"policy_controlled": true, '
+                    '"deterministic_probe": true}}}'
                 ),
                 encoding="utf-8",
             )
@@ -379,7 +554,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(callback.best_distance_m, 171.2)
         self.assertEqual(callback.best_reward, 304.6)
 
-    def test_best_model_callback_ignores_warmup_and_legacy_bests(self):
+    def test_best_model_callback_only_saves_deterministic_probes(self):
         class FakeBaseCallback:
             def __init__(self, verbose=0):
                 self.verbose = verbose
@@ -418,7 +593,9 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                 "infos": [
                     {
                         "episode_summary": {
-                            "policy_controlled": False,
+                            "policy_controlled": True,
+                            "deterministic_probe": False,
+                            "curriculum_eligible": False,
                             "distance_m": 200.0,
                             "reward": 500.0,
                         }
@@ -435,6 +612,8 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                     {
                         "episode_summary": {
                             "policy_controlled": True,
+                            "deterministic_probe": True,
+                            "curriculum_eligible": True,
                             "distance_m": 80.0,
                             "reward": -100.0,
                         }
