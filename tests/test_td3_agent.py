@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 import sys
 import tempfile
@@ -482,8 +483,9 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         callback._on_training_start()
 
         self.assertEqual(callback.model.action_noise, ("noise", 0.12))
-        self.assertEqual(callback.model.gradient_steps, 1)
+        self.assertEqual(callback.model.gradient_steps, 0)
         self.assertFalse(env.modes[-1]["deterministic_probe"])
+        self.assertEqual(env.modes[-1]["training_phase"], "warmup")
 
         callback.num_timesteps = 20_100
         callback.locals = {
@@ -501,6 +503,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertIsNone(callback.model.action_noise)
         self.assertEqual(callback.model.gradient_steps, 1)
         self.assertTrue(env.modes[-1]["deterministic_probe"])
+        self.assertEqual(env.modes[-1]["training_phase"], "deterministic_probe")
 
         callback.num_timesteps = 20_101
         callback.locals = {"infos": [{}]}
@@ -524,12 +527,64 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertIsNotNone(callback.model.action_noise)
         self.assertEqual(callback.model.gradient_steps, 1)
         self.assertFalse(env.modes[-1]["deterministic_probe"])
+        self.assertEqual(env.modes[-1]["training_phase"], "learning")
+
+    def test_continuation_callback_refills_replay_before_enabling_gradients(self):
+        class FakeBaseCallback:
+            def __init__(self, verbose=0):
+                self.locals = {}
+                self.model = types.SimpleNamespace(
+                    action_noise=None,
+                    gradient_steps=1,
+                )
+                self.num_timesteps = 0
+
+        class FakeEnv:
+            def __init__(self):
+                self.modes = []
+
+            def set_policy_mode(self, **mode):
+                self.modes.append(mode)
+
+        env = FakeEnv()
+        Callback = train_td3_agent.make_exploration_schedule_callback_class(
+            FakeBaseCallback
+        )
+        callback = Callback(
+            env,
+            lambda sigma: ("noise", sigma),
+            learning_starts=10_000,
+            initial_sigma=0.04,
+            final_sigma=0.02,
+            decay_steps=200_000,
+            probe_interval=10,
+            training_gradient_steps=1,
+            pre_update_training_phase="replay_refill",
+        )
+
+        callback._on_training_start()
+        self.assertEqual(callback.model.gradient_steps, 0)
+        self.assertEqual(env.modes[-1]["training_phase"], "replay_refill")
+
+        callback.num_timesteps = 9_999
+        callback.locals = {"infos": [{}]}
+        callback._on_step()
+        self.assertEqual(callback.model.gradient_steps, 0)
+
+        callback.num_timesteps = 10_000
+        callback._on_step()
+        self.assertEqual(callback.model.gradient_steps, 1)
+        self.assertEqual(env.modes[-1]["training_phase"], "learning")
 
     def test_default_training_args_use_stable_td3_warmup(self):
         with mock.patch.object(sys, "argv", [str(SCRIPT_PATH)]):
             args = train_td3_agent.parse_args()
 
         self.assertEqual(args.learning_starts, 20_000)
+        self.assertFalse(args.continuation)
+        self.assertEqual(args.start_stage, "launch")
+        self.assertEqual(args.replay_refill_steps, 0)
+        self.assertEqual(args.buffer_size, 1_000_000)
         self.assertEqual(args.learning_rate, 3e-4)
         self.assertEqual(args.learning_rate_final, 1e-4)
         self.assertEqual(args.checkpoint_freq, 25_000)
@@ -538,6 +593,130 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(args.action_noise_decay_steps, 200_000)
         self.assertEqual(args.policy_probe_interval, 10)
         self.assertEqual(args.warmup_steer_std, 0.18)
+        self.assertFalse(args.save_best_replay_buffer)
+
+    def test_continuation_defaults_are_conservative_and_policy_controlled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "verified.zip"
+            checkpoint.write_bytes(b"checkpoint")
+            metadata_path_for_policy(checkpoint).write_text(
+                json.dumps(
+                    {
+                        "model_family": AGENT6_MODEL_FAMILY,
+                        "observation_version": AGENT6_OBSERVATION_VERSION,
+                        "action_version": AGENT6_ACTION_VERSION,
+                        "feature_names": FEATURE_NAMES,
+                        "action_shape": [3],
+                        "track": "g-track-3",
+                        "best_evaluation": {
+                            "deterministic": True,
+                            "repeats": 3,
+                            "track": "g-track-3",
+                            "median_progress_m": 1859.65,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            argv = [
+                str(SCRIPT_PATH),
+                "--resume-from",
+                str(checkpoint),
+                "--total-timesteps",
+                "20000",
+            ]
+            with mock.patch.object(sys, "argv", argv):
+                args = train_td3_agent.parse_args()
+
+        self.assertTrue(args.continuation)
+        self.assertEqual(args.start_stage, "sector_progression")
+        self.assertEqual(args.replay_refill_steps, 10_000)
+        self.assertEqual(args.buffer_size, 300_000)
+        self.assertEqual(args.learning_rate, 1e-4)
+        self.assertEqual(args.learning_rate_final, 3e-5)
+        self.assertEqual(args.action_noise_sigma, 0.04)
+        self.assertEqual(args.action_noise_final_sigma, 0.02)
+        self.assertTrue(args.save_best_replay_buffer)
+        self.assertEqual(train_td3_agent.policy_action_start_timestep(args), 0)
+        self.assertEqual(
+            train_td3_agent.gradient_update_start_timestep(args),
+            10_000,
+        )
+
+    def test_continuation_model_loads_verified_weights_with_fresh_replay(self):
+        class FakeTD3:
+            load_call = None
+
+            @classmethod
+            def load(cls, path, **kwargs):
+                cls.load_call = (path, kwargs)
+                return types.SimpleNamespace(num_timesteps=35_226)
+
+        args = types.SimpleNamespace(
+            continuation=True,
+            resume_from=Path("verified.zip"),
+            verbose_training=False,
+            buffer_size=300_000,
+            learning_starts=20_000,
+            replay_refill_steps=10_000,
+            batch_size=256,
+            gamma=0.995,
+            tau=0.005,
+            train_freq=1,
+            gradient_steps=1,
+            policy_delay=2,
+            target_policy_noise=0.2,
+            target_noise_clip=0.5,
+            seed=42,
+            device="cpu",
+        )
+        schedule = lambda _: 1e-4
+        model = train_td3_agent.create_td3_model(
+            FakeTD3,
+            args=args,
+            env="env",
+            tensorboard_log=None,
+            action_noise="noise",
+            learning_rate_schedule=schedule,
+        )
+
+        self.assertEqual(model.num_timesteps, 35_226)
+        path, kwargs = FakeTD3.load_call
+        self.assertEqual(path, "verified.zip")
+        self.assertEqual(kwargs["learning_starts"], 0)
+        self.assertEqual(kwargs["buffer_size"], 300_000)
+        self.assertIs(kwargs["learning_rate"], schedule)
+
+    def test_continuation_stage_requires_verified_prerequisite_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "verified.zip"
+            checkpoint.write_bytes(b"checkpoint")
+            metadata_path_for_policy(checkpoint).write_text(
+                json.dumps(
+                    {
+                        "model_family": AGENT6_MODEL_FAMILY,
+                        "observation_version": AGENT6_OBSERVATION_VERSION,
+                        "action_version": AGENT6_ACTION_VERSION,
+                        "feature_names": FEATURE_NAMES,
+                        "action_shape": [3],
+                        "best_evaluation": {
+                            "deterministic": True,
+                            "repeats": 3,
+                            "track": "g-track-3",
+                            "median_progress_m": 500.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            errors = train_td3_agent.continuation_source_errors(
+                checkpoint,
+                track="g-track-3",
+                start_stage="sector_progression",
+            )
+
+        self.assertTrue(any("requires 520.0m" in error for error in errors))
 
     def test_final_learning_rate_cannot_exceed_initial_rate(self):
         argv = [
@@ -612,6 +791,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                 best_reward_path,
                 {},
                 learning_starts=20_000,
+                save_best_replay_buffer=True,
             )
 
             self.assertIsNone(callback.best_distance_m)
@@ -654,6 +834,16 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             self.assertEqual(callback.best_distance_m, 80.0)
             self.assertEqual(callback.best_reward, -100.0)
             self.assertEqual(callback.model.save.call_count, 2)
+            callback.model.save_replay_buffer.assert_called_once_with(
+                str(train_td3_agent.replay_buffer_path_for_policy(best_distance_path))
+            )
+            saved_metadata = json.loads(
+                metadata_path_for_policy(best_distance_path).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                saved_metadata["best_distance_episode"]["replay_buffer_path"],
+                str(train_td3_agent.replay_buffer_path_for_policy(best_distance_path)),
+            )
 
     def test_progress_line_reports_stage_and_best_distance(self):
         state = train_td3_agent.TrainingProgressState()

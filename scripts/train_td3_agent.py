@@ -38,8 +38,10 @@ from agents.td3_agent import (  # noqa: E402
     clamp,
     decode_td3_action,
     episode_metadata_is_deterministic_probe,
+    evaluation_checkpoint_is_verified,
     finite_float,
     metadata_path_for_policy,
+    policy_contract_mismatches,
     rate_limit_td3_action,
     read_policy_metadata,
     shift_gears,
@@ -58,6 +60,12 @@ DEFAULT_PROGRESS_INTERVAL_SECONDS = 1.0
 ACTION_NOISE_UPDATE_INTERVAL_STEPS = 1_000
 DEFAULT_LEARNING_RATE = 3e-4
 DEFAULT_FINAL_LEARNING_RATE = 1e-4
+DEFAULT_CONTINUATION_LEARNING_RATE = 1e-4
+DEFAULT_CONTINUATION_FINAL_LEARNING_RATE = 3e-5
+DEFAULT_CONTINUATION_BUFFER_SIZE = 300_000
+DEFAULT_CONTINUATION_REPLAY_REFILL_STEPS = 10_000
+DEFAULT_CONTINUATION_ACTION_NOISE_SIGMA = 0.04
+DEFAULT_CONTINUATION_FINAL_ACTION_NOISE_SIGMA = 0.02
 
 REWARD_VERSION = "agent6_td3_reward_v1_raw_progress_curriculum"
 OFF_TRACK_GRACE_STEPS = 4
@@ -139,6 +147,7 @@ CURRICULUM: tuple[CurriculumStage, ...] = (
         130.0,
     ),
 )
+CURRICULUM_STAGE_IDS = tuple(stage.stage_id for stage in CURRICULUM)
 
 EPISODE_COLUMNS = [
     "episodes_seen",
@@ -146,6 +155,7 @@ EPISODE_COLUMNS = [
     "policy_controlled",
     "deterministic_probe",
     "curriculum_eligible",
+    "training_phase",
     "action_noise_sigma",
     "stage_id",
     "stage_name",
@@ -254,6 +264,81 @@ def write_json(path: Path, payload: Mapping[str, Any]) -> None:
 def make_default_run_dir() -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return DEFAULT_RUNS_DIR / timestamp
+
+
+def curriculum_stage_index(stage_id: str) -> int:
+    for index, stage in enumerate(CURRICULUM):
+        if stage.stage_id == stage_id:
+            return index
+    raise ValueError(f"Unknown TD3 curriculum stage: {stage_id}")
+
+
+def replay_buffer_path_for_policy(policy_path: Path) -> Path:
+    return Path(policy_path).with_suffix(".replay_buffer.pkl")
+
+
+def continuation_source_errors(
+    policy_path: Path,
+    *,
+    track: str,
+    start_stage: str,
+) -> list[str]:
+    path = Path(policy_path)
+    if not path.is_file():
+        return [f"continuation checkpoint does not exist: {path}"]
+    if not evaluation_checkpoint_is_verified(path):
+        return ["continuation checkpoint has no verified deterministic evaluation"]
+
+    metadata = read_policy_metadata(path)
+    errors = [
+        f"continuation checkpoint contract mismatch: {key}"
+        for key in policy_contract_mismatches(metadata)
+    ]
+    evaluation = metadata.get("best_evaluation")
+    evaluation_repeats = (
+        int(finite_float(evaluation.get("repeats")))
+        if isinstance(evaluation, Mapping)
+        else 0
+    )
+    if evaluation_repeats < 3:
+        errors.append("continuation checkpoint requires at least 3 evaluation repeats")
+    evaluation_track = (
+        str(evaluation.get("track"))
+        if isinstance(evaluation, Mapping) and evaluation.get("track")
+        else str(metadata.get("track") or "")
+    )
+    if evaluation_track and evaluation_track != str(track):
+        errors.append(
+            "continuation checkpoint track mismatch: "
+            f"expected {track}, found {evaluation_track}"
+        )
+    stage_index = curriculum_stage_index(start_stage)
+    required_progress_m = (
+        0.0
+        if stage_index == 0
+        else CURRICULUM[stage_index - 1].distance_target_m
+    )
+    evaluation_progress_m = (
+        finite_float(evaluation.get("median_progress_m"))
+        if isinstance(evaluation, Mapping)
+        else 0.0
+    )
+    if evaluation_progress_m < required_progress_m:
+        errors.append(
+            f"continuation checkpoint reached {evaluation_progress_m:.1f}m, but "
+            f"stage {start_stage} requires {required_progress_m:.1f}m"
+        )
+    return errors
+
+
+def policy_action_start_timestep(args: argparse.Namespace) -> int:
+    return 0 if args.continuation else max(0, int(args.learning_starts))
+
+
+def gradient_update_start_timestep(args: argparse.Namespace) -> int:
+    if args.continuation:
+        return max(0, int(args.replay_refill_steps))
+    return max(0, int(args.learning_starts))
 
 
 def calculate_progress_delta(
@@ -509,6 +594,13 @@ def calculate_td3_reward(
 
 
 def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
+    source_metadata = read_policy_metadata(args.resume_from)
+    source_evaluation = source_metadata.get("best_evaluation")
+    source_progress_m = (
+        finite_float(source_evaluation.get("median_progress_m"))
+        if isinstance(source_evaluation, Mapping)
+        else None
+    )
     return {
         "model_family": AGENT6_MODEL_FAMILY,
         "observation_version": AGENT6_OBSERVATION_VERSION,
@@ -537,7 +629,20 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "policy_probe_freezes_gradient_updates": True,
         "policy_probe_writes_to_replay_buffer": True,
         "best_checkpoint_scope": "deterministic_policy_probe_episodes_only",
+        "best_checkpoint_saves_replay_buffer": args.save_best_replay_buffer,
         "curriculum": [stage.__dict__ for stage in CURRICULUM],
+        "curriculum_start_stage": args.start_stage,
+        "continuation": {
+            "enabled": args.continuation,
+            "source_policy_path": (
+                str(args.resume_from) if args.resume_from is not None else None
+            ),
+            "source_verified_evaluation_progress_m": source_progress_m,
+            "fresh_replay_buffer": args.continuation,
+            "replay_refill_steps": args.replay_refill_steps,
+            "replay_refill_uses_loaded_policy": args.continuation,
+            "replay_refill_freezes_gradient_updates": args.continuation,
+        },
         "total_timesteps_requested": args.total_timesteps,
         "seed": args.seed,
         "manual_start": args.manual_start,
@@ -560,13 +665,17 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "td3_hyperparameters": {
             "buffer_size": args.buffer_size,
             "learning_starts": args.learning_starts,
+            "policy_action_starts_at_timestep": policy_action_start_timestep(args),
+            "gradient_updates_start_at_timestep": gradient_update_start_timestep(args),
             "batch_size": args.batch_size,
             "gamma": args.gamma,
             "tau": args.tau,
             "learning_rate": args.learning_rate,
             "learning_rate_final": args.learning_rate_final,
             "learning_rate_schedule": "linear_after_learning_starts",
-            "learning_rate_decay_starts_at_timestep": args.learning_starts,
+            "learning_rate_decay_starts_at_timestep": (
+                gradient_update_start_timestep(args)
+            ),
             "train_freq": args.train_freq,
             "gradient_steps": args.gradient_steps,
             "policy_delay": args.policy_delay,
@@ -662,6 +771,8 @@ def make_training_env_class(gym: Any, spaces: Any):
             warmup_accel_max: float = 1.00,
             warmup_brake_probability: float = 0.12,
             learning_starts: int = 20_000,
+            initial_stage_id: str = "launch",
+            pre_update_training_phase: str = "warmup",
         ) -> None:
             super().__init__()
             self.track_name = track_name
@@ -686,7 +797,9 @@ def make_training_env_class(gym: Any, spaces: Any):
                 shape=(len(FEATURE_NAMES),),
                 dtype=np.float32,
             )
-            self.stage_index = 0
+            self.stage_index = curriculum_stage_index(initial_stage_id)
+            self.pre_update_training_phase = str(pre_update_training_phase)
+            self.training_phase = self.pre_update_training_phase
             self.stage_success_streak = 0
             self.stage_success_totals = {
                 stage.stage_id: 0
@@ -730,9 +843,11 @@ def make_training_env_class(gym: Any, spaces: Any):
             *,
             deterministic_probe: bool,
             action_noise_sigma: float,
+            training_phase: str,
         ) -> None:
             self.deterministic_probe = bool(deterministic_probe)
             self.action_noise_sigma = max(0.0, float(action_noise_sigma))
+            self.training_phase = str(training_phase)
 
         def reset(self, *, seed: int | None = None, options: Mapping[str, Any] | None = None):
             super().reset(seed=seed)
@@ -973,6 +1088,7 @@ def make_training_env_class(gym: Any, spaces: Any):
                 "policy_controlled": policy_controlled,
                 "deterministic_probe": self.deterministic_probe,
                 "curriculum_eligible": curriculum_eligible,
+                "training_phase": self.training_phase,
                 "action_noise_sigma": applied_action_noise_sigma,
                 "stage_id": self.current_stage.stage_id,
                 "stage_name": self.current_stage.name,
@@ -1067,6 +1183,7 @@ def make_training_env_class(gym: Any, spaces: Any):
                 "policy_controlled": policy_controlled,
                 "deterministic_probe": deterministic_probe,
                 "curriculum_eligible": curriculum_eligible,
+                "training_phase": self.training_phase,
                 "action_noise_sigma": applied_action_noise_sigma,
                 "stage_id": self.current_stage.stage_id,
                 "stage_name": self.current_stage.name,
@@ -1377,6 +1494,7 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             decay_steps: int,
             probe_interval: int,
             training_gradient_steps: int,
+            pre_update_training_phase: str = "warmup",
         ) -> None:
             super().__init__(verbose=0)
             self.raw_env = raw_env
@@ -1387,6 +1505,7 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             self.decay_steps = max(1, int(decay_steps))
             self.probe_interval = max(1, int(probe_interval))
             self.training_gradient_steps = int(training_gradient_steps)
+            self.pre_update_training_phase = str(pre_update_training_phase)
             self.probe_episodes_completed = 0
             self.policy_episodes_since_probe = 0
             self.current_episode_is_probe = False
@@ -1427,6 +1546,11 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                 # final update. Freeze from this point until the probe terminates.
                 self.model.gradient_steps = 0
             elif (
+                self.num_timesteps >= self.learning_starts
+                and self.model.gradient_steps != self.training_gradient_steps
+            ):
+                self._apply_policy_mode(deterministic_probe=False, force=True)
+            elif (
                 not self.current_episode_is_probe
                 and self.num_timesteps - self.last_noise_update_timestep
                 >= ACTION_NOISE_UPDATE_INTERVAL_STEPS
@@ -1463,12 +1587,24 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                 self.model.action_noise = (
                     None if deterministic_probe else self.noise_factory(sigma)
                 )
-            self.model.gradient_steps = self.training_gradient_steps
+            self.model.gradient_steps = (
+                0
+                if self.num_timesteps < self.learning_starts
+                else self.training_gradient_steps
+            )
             self.current_episode_is_probe = deterministic_probe
             self.last_noise_update_timestep = self.num_timesteps
+            training_phase = (
+                "deterministic_probe"
+                if deterministic_probe
+                else self.pre_update_training_phase
+                if self.num_timesteps < self.learning_starts
+                else "learning"
+            )
             self.raw_env.set_policy_mode(
                 deterministic_probe=deterministic_probe,
                 action_noise_sigma=sigma,
+                training_phase=training_phase,
             )
 
     return ExplorationScheduleCallback
@@ -1483,6 +1619,7 @@ def make_best_model_callback_class(BaseCallback: Any):
             metadata: Mapping[str, Any],
             progress_state: TrainingProgressState | None = None,
             learning_starts: int = 0,
+            save_best_replay_buffer: bool = False,
         ) -> None:
             super().__init__(verbose=0)
             self.best_distance_model_path = Path(best_distance_model_path)
@@ -1490,6 +1627,7 @@ def make_best_model_callback_class(BaseCallback: Any):
             self.metadata = dict(metadata)
             self.progress_state = progress_state
             self.learning_starts = max(0, int(learning_starts))
+            self.save_best_replay_buffer = bool(save_best_replay_buffer)
             self.best_distance_m = self._read_existing_best_distance()
             self.best_reward = self._read_existing_best_reward()
             if self.progress_state is not None:
@@ -1525,6 +1663,7 @@ def make_best_model_callback_class(BaseCallback: Any):
                             "distance_m": distance_m,
                             "episode_summary": summary,
                         },
+                        save_replay_buffer=self.save_best_replay_buffer,
                     )
                 if self.best_reward is None or reward > self.best_reward:
                     self.best_reward = reward
@@ -1544,9 +1683,21 @@ def make_best_model_callback_class(BaseCallback: Any):
                     )
             return True
 
-        def _save_best(self, path: Path, metadata_key: str, payload: Mapping[str, Any]) -> None:
+        def _save_best(
+            self,
+            path: Path,
+            metadata_key: str,
+            payload: Mapping[str, Any],
+            *,
+            save_replay_buffer: bool = False,
+        ) -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             self.model.save(str(path))
+            saved_payload = dict(payload)
+            if save_replay_buffer:
+                replay_buffer_path = replay_buffer_path_for_policy(path)
+                self.model.save_replay_buffer(str(replay_buffer_path))
+                saved_payload["replay_buffer_path"] = str(replay_buffer_path)
             write_json(
                 metadata_path_for_policy(path),
                 {
@@ -1554,7 +1705,7 @@ def make_best_model_callback_class(BaseCallback: Any):
                     metadata_key: {
                         "saved_at": datetime.now(timezone.utc).isoformat(),
                         "global_timestep": self.num_timesteps,
-                        **payload,
+                        **saved_payload,
                     },
                 },
             )
@@ -1672,12 +1823,76 @@ def resolve_tensorboard_log_dir(tensorboard_dir: Path, *, disable_tensorboard: b
     return None
 
 
+def create_td3_model(
+    TD3: Any,
+    *,
+    args: argparse.Namespace,
+    env: Any,
+    tensorboard_log: str | None,
+    action_noise: Any,
+    learning_rate_schedule: Callable[[float], float],
+) -> Any:
+    model_kwargs = {
+        "env": env,
+        "verbose": int(args.verbose_training),
+        "tensorboard_log": tensorboard_log,
+        "buffer_size": args.buffer_size,
+        "learning_starts": policy_action_start_timestep(args),
+        "batch_size": args.batch_size,
+        "gamma": args.gamma,
+        "tau": args.tau,
+        "learning_rate": learning_rate_schedule,
+        "train_freq": args.train_freq,
+        "gradient_steps": args.gradient_steps,
+        "policy_delay": args.policy_delay,
+        "target_policy_noise": args.target_policy_noise,
+        "target_noise_clip": args.target_noise_clip,
+        "action_noise": action_noise,
+        "seed": args.seed,
+        "device": args.device,
+    }
+    if args.continuation:
+        return TD3.load(str(args.resume_from), **model_kwargs)
+    return TD3(
+        "MlpPolicy",
+        policy_kwargs={"net_arch": args.net_arch},
+        **model_kwargs,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train Agent 6 as a from-scratch TD3 continuous-control racer.",
+        description=(
+            "Train Agent 6 from scratch or continue a verified reward-only TD3 "
+            "checkpoint."
+        ),
     )
     parser.add_argument("--total-timesteps", type=int, default=100_000)
     parser.add_argument("--track", default=DEFAULT_TRACK_NAME)
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help="Verified Agent 6 evaluation checkpoint to continue training.",
+    )
+    parser.add_argument(
+        "--start-stage",
+        choices=CURRICULUM_STAGE_IDS,
+        default=None,
+        help=(
+            "Initial curriculum stage. Continuation defaults to sector_progression; "
+            "fresh training defaults to launch."
+        ),
+    )
+    parser.add_argument(
+        "--replay-refill-steps",
+        type=int,
+        default=None,
+        help=(
+            "Policy-controlled steps collected into a fresh replay buffer with "
+            "gradient updates frozen."
+        ),
+    )
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument(
         "--best-distance-model-path",
@@ -1707,16 +1922,16 @@ def parse_args() -> argparse.Namespace:
         help="Run the SB3 environment checker before training. This starts TORCS.",
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--buffer-size", type=int, default=1_000_000)
+    parser.add_argument("--buffer-size", type=int, default=None)
     parser.add_argument("--learning-starts", type=int, default=20_000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--tau", type=float, default=0.005)
-    parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
+    parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument(
         "--learning-rate-final",
         type=float,
-        default=DEFAULT_FINAL_LEARNING_RATE,
+        default=None,
         help=(
             "Final TD3 optimizer learning rate. It is reached linearly at the "
             "end of the requested training run."
@@ -1727,8 +1942,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy-delay", type=int, default=2)
     parser.add_argument("--target-policy-noise", type=float, default=0.20)
     parser.add_argument("--target-noise-clip", type=float, default=0.50)
-    parser.add_argument("--action-noise-sigma", type=float, default=0.12)
-    parser.add_argument("--action-noise-final-sigma", type=float, default=0.04)
+    parser.add_argument("--action-noise-sigma", type=float, default=None)
+    parser.add_argument("--action-noise-final-sigma", type=float, default=None)
     parser.add_argument("--action-noise-decay-steps", type=int, default=200_000)
     parser.add_argument("--policy-probe-interval", type=int, default=10)
     parser.add_argument("--net-arch", type=int, nargs="+", default=[400, 300])
@@ -1752,7 +1967,80 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
+    parser.add_argument(
+        "--save-best-replay-buffer",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Save an aligned replay buffer beside each exact best-distance model. "
+            "Enabled by default for continuation training."
+        ),
+    )
     args = parser.parse_args()
+    args.continuation = args.resume_from is not None
+    if args.start_stage is None:
+        args.start_stage = "sector_progression" if args.continuation else "launch"
+    if args.replay_refill_steps is None:
+        args.replay_refill_steps = (
+            DEFAULT_CONTINUATION_REPLAY_REFILL_STEPS if args.continuation else 0
+        )
+    if args.buffer_size is None:
+        args.buffer_size = (
+            DEFAULT_CONTINUATION_BUFFER_SIZE if args.continuation else 1_000_000
+        )
+    if args.learning_rate is None:
+        args.learning_rate = (
+            DEFAULT_CONTINUATION_LEARNING_RATE
+            if args.continuation
+            else DEFAULT_LEARNING_RATE
+        )
+    if args.learning_rate_final is None:
+        args.learning_rate_final = (
+            DEFAULT_CONTINUATION_FINAL_LEARNING_RATE
+            if args.continuation
+            else DEFAULT_FINAL_LEARNING_RATE
+        )
+    if args.action_noise_sigma is None:
+        args.action_noise_sigma = (
+            DEFAULT_CONTINUATION_ACTION_NOISE_SIGMA
+            if args.continuation
+            else 0.12
+        )
+    if args.action_noise_final_sigma is None:
+        args.action_noise_final_sigma = (
+            DEFAULT_CONTINUATION_FINAL_ACTION_NOISE_SIGMA
+            if args.continuation
+            else 0.04
+        )
+    if args.save_best_replay_buffer is None:
+        args.save_best_replay_buffer = args.continuation
+
+    if not args.continuation and args.start_stage != "launch":
+        parser.error("--start-stage requires --resume-from unless it is launch")
+    if args.continuation:
+        source_errors = continuation_source_errors(
+            args.resume_from,
+            track=args.track,
+            start_stage=args.start_stage,
+        )
+        if source_errors:
+            parser.error(source_errors[0])
+        source_path = args.resume_from.resolve()
+        output_paths = (
+            args.model_path.resolve(),
+            args.best_distance_model_path.resolve(),
+            args.best_reward_model_path.resolve(),
+        )
+        if source_path in output_paths:
+            parser.error("continuation outputs must not overwrite --resume-from")
+    if args.total_timesteps < 1:
+        parser.error("--total-timesteps must be at least 1")
+    if args.replay_refill_steps < 0:
+        parser.error("--replay-refill-steps cannot be negative")
+    if args.continuation and args.replay_refill_steps >= args.total_timesteps:
+        parser.error("--replay-refill-steps must be less than --total-timesteps")
+    if args.buffer_size < max(1, args.batch_size):
+        parser.error("--buffer-size must be at least --batch-size")
     if args.checkpoint_freq < 1:
         parser.error("--checkpoint-freq must be at least 1")
     if args.learning_rate <= 0.0:
@@ -1819,7 +2107,11 @@ def main() -> None:
         warmup_accel_min=args.warmup_accel_min,
         warmup_accel_max=args.warmup_accel_max,
         warmup_brake_probability=args.warmup_brake_probability,
-        learning_starts=args.learning_starts,
+        learning_starts=policy_action_start_timestep(args),
+        initial_stage_id=args.start_stage,
+        pre_update_training_phase=(
+            "replay_refill" if args.continuation else "warmup"
+        ),
     )
     raw_env.action_space.seed(args.seed)
     raw_env.observation_space.seed(args.seed)
@@ -1835,6 +2127,7 @@ def main() -> None:
             "policy_controlled",
             "deterministic_probe",
             "curriculum_eligible",
+            "training_phase",
             "action_noise_sigma",
             "stage_id",
             "distance_m",
@@ -1862,30 +2155,28 @@ def main() -> None:
     learning_rate_schedule = linear_learning_rate_schedule(
         args.learning_rate,
         args.learning_rate_final,
-        learning_starts=args.learning_starts,
+        learning_starts=gradient_update_start_timestep(args),
         total_timesteps=args.total_timesteps,
     )
-    model = TD3(
-        "MlpPolicy",
-        env,
-        verbose=int(args.verbose_training),
+    model = create_td3_model(
+        TD3,
+        args=args,
+        env=env,
         tensorboard_log=tensorboard_log,
-        buffer_size=args.buffer_size,
-        learning_starts=args.learning_starts,
-        batch_size=args.batch_size,
-        gamma=args.gamma,
-        tau=args.tau,
-        learning_rate=learning_rate_schedule,
-        train_freq=args.train_freq,
-        gradient_steps=args.gradient_steps,
-        policy_delay=args.policy_delay,
-        target_policy_noise=args.target_policy_noise,
-        target_noise_clip=args.target_noise_clip,
         action_noise=action_noise,
-        policy_kwargs={"net_arch": args.net_arch},
-        seed=args.seed,
-        device=args.device,
+        learning_rate_schedule=learning_rate_schedule,
     )
+    if args.continuation:
+        metadata["continuation"]["source_model_num_timesteps"] = int(
+            getattr(model, "num_timesteps", 0)
+        )
+        write_json(run_dir / "training_metadata.json", metadata)
+        write_json(metadata_path_for_policy(args.model_path), metadata)
+        print(
+            "Continuing verified Agent 6 policy from "
+            f"{args.resume_from} at stage={args.start_stage}; "
+            f"replay refill={args.replay_refill_steps:,} steps."
+        )
 
     progress_state = TrainingProgressState()
     ExplorationScheduleCallback = make_exploration_schedule_callback_class(
@@ -1897,12 +2188,15 @@ def main() -> None:
         ExplorationScheduleCallback(
             raw_env,
             make_action_noise,
-            learning_starts=args.learning_starts,
+            learning_starts=gradient_update_start_timestep(args),
             initial_sigma=args.action_noise_sigma,
             final_sigma=args.action_noise_final_sigma,
             decay_steps=args.action_noise_decay_steps,
             probe_interval=args.policy_probe_interval,
             training_gradient_steps=args.gradient_steps,
+            pre_update_training_phase=(
+                "replay_refill" if args.continuation else "warmup"
+            ),
         ),
         make_checkpoint_callback(CheckpointCallback, args),
         EpisodeSummaryCallback(run_dir, progress_state),
@@ -1911,7 +2205,8 @@ def main() -> None:
             args.best_reward_model_path,
             metadata,
             progress_state,
-            learning_starts=args.learning_starts,
+            learning_starts=gradient_update_start_timestep(args),
+            save_best_replay_buffer=args.save_best_replay_buffer,
         ),
     ]
     if not args.no_progress_bar and not args.verbose_training:
