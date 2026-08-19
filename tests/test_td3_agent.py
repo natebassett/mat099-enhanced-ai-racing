@@ -392,6 +392,21 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertAlmostEqual(sigma(220_000), 0.04)
         self.assertAlmostEqual(sigma(300_000), 0.04)
 
+    def test_learning_rate_schedule_decays_and_clamps_progress(self):
+        schedule = train_td3_agent.linear_learning_rate_schedule(
+            3e-4,
+            1e-4,
+            learning_starts=20_000,
+            total_timesteps=220_000,
+        )
+
+        self.assertAlmostEqual(schedule(1.0), 3e-4)
+        self.assertAlmostEqual(schedule(1.0 - (20_000 / 220_000)), 3e-4)
+        self.assertAlmostEqual(schedule(1.0 - (120_000 / 220_000)), 2e-4)
+        self.assertAlmostEqual(schedule(0.0), 1e-4)
+        self.assertAlmostEqual(schedule(2.0), 3e-4)
+        self.assertAlmostEqual(schedule(-1.0), 1e-4)
+
     def test_policy_probe_schedule_starts_promptly_and_then_spaces_probes(self):
         schedule = train_td3_agent.should_schedule_policy_probe
 
@@ -516,11 +531,25 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
         self.assertEqual(args.learning_starts, 20_000)
         self.assertEqual(args.learning_rate, 3e-4)
+        self.assertEqual(args.learning_rate_final, 1e-4)
+        self.assertEqual(args.checkpoint_freq, 25_000)
         self.assertEqual(args.action_noise_sigma, 0.12)
         self.assertEqual(args.action_noise_final_sigma, 0.04)
         self.assertEqual(args.action_noise_decay_steps, 200_000)
         self.assertEqual(args.policy_probe_interval, 10)
         self.assertEqual(args.warmup_steer_std, 0.18)
+
+    def test_final_learning_rate_cannot_exceed_initial_rate(self):
+        argv = [
+            str(SCRIPT_PATH),
+            "--learning-rate",
+            "0.0001",
+            "--learning-rate-final",
+            "0.0003",
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            with self.assertRaises(SystemExit):
+                train_td3_agent.parse_args()
 
     def test_best_model_callback_preserves_previous_global_bests(self):
         class FakeBaseCallback:

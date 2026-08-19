@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
@@ -53,9 +53,11 @@ DEFAULT_RUNS_DIR = PROJECT_ROOT / "models" / "training_runs" / "agent6_td3_scrat
 DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "models" / "checkpoints" / "agent6_td3_scratch"
 DEFAULT_TENSORBOARD_DIR = PROJECT_ROOT / "models" / "tensorboard" / "agent6_td3_scratch"
 DEFAULT_REPLAY_BUFFER_PATH = PROJECT_ROOT / "models" / "replay_buffers" / "agent6_td3_scratch.pkl"
-DEFAULT_CHECKPOINT_FREQ = 100_000
+DEFAULT_CHECKPOINT_FREQ = 25_000
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 1.0
 ACTION_NOISE_UPDATE_INTERVAL_STEPS = 1_000
+DEFAULT_LEARNING_RATE = 3e-4
+DEFAULT_FINAL_LEARNING_RATE = 1e-4
 
 REWARD_VERSION = "agent6_td3_reward_v1_raw_progress_curriculum"
 OFF_TRACK_GRACE_STEPS = 4
@@ -368,6 +370,33 @@ def action_noise_sigma_at_timestep(
     return initial + (final - initial) * progress
 
 
+def linear_learning_rate_schedule(
+    initial_rate: float,
+    final_rate: float,
+    *,
+    learning_starts: int = 0,
+    total_timesteps: int = 1,
+) -> Callable[[float], float]:
+    """Reduce update size only after replay-buffer warm-up has completed."""
+    initial = float(initial_rate)
+    final = float(final_rate)
+    total = max(1, int(total_timesteps))
+    first_update = max(0, int(learning_starts))
+    decay_steps = max(1, total - first_update)
+
+    def schedule(progress_remaining: float) -> float:
+        elapsed_fraction = 1.0 - clamp(float(progress_remaining), 0.0, 1.0)
+        estimated_timestep = elapsed_fraction * total
+        update_progress = clamp(
+            (estimated_timestep - first_update) / decay_steps,
+            0.0,
+            1.0,
+        )
+        return initial + (final - initial) * update_progress
+
+    return schedule
+
+
 def should_schedule_policy_probe(
     *,
     timestep: int,
@@ -535,6 +564,9 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "gamma": args.gamma,
             "tau": args.tau,
             "learning_rate": args.learning_rate,
+            "learning_rate_final": args.learning_rate_final,
+            "learning_rate_schedule": "linear_after_learning_starts",
+            "learning_rate_decay_starts_at_timestep": args.learning_starts,
             "train_freq": args.train_freq,
             "gradient_steps": args.gradient_steps,
             "policy_delay": args.policy_delay,
@@ -1680,7 +1712,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--tau", type=float, default=0.005)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
+    parser.add_argument(
+        "--learning-rate-final",
+        type=float,
+        default=DEFAULT_FINAL_LEARNING_RATE,
+        help=(
+            "Final TD3 optimizer learning rate. It is reached linearly at the "
+            "end of the requested training run."
+        ),
+    )
     parser.add_argument("--train-freq", type=int, default=1)
     parser.add_argument("--gradient-steps", type=int, default=1)
     parser.add_argument("--policy-delay", type=int, default=2)
@@ -1712,6 +1753,15 @@ def parse_args() -> argparse.Namespace:
         default=False,
     )
     args = parser.parse_args()
+    if args.checkpoint_freq < 1:
+        parser.error("--checkpoint-freq must be at least 1")
+    if args.learning_rate <= 0.0:
+        parser.error("--learning-rate must be greater than zero")
+    if not 0.0 < args.learning_rate_final <= args.learning_rate:
+        parser.error(
+            "--learning-rate-final must be greater than zero and no greater "
+            "than --learning-rate"
+        )
     if args.action_noise_sigma < 0.0:
         parser.error("--action-noise-sigma cannot be negative")
     if not 0.0 <= args.action_noise_final_sigma <= args.action_noise_sigma:
@@ -1809,6 +1859,12 @@ def main() -> None:
         )
 
     action_noise = make_action_noise(args.action_noise_sigma)
+    learning_rate_schedule = linear_learning_rate_schedule(
+        args.learning_rate,
+        args.learning_rate_final,
+        learning_starts=args.learning_starts,
+        total_timesteps=args.total_timesteps,
+    )
     model = TD3(
         "MlpPolicy",
         env,
@@ -1819,7 +1875,7 @@ def main() -> None:
         batch_size=args.batch_size,
         gamma=args.gamma,
         tau=args.tau,
-        learning_rate=args.learning_rate,
+        learning_rate=learning_rate_schedule,
         train_freq=args.train_freq,
         gradient_steps=args.gradient_steps,
         policy_delay=args.policy_delay,
