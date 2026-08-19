@@ -277,6 +277,22 @@ def replay_buffer_path_for_policy(policy_path: Path) -> Path:
     return Path(policy_path).with_suffix(".replay_buffer.pkl")
 
 
+def save_replay_buffer_atomically(model: Any, path: Path) -> str | None:
+    target = Path(path)
+    temporary = target.with_name(f"{target.name}.tmp")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        temporary.unlink()
+    try:
+        model.save_replay_buffer(str(temporary))
+        temporary.replace(target)
+    except Exception as exc:  # Persistence must not terminate a training run.
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        return f"{type(exc).__name__}: {exc}"
+    return None
+
+
 def continuation_source_errors(
     policy_path: Path,
     *,
@@ -773,6 +789,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             learning_starts: int = 20_000,
             initial_stage_id: str = "launch",
             pre_update_training_phase: str = "warmup",
+            use_custom_warmup_action_space: bool = True,
         ) -> None:
             super().__init__()
             self.track_name = track_name
@@ -783,14 +800,22 @@ def make_training_env_class(gym: Any, spaces: Any):
             self.run_dir = Path(run_dir) if run_dir is not None else None
             self.learning_starts = max(0, int(learning_starts))
             self.runner = make_torcs_runner()
-            self.action_space = make_scratch_action_space(
-                spaces,
-                warmup_action_mode=warmup_action_mode,
-                warmup_steer_std=warmup_steer_std,
-                warmup_accel_min=warmup_accel_min,
-                warmup_accel_max=warmup_accel_max,
-                warmup_brake_probability=warmup_brake_probability,
-            )
+            if use_custom_warmup_action_space:
+                self.action_space = make_scratch_action_space(
+                    spaces,
+                    warmup_action_mode=warmup_action_mode,
+                    warmup_steer_std=warmup_steer_std,
+                    warmup_accel_min=warmup_accel_min,
+                    warmup_accel_max=warmup_accel_max,
+                    warmup_brake_probability=warmup_brake_probability,
+                )
+            else:
+                self.action_space = spaces.Box(
+                    low=-1.0,
+                    high=1.0,
+                    shape=(3,),
+                    dtype=np.float32,
+                )
             self.observation_space = spaces.Box(
                 low=-1.0,
                 high=1.0,
@@ -1696,8 +1721,18 @@ def make_best_model_callback_class(BaseCallback: Any):
             saved_payload = dict(payload)
             if save_replay_buffer:
                 replay_buffer_path = replay_buffer_path_for_policy(path)
-                self.model.save_replay_buffer(str(replay_buffer_path))
-                saved_payload["replay_buffer_path"] = str(replay_buffer_path)
+                replay_error = save_replay_buffer_atomically(
+                    self.model,
+                    replay_buffer_path,
+                )
+                if replay_error is None:
+                    saved_payload["replay_buffer_path"] = str(replay_buffer_path)
+                else:
+                    saved_payload["replay_buffer_save_error"] = replay_error
+                    print(
+                        "Warning: best TD3 model was saved, but its replay buffer "
+                        f"was not: {replay_error}"
+                    )
             write_json(
                 metadata_path_for_policy(path),
                 {
@@ -1852,12 +1887,29 @@ def create_td3_model(
         "device": args.device,
     }
     if args.continuation:
-        return TD3.load(str(args.resume_from), **model_kwargs)
+        model = TD3.load(str(args.resume_from), **model_kwargs)
+        normalise_continuation_spaces(model, env)
+        return model
     return TD3(
         "MlpPolicy",
         policy_kwargs={"net_arch": args.net_arch},
         **model_kwargs,
     )
+
+
+def normalise_continuation_spaces(model: Any, env: Any) -> None:
+    """Remove dynamically defined warm-up spaces from replay serialization."""
+    action_space = env.action_space
+    observation_space = env.observation_space
+    model.action_space = action_space
+    model.observation_space = observation_space
+    if getattr(model, "policy", None) is not None:
+        model.policy.action_space = action_space
+        model.policy.observation_space = observation_space
+    replay_buffer = getattr(model, "replay_buffer", None)
+    if replay_buffer is not None:
+        replay_buffer.action_space = action_space
+        replay_buffer.observation_space = observation_space
 
 
 def parse_args() -> argparse.Namespace:
@@ -2112,6 +2164,7 @@ def main() -> None:
         pre_update_training_phase=(
             "replay_refill" if args.continuation else "warmup"
         ),
+        use_custom_warmup_action_space=not args.continuation,
     )
     raw_env.action_space.seed(args.seed)
     raw_env.observation_space.seed(args.seed)

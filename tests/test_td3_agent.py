@@ -650,7 +650,17 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             @classmethod
             def load(cls, path, **kwargs):
                 cls.load_call = (path, kwargs)
-                return types.SimpleNamespace(num_timesteps=35_226)
+                return types.SimpleNamespace(
+                    num_timesteps=35_226,
+                    policy=types.SimpleNamespace(
+                        action_space="dynamic_action_space",
+                        observation_space="dynamic_observation_space",
+                    ),
+                    replay_buffer=types.SimpleNamespace(
+                        action_space="dynamic_action_space",
+                        observation_space="dynamic_observation_space",
+                    ),
+                )
 
         args = types.SimpleNamespace(
             continuation=True,
@@ -671,10 +681,14 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             device="cpu",
         )
         schedule = lambda _: 1e-4
+        env = types.SimpleNamespace(
+            action_space="standard_action_space",
+            observation_space="standard_observation_space",
+        )
         model = train_td3_agent.create_td3_model(
             FakeTD3,
             args=args,
-            env="env",
+            env=env,
             tensorboard_log=None,
             action_noise="noise",
             learning_rate_schedule=schedule,
@@ -686,6 +700,9 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(kwargs["learning_starts"], 0)
         self.assertEqual(kwargs["buffer_size"], 300_000)
         self.assertIs(kwargs["learning_rate"], schedule)
+        self.assertEqual(model.action_space, "standard_action_space")
+        self.assertEqual(model.policy.action_space, "standard_action_space")
+        self.assertEqual(model.replay_buffer.action_space, "standard_action_space")
 
     def test_continuation_stage_requires_verified_prerequisite_progress(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -717,6 +734,18 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             )
 
         self.assertTrue(any("requires 520.0m" in error for error in errors))
+
+    def test_replay_snapshot_failure_is_reported_without_partial_temp_file(self):
+        model = mock.Mock()
+        model.save_replay_buffer.side_effect = RuntimeError("disk unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "best.replay_buffer.pkl"
+
+            error = train_td3_agent.save_replay_buffer_atomically(model, path)
+
+            self.assertIn("RuntimeError: disk unavailable", error)
+            self.assertFalse(path.is_file())
+            self.assertFalse((Path(directory) / "best.replay_buffer.pkl.tmp").is_file())
 
     def test_final_learning_rate_cannot_exceed_initial_rate(self):
         argv = [
@@ -793,6 +822,9 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                 learning_starts=20_000,
                 save_best_replay_buffer=True,
             )
+            callback.model.save_replay_buffer.side_effect = (
+                lambda path: Path(path).write_bytes(b"replay")
+            )
 
             self.assertIsNone(callback.best_distance_m)
             self.assertIsNone(callback.best_reward)
@@ -834,15 +866,18 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             self.assertEqual(callback.best_distance_m, 80.0)
             self.assertEqual(callback.best_reward, -100.0)
             self.assertEqual(callback.model.save.call_count, 2)
+            replay_buffer_path = train_td3_agent.replay_buffer_path_for_policy(
+                best_distance_path
+            )
             callback.model.save_replay_buffer.assert_called_once_with(
-                str(train_td3_agent.replay_buffer_path_for_policy(best_distance_path))
+                str(replay_buffer_path.with_name(f"{replay_buffer_path.name}.tmp"))
             )
             saved_metadata = json.loads(
                 metadata_path_for_policy(best_distance_path).read_text(encoding="utf-8")
             )
             self.assertEqual(
                 saved_metadata["best_distance_episode"]["replay_buffer_path"],
-                str(train_td3_agent.replay_buffer_path_for_policy(best_distance_path)),
+                str(replay_buffer_path),
             )
 
     def test_progress_line_reports_stage_and_best_distance(self):
