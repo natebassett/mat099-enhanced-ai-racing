@@ -408,6 +408,36 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertAlmostEqual(schedule(2.0), 3e-4)
         self.assertAlmostEqual(schedule(-1.0), 1e-4)
 
+    def test_actor_learning_rate_freezes_ramps_and_then_decays(self):
+        schedule = train_td3_agent.gradual_actor_learning_rate_schedule(
+            1e-5,
+            3e-6,
+            actor_update_start=40_000,
+            unfreeze_steps=40_000,
+            total_timesteps=300_000,
+        )
+
+        self.assertEqual(schedule(0), 0.0)
+        self.assertEqual(schedule(40_000), 0.0)
+        self.assertAlmostEqual(schedule(60_000), 5e-6)
+        self.assertAlmostEqual(schedule(80_000), 1e-5)
+        self.assertAlmostEqual(schedule(190_000), 6.5e-6)
+        self.assertAlmostEqual(schedule(300_000), 3e-6)
+
+    def test_continuation_phase_reports_each_update_stage(self):
+        phase = train_td3_agent.continuation_training_phase
+        kwargs = {
+            "gradient_update_start": 20_000,
+            "actor_update_start": 40_000,
+            "actor_full_unfreeze": 80_000,
+            "pre_update_phase": "replay_refill",
+        }
+
+        self.assertEqual(phase(19_999, **kwargs), "replay_refill")
+        self.assertEqual(phase(20_000, **kwargs), "critic_warmup")
+        self.assertEqual(phase(40_000, **kwargs), "actor_unfreeze")
+        self.assertEqual(phase(80_000, **kwargs), "learning")
+
     def test_policy_probe_schedule_starts_promptly_and_then_spaces_probes(self):
         schedule = train_td3_agent.should_schedule_policy_probe
 
@@ -447,6 +477,23 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                 probe_interval=10,
             )
         )
+
+    def test_safe_actor_probe_decision_requires_median_improvement(self):
+        decision, median_distance = train_td3_agent.safe_actor_probe_decision(
+            [1442.0, 1438.0, 1440.0],
+            accepted_distance_m=1430.0,
+            minimum_improvement_m=5.0,
+        )
+        self.assertEqual(decision, "accepted")
+        self.assertEqual(median_distance, 1440.0)
+
+        decision, median_distance = train_td3_agent.safe_actor_probe_decision(
+            [1436.0, 1200.0, 1432.0],
+            accepted_distance_m=1430.0,
+            minimum_improvement_m=5.0,
+        )
+        self.assertEqual(decision, "rolled_back")
+        self.assertEqual(median_distance, 1432.0)
 
     def test_exploration_callback_toggles_probe_mode_at_episode_boundaries(self):
         class FakeBaseCallback:
@@ -560,6 +607,8 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             probe_interval=10,
             training_gradient_steps=1,
             pre_update_training_phase="replay_refill",
+            actor_update_start=30_000,
+            actor_full_unfreeze=50_000,
         )
 
         callback._on_training_start()
@@ -574,7 +623,166 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         callback.num_timesteps = 10_000
         callback._on_step()
         self.assertEqual(callback.model.gradient_steps, 1)
+        self.assertEqual(env.modes[-1]["training_phase"], "critic_warmup")
+
+        callback.num_timesteps = 30_000
+        callback._on_step()
+        self.assertEqual(env.modes[-1]["training_phase"], "actor_unfreeze")
+
+        callback.num_timesteps = 50_000
+        callback._on_step()
         self.assertEqual(env.modes[-1]["training_phase"], "learning")
+
+    def test_safe_actor_candidate_forces_repeated_probes_then_rolls_back(self):
+        class FakeBaseCallback:
+            def __init__(self, verbose=0):
+                self.locals = {}
+                self.num_timesteps = 50_000
+
+        class FakeModel:
+            def __init__(self):
+                self.action_noise = None
+                self.gradient_steps = 1
+                self.waiting = True
+                self.probes = 0
+
+            def safe_actor_probe_required(self):
+                return self.waiting
+
+            def record_safe_actor_probe(self, summary):
+                self.probes += 1
+                decision = "pending" if self.probes == 1 else "rolled_back"
+                if decision == "rolled_back":
+                    self.waiting = False
+                return {
+                    "candidate_id": 1,
+                    "probe_index": self.probes,
+                    "probe_repeats": 2,
+                    "decision": decision,
+                    "median_distance_m": (
+                        None if decision == "pending" else 400.0
+                    ),
+                    "accepted_distance_m": 1430.0,
+                    "required_distance_m": 1435.0,
+                }
+
+        class FakeEnv:
+            def __init__(self):
+                self.modes = []
+
+            def set_policy_mode(self, **mode):
+                self.modes.append(mode)
+
+        env = FakeEnv()
+        Callback = train_td3_agent.make_exploration_schedule_callback_class(
+            FakeBaseCallback
+        )
+        callback = Callback(
+            env,
+            lambda sigma: ("noise", sigma),
+            learning_starts=0,
+            initial_sigma=0.02,
+            final_sigma=0.006,
+            decay_steps=100_000,
+            probe_interval=10,
+            training_gradient_steps=1,
+        )
+        callback.model = FakeModel()
+        callback.current_episode_is_probe = True
+        first_summary = {
+            "policy_controlled": True,
+            "deterministic_probe": True,
+            "curriculum_eligible": False,
+            "distance_m": 500.0,
+        }
+        callback.locals = {"infos": [{"episode_summary": first_summary}]}
+
+        callback._on_step()
+
+        self.assertEqual(first_summary["safe_actor_decision"], "pending")
+        self.assertTrue(env.modes[-1]["deterministic_probe"])
+        self.assertTrue(env.modes[-1]["safe_actor_candidate_probe"])
+
+        second_summary = {
+            "policy_controlled": True,
+            "deterministic_probe": True,
+            "curriculum_eligible": False,
+            "distance_m": 300.0,
+        }
+        callback.locals = {"infos": [{"episode_summary": second_summary}]}
+        callback._on_step()
+
+        self.assertEqual(second_summary["safe_actor_decision"], "rolled_back")
+        self.assertFalse(env.modes[-1]["deterministic_probe"])
+        self.assertFalse(env.modes[-1]["safe_actor_candidate_probe"])
+
+    def test_accepted_safe_actor_probe_is_committed_to_curriculum(self):
+        class FakeBaseCallback:
+            def __init__(self, verbose=0):
+                self.locals = {}
+                self.num_timesteps = 50_000
+
+        class FakeModel:
+            action_noise = None
+            gradient_steps = 1
+            waiting = True
+
+            def safe_actor_probe_required(self):
+                return self.waiting
+
+            def record_safe_actor_probe(self, summary):
+                self.waiting = False
+                return {
+                    "candidate_id": 2,
+                    "probe_index": 3,
+                    "probe_repeats": 3,
+                    "decision": "accepted",
+                    "median_distance_m": 1760.0,
+                    "accepted_distance_m": 1760.0,
+                    "required_distance_m": 1435.0,
+                }
+
+        class FakeEnv:
+            def __init__(self):
+                self.modes = []
+                self.accepted = []
+
+            def set_policy_mode(self, **mode):
+                self.modes.append(mode)
+
+            def accept_safe_actor_probe(self, summary, *, median_distance_m):
+                summary["curriculum_eligible"] = True
+                self.accepted.append(median_distance_m)
+
+        env = FakeEnv()
+        Callback = train_td3_agent.make_exploration_schedule_callback_class(
+            FakeBaseCallback
+        )
+        callback = Callback(
+            env,
+            lambda sigma: ("noise", sigma),
+            learning_starts=0,
+            initial_sigma=0.02,
+            final_sigma=0.006,
+            decay_steps=100_000,
+            probe_interval=10,
+            training_gradient_steps=1,
+        )
+        callback.model = FakeModel()
+        callback.current_episode_is_probe = True
+        summary = {
+            "policy_controlled": True,
+            "deterministic_probe": True,
+            "curriculum_eligible": False,
+            "distance_m": 1750.0,
+        }
+        callback.locals = {"infos": [{"episode_summary": summary}]}
+
+        callback._on_step()
+
+        self.assertEqual(summary["safe_actor_decision"], "accepted")
+        self.assertTrue(summary["curriculum_eligible"])
+        self.assertEqual(env.accepted, [1760.0])
 
     def test_default_training_args_use_stable_td3_warmup(self):
         with mock.patch.object(sys, "argv", [str(SCRIPT_PATH)]):
@@ -584,14 +792,25 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertFalse(args.continuation)
         self.assertEqual(args.start_stage, "launch")
         self.assertEqual(args.replay_refill_steps, 0)
+        self.assertEqual(args.critic_warmup_steps, 0)
+        self.assertEqual(args.actor_unfreeze_steps, 0)
         self.assertEqual(args.buffer_size, 1_000_000)
         self.assertEqual(args.learning_rate, 3e-4)
         self.assertEqual(args.learning_rate_final, 1e-4)
+        self.assertEqual(args.actor_learning_rate, 3e-4)
+        self.assertEqual(args.actor_learning_rate_final, 1e-4)
         self.assertEqual(args.checkpoint_freq, 25_000)
         self.assertEqual(args.action_noise_sigma, 0.12)
         self.assertEqual(args.action_noise_final_sigma, 0.04)
         self.assertEqual(args.action_noise_decay_steps, 200_000)
         self.assertEqual(args.policy_probe_interval, 10)
+        self.assertFalse(args.safe_actor_improvement)
+        self.assertEqual(args.safe_actor_max_action_delta, 0.025)
+        self.assertEqual(args.safe_actor_gradient_norm, 1.0)
+        self.assertEqual(args.safe_actor_block_updates, 250)
+        self.assertEqual(args.safe_actor_probe_repeats, 3)
+        self.assertEqual(args.safe_actor_min_improvement_m, 5.0)
+        self.assertEqual(args.safe_actor_anchor_batch_size, 256)
         self.assertEqual(args.warmup_steer_std, 0.18)
         self.assertFalse(args.save_best_replay_buffer)
 
@@ -623,24 +842,39 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                 "--resume-from",
                 str(checkpoint),
                 "--total-timesteps",
-                "20000",
+                "100000",
             ]
             with mock.patch.object(sys, "argv", argv):
                 args = train_td3_agent.parse_args()
 
         self.assertTrue(args.continuation)
         self.assertEqual(args.start_stage, "sector_progression")
-        self.assertEqual(args.replay_refill_steps, 10_000)
+        self.assertEqual(args.replay_refill_steps, 20_000)
+        self.assertEqual(args.critic_warmup_steps, 20_000)
+        self.assertEqual(args.actor_unfreeze_steps, 40_000)
         self.assertEqual(args.buffer_size, 300_000)
-        self.assertEqual(args.learning_rate, 1e-4)
-        self.assertEqual(args.learning_rate_final, 3e-5)
-        self.assertEqual(args.action_noise_sigma, 0.04)
-        self.assertEqual(args.action_noise_final_sigma, 0.02)
+        self.assertEqual(args.learning_rate, 3e-5)
+        self.assertEqual(args.learning_rate_final, 1e-5)
+        self.assertEqual(args.actor_learning_rate, 1e-5)
+        self.assertEqual(args.actor_learning_rate_final, 3e-6)
+        self.assertEqual(args.action_noise_sigma, 0.02)
+        self.assertEqual(args.action_noise_final_sigma, 0.006)
         self.assertTrue(args.save_best_replay_buffer)
+        self.assertTrue(args.safe_actor_improvement)
+        self.assertEqual(args.safe_actor_max_action_delta, 0.025)
+        self.assertEqual(args.safe_actor_gradient_norm, 1.0)
+        self.assertEqual(args.safe_actor_block_updates, 250)
+        self.assertEqual(args.safe_actor_probe_repeats, 3)
+        self.assertEqual(args.safe_actor_min_improvement_m, 5.0)
         self.assertEqual(train_td3_agent.policy_action_start_timestep(args), 0)
         self.assertEqual(
             train_td3_agent.gradient_update_start_timestep(args),
-            10_000,
+            20_000,
+        )
+        self.assertEqual(train_td3_agent.actor_update_start_timestep(args), 40_000)
+        self.assertEqual(
+            train_td3_agent.actor_full_unfreeze_timestep(args),
+            80_000,
         )
 
     def test_continuation_model_loads_verified_weights_with_fresh_replay(self):
@@ -703,6 +937,198 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(model.action_space, "standard_action_space")
         self.assertEqual(model.policy.action_space, "standard_action_space")
         self.assertEqual(model.replay_buffer.action_space, "standard_action_space")
+
+    def test_safe_actor_model_rolls_back_degraded_candidate_exactly(self):
+        import gymnasium as gym
+        import torch
+        from stable_baselines3 import TD3
+
+        class TinyEnv(gym.Env):
+            observation_space = gym.spaces.Box(-1.0, 1.0, shape=(4,), dtype=np.float32)
+            action_space = gym.spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32)
+
+            def reset(self, *, seed=None, options=None):
+                super().reset(seed=seed)
+                return np.zeros(4, dtype=np.float32), {}
+
+            def step(self, action):
+                return np.zeros(4, dtype=np.float32), 0.0, False, False, {}
+
+        SafeTD3 = train_td3_agent.make_phased_continuation_td3_class(TD3)
+        model = SafeTD3(
+            "MlpPolicy",
+            TinyEnv(),
+            policy_kwargs={"net_arch": [8, 8]},
+            learning_starts=0,
+            buffer_size=32,
+            batch_size=4,
+            device="cpu",
+        )
+        model.configure_continuation_updates(
+            actor_learning_rate_schedule=lambda _: 1e-4,
+            actor_updates_start_at=0,
+            safe_actor_improvement=True,
+            safe_actor_block_updates=1,
+            safe_actor_probe_repeats=2,
+            safe_actor_min_improvement_m=5.0,
+            accepted_distance_m=100.0,
+        )
+        accepted_actor = {
+            name: value.detach().clone()
+            for name, value in model.actor.state_dict().items()
+        }
+        accepted_target = {
+            name: value.detach().clone()
+            for name, value in model.actor_target.state_dict().items()
+        }
+        with torch.no_grad():
+            next(model.actor.parameters()).add_(0.25)
+            next(model.actor_target.parameters()).sub_(0.25)
+        model._agent6_safe_actor_candidate_id = 1
+        model._agent6_safe_actor_candidate_updates = 1
+        model._agent6_safe_actor_waiting_for_probe = True
+        candidate_actor = {
+            name: value.detach().clone()
+            for name, value in model.actor.state_dict().items()
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "candidate_checkpoint.zip"
+            model.save(checkpoint)
+            saved = TD3.load(checkpoint, device="cpu")
+        for name, value in saved.actor.state_dict().items():
+            self.assertTrue(torch.equal(value, accepted_actor[name]))
+        for name, value in model.actor.state_dict().items():
+            self.assertTrue(torch.equal(value, candidate_actor[name]))
+
+        pending = model.record_safe_actor_probe({"distance_m": 102.0})
+        result = model.record_safe_actor_probe({"distance_m": 80.0})
+
+        self.assertEqual(pending["decision"], "pending")
+        self.assertEqual(result["decision"], "rolled_back")
+        self.assertFalse(model.safe_actor_probe_required())
+        for name, value in model.actor.state_dict().items():
+            self.assertTrue(torch.equal(value, accepted_actor[name]))
+        for name, value in model.actor_target.state_dict().items():
+            self.assertTrue(torch.equal(value, accepted_target[name]))
+
+        with torch.no_grad():
+            next(model.actor.parameters()).add_(0.01)
+            next(model.actor_target.parameters()).add_(0.01)
+        model._agent6_safe_actor_candidate_id = 2
+        model._agent6_safe_actor_candidate_updates = 1
+        model._agent6_safe_actor_waiting_for_probe = True
+        model.record_safe_actor_probe({"distance_m": 110.0})
+        accepted = model.record_safe_actor_probe({"distance_m": 112.0})
+        accepted_actor = {
+            name: value.detach().clone()
+            for name, value in model.actor.state_dict().items()
+        }
+
+        self.assertEqual(accepted["decision"], "accepted")
+        self.assertEqual(accepted["median_distance_m"], 111.0)
+        with torch.no_grad():
+            next(model.actor.parameters()).add_(0.5)
+        model._agent6_safe_actor_candidate_id = 3
+        model._agent6_safe_actor_candidate_updates = 1
+        finalized = model.finalize_safe_actor_candidate()
+
+        self.assertEqual(finalized["decision"], "rolled_back_incomplete")
+        for name, value in model.actor.state_dict().items():
+            self.assertTrue(torch.equal(value, accepted_actor[name]))
+        status = model.safe_actor_status()
+        self.assertEqual(status["accepted_blocks"], 1)
+        self.assertEqual(status["rolled_back_blocks"], 2)
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "safe_actor.zip"
+            model.save(checkpoint)
+            loaded = TD3.load(checkpoint, device="cpu")
+        for name, value in loaded.actor.state_dict().items():
+            self.assertTrue(torch.equal(value, accepted_actor[name]))
+
+    def test_safe_actor_projection_enforces_action_space_limit(self):
+        import gymnasium as gym
+        import torch
+        from stable_baselines3 import TD3
+
+        class TinyEnv(gym.Env):
+            observation_space = gym.spaces.Box(-1.0, 1.0, shape=(4,), dtype=np.float32)
+            action_space = gym.spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32)
+
+            def reset(self, *, seed=None, options=None):
+                super().reset(seed=seed)
+                return np.zeros(4, dtype=np.float32), {}
+
+            def step(self, action):
+                return np.zeros(4, dtype=np.float32), 0.0, False, False, {}
+
+        SafeTD3 = train_td3_agent.make_phased_continuation_td3_class(TD3)
+        model = SafeTD3(
+            "MlpPolicy",
+            TinyEnv(),
+            policy_kwargs={"net_arch": [8, 8]},
+            learning_starts=0,
+            buffer_size=32,
+            batch_size=4,
+            device="cpu",
+        )
+        model.configure_continuation_updates(
+            actor_learning_rate_schedule=lambda _: 1e-4,
+            actor_updates_start_at=0,
+            safe_actor_improvement=True,
+            safe_actor_max_action_delta=0.01,
+        )
+        observations = torch.ones((8, 4), dtype=torch.float32)
+        with torch.no_grad():
+            for parameter in model.actor.parameters():
+                parameter.add_(0.5)
+
+        projected_delta = model._project_safe_actor(observations)
+
+        self.assertLessEqual(projected_delta, 0.010001)
+
+    def test_safe_actor_training_stops_at_candidate_block_boundary(self):
+        import gymnasium as gym
+        from stable_baselines3 import TD3
+
+        class TinyEnv(gym.Env):
+            observation_space = gym.spaces.Box(-1.0, 1.0, shape=(4,), dtype=np.float32)
+            action_space = gym.spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32)
+
+            def reset(self, *, seed=None, options=None):
+                super().reset(seed=seed)
+                return np.zeros(4, dtype=np.float32), {}
+
+            def step(self, action):
+                return np.zeros(4, dtype=np.float32), 1.0, False, False, {}
+
+        SafeTD3 = train_td3_agent.make_phased_continuation_td3_class(TD3)
+        model = SafeTD3(
+            "MlpPolicy",
+            TinyEnv(),
+            policy_kwargs={"net_arch": [8, 8]},
+            learning_starts=0,
+            buffer_size=64,
+            batch_size=4,
+            train_freq=1,
+            gradient_steps=1,
+            policy_delay=1,
+            device="cpu",
+        )
+        model.configure_continuation_updates(
+            actor_learning_rate_schedule=lambda _: 1e-4,
+            actor_updates_start_at=0,
+            safe_actor_improvement=True,
+            safe_actor_block_updates=2,
+            safe_actor_probe_repeats=3,
+        )
+
+        model.learn(total_timesteps=10)
+
+        status = model.safe_actor_status()
+        self.assertEqual(status["candidate_updates"], 2)
+        self.assertTrue(status["waiting_for_probe"])
+        self.assertEqual(status["accepted_blocks"], 0)
+        self.assertEqual(status["rolled_back_blocks"], 0)
 
     def test_continuation_stage_requires_verified_prerequisite_progress(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -847,6 +1273,25 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
             callback.model.save.assert_not_called()
 
+            callback.num_timesteps = 20_500
+            callback.locals = {
+                "infos": [
+                    {
+                        "episode_summary": {
+                            "policy_controlled": True,
+                            "deterministic_probe": True,
+                            "safe_actor_decision": "pending",
+                            "curriculum_eligible": False,
+                            "distance_m": 5_000.0,
+                            "reward": 10_000.0,
+                        }
+                    }
+                ]
+            }
+            callback._on_step()
+
+            callback.model.save.assert_not_called()
+
             callback.num_timesteps = 21_000
             callback.locals = {
                 "infos": [
@@ -866,18 +1311,44 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             self.assertEqual(callback.best_distance_m, 80.0)
             self.assertEqual(callback.best_reward, -100.0)
             self.assertEqual(callback.model.save.call_count, 2)
-            replay_buffer_path = train_td3_agent.replay_buffer_path_for_policy(
+            distance_replay_path = train_td3_agent.replay_buffer_path_for_policy(
                 best_distance_path
             )
-            callback.model.save_replay_buffer.assert_called_once_with(
-                str(replay_buffer_path.with_name(f"{replay_buffer_path.name}.tmp"))
+            reward_replay_path = train_td3_agent.replay_buffer_path_for_policy(
+                best_reward_path
+            )
+            self.assertEqual(callback.model.save_replay_buffer.call_count, 2)
+            callback.model.save_replay_buffer.assert_has_calls(
+                [
+                    mock.call(
+                        str(
+                            distance_replay_path.with_name(
+                                f"{distance_replay_path.name}.tmp"
+                            )
+                        )
+                    ),
+                    mock.call(
+                        str(
+                            reward_replay_path.with_name(
+                                f"{reward_replay_path.name}.tmp"
+                            )
+                        )
+                    ),
+                ]
             )
             saved_metadata = json.loads(
                 metadata_path_for_policy(best_distance_path).read_text(encoding="utf-8")
             )
             self.assertEqual(
                 saved_metadata["best_distance_episode"]["replay_buffer_path"],
-                str(replay_buffer_path),
+                str(distance_replay_path),
+            )
+            reward_metadata = json.loads(
+                metadata_path_for_policy(best_reward_path).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                reward_metadata["best_reward_episode"]["replay_buffer_path"],
+                str(reward_replay_path),
             )
 
     def test_progress_line_reports_stage_and_best_distance(self):

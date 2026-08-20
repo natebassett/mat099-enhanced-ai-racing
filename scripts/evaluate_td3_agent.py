@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
+import random
 import shutil
 import statistics
 import sys
@@ -25,6 +27,7 @@ from agents.td3_agent import (  # noqa: E402
     DEFAULT_MODEL_PATH,
     FEATURE_NAMES,
     G_TRACK_3_LENGTH_METRES,
+    MAX_STEER,
     Td3ScratchAgent,
     metadata_path_for_policy,
     read_policy_metadata,
@@ -38,11 +41,17 @@ DEFAULT_TRACK_ID = "g-track-3"
 DEFAULT_TRACK_CATEGORY = "road"
 DEFAULT_CAR_ID = "car1-ow1"
 CHECKPOINT_GLOB = "agent6_td3_scratch_*_steps.zip"
+EVALUATION_PROTOCOL = "agent6_seeded_steering_robustness_v1"
+DEFAULT_BASE_SEED = 20260819
+DEFAULT_STEERING_NOISE_STD = 0.006
+STEERING_NOISE_CORRELATION = 0.985
+MAX_EVALUATION_SEED = (2**32) - 1
 
 
 @dataclass(frozen=True)
 class EvaluationEpisode:
     repeat: int
+    seed: int
     reason: str
     steps: int
     laps: int
@@ -59,6 +68,9 @@ class EvaluationSummary:
     policy_path: str
     track: str
     deterministic: bool
+    evaluation_protocol: str
+    evaluation_seeds: tuple[int, ...]
+    steering_noise_std: float
     repeats: int
     completed_repeats: int
     completed_laps: int
@@ -73,8 +85,8 @@ class EvaluationSummary:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Deterministically evaluate Agent 6 TD3 policies without training "
-            "noise or replay-buffer writes."
+            "Evaluate deterministic Agent 6 TD3 policies under reproducible "
+            "seeded steering disturbances, without training or replay writes."
         )
     )
     parser.add_argument(
@@ -94,6 +106,28 @@ def parse_args() -> argparse.Namespace:
         help="Also evaluate every periodic TD3 checkpoint in this directory.",
     )
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument(
+        "--base-seed",
+        type=int,
+        default=DEFAULT_BASE_SEED,
+        help="Generate a reproducible unique seed suite from this value.",
+    )
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Explicit evaluation seeds. Overrides --repeats and --base-seed.",
+    )
+    parser.add_argument(
+        "--steering-noise-std",
+        type=float,
+        default=DEFAULT_STEERING_NOISE_STD,
+        help=(
+            "Standard deviation of the small correlated steering disturbance "
+            "used to test policy recovery. Set to 0 for an unperturbed baseline."
+        ),
+    )
     parser.add_argument("--track", default=DEFAULT_TRACK_ID)
     parser.add_argument("--track-category", default=DEFAULT_TRACK_CATEGORY)
     parser.add_argument("--car", default=DEFAULT_CAR_ID)
@@ -102,8 +136,8 @@ def parse_args() -> argparse.Namespace:
         "--promote-best-if-improved",
         action="store_true",
         help=(
-            "Copy the strongest deterministic result to the verified Agent 6 "
-            "evaluation checkpoint."
+            "Copy the strongest seeded robustness result to the verified "
+            "Agent 6 evaluation checkpoint."
         ),
     )
     parser.add_argument(
@@ -114,6 +148,13 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be at least 1")
+    if not math.isfinite(args.steering_noise_std) or args.steering_noise_std < 0.0:
+        parser.error("--steering-noise-std must be finite and non-negative")
+    if args.seeds is not None:
+        if any(seed < 0 or seed > MAX_EVALUATION_SEED for seed in args.seeds):
+            parser.error(f"--seeds must be between 0 and {MAX_EVALUATION_SEED}")
+        if len(set(args.seeds)) != len(args.seeds):
+            parser.error("--seeds must be unique")
     return args
 
 
@@ -122,6 +163,19 @@ def main() -> int:
     policies = collect_policy_paths(args.policy_path, args.checkpoint_dir)
     if not policies:
         raise SystemExit("No TD3 policy files were found to evaluate.")
+    if args.promote_best_if_improved:
+        policies = include_verified_baseline(
+            policies,
+            args.best_evaluation_model_path,
+        )
+    seeds = build_evaluation_seeds(
+        repeats=args.repeats,
+        base_seed=args.base_seed,
+        explicit_seeds=args.seeds,
+    )
+    print(f"Evaluation protocol: {EVALUATION_PROTOCOL}")
+    print(f"Evaluation seeds: {', '.join(str(seed) for seed in seeds)}")
+    print(f"Steering disturbance std: {args.steering_noise_std:.4f}")
 
     # gym_torcs/snakeoil reads sys.argv internally.
     sys.argv = [sys.argv[0]]
@@ -131,34 +185,50 @@ def main() -> int:
     for policy_index, policy_path in enumerate(policies, start=1):
         print(f"\nEvaluating policy {policy_index}/{len(policies)}: {policy_path}")
         episodes = []
-        for repeat in range(1, args.repeats + 1):
-            print(f"Deterministic repeat {repeat}/{args.repeats}")
+        for repeat, seed in enumerate(seeds, start=1):
+            print(f"Robustness repeat {repeat}/{len(seeds)} | seed={seed}")
             results = run_evaluation(
                 policy_path=policy_path,
                 track=args.track,
                 track_category=args.track_category,
                 car=args.car,
+                evaluation_seed=seed,
+                steering_noise_std=args.steering_noise_std,
             )
-            episodes.append(evaluation_episode(repeat, results))
+            episodes.append(evaluation_episode(repeat, seed, results))
 
-        summary = aggregate_evaluations(policy_path, args.track, episodes)
+        summary = aggregate_evaluations(
+            policy_path,
+            args.track,
+            episodes,
+            steering_noise_std=args.steering_noise_std,
+        )
         summaries.append(summary)
         episodes_by_policy[str(policy_path)] = episodes
         print(summary_text(summary))
 
-        if args.promote_best_if_improved:
-            if promote_best_evaluation(
-                policy_path,
-                args.best_evaluation_model_path,
-                summary,
-                episodes,
-            ):
-                print(
-                    "Promoted verified TD3 evaluation checkpoint: "
-                    f"{args.best_evaluation_model_path}"
-                )
-            else:
-                print("Verified TD3 evaluation checkpoint unchanged.")
+    if args.promote_best_if_improved:
+        best_summary = max(
+            summaries,
+            key=lambda candidate: evaluation_quality(asdict(candidate)),
+        )
+        best_episodes = episodes_by_policy[best_summary.policy_path]
+        baseline_was_evaluated = (
+            args.best_evaluation_model_path.resolve() in policies
+        )
+        if promote_best_evaluation(
+            Path(best_summary.policy_path),
+            args.best_evaluation_model_path,
+            best_summary,
+            best_episodes,
+            allow_protocol_migration=baseline_was_evaluated,
+        ):
+            print(
+                "Promoted verified TD3 evaluation checkpoint: "
+                f"{args.best_evaluation_model_path}"
+            )
+        else:
+            print("Verified TD3 evaluation checkpoint unchanged.")
 
     json_path, csv_path = write_evaluation_logs(
         args.output_dir,
@@ -191,6 +261,25 @@ def collect_policy_paths(
     return policies
 
 
+def include_verified_baseline(policies: list[Path], best_path: Path) -> list[Path]:
+    baseline = Path(best_path).resolve()
+    if not baseline.is_file() or baseline in policies:
+        return policies
+    return [*policies, baseline]
+
+
+def build_evaluation_seeds(
+    *,
+    repeats: int,
+    base_seed: int,
+    explicit_seeds: list[int] | None,
+) -> tuple[int, ...]:
+    if explicit_seeds is not None:
+        return tuple(explicit_seeds)
+    generator = random.Random(base_seed)
+    return tuple(generator.sample(range(MAX_EVALUATION_SEED + 1), repeats))
+
+
 def _checkpoint_step(path: Path) -> int:
     marker = path.stem.rsplit("_", 2)
     if len(marker) >= 2:
@@ -207,6 +296,8 @@ def run_evaluation(
     track: str,
     track_category: str,
     car: str,
+    evaluation_seed: int,
+    steering_noise_std: float,
 ) -> dict[str, Any]:
     from runner.torcs_runner import TorcsRunner  # noqa: PLC0415
 
@@ -221,19 +312,88 @@ def run_evaluation(
             runner.launch()
             runner.connect()
             runner.load_track(track)
-            agent = Td3ScratchAgent(
+            policy_agent = Td3ScratchAgent(
+                seed=evaluation_seed,
                 policy_path=policy_path,
                 require_policy=True,
                 deterministic=True,
+            )
+            agent = SeededSteeringPerturbationAgent(
+                policy_agent,
+                seed=evaluation_seed,
+                steering_noise_std=steering_noise_std,
             )
             return runner.run(agent)
         finally:
             runner.shutdown()
 
 
-def evaluation_episode(repeat: int, results: Mapping[str, Any]) -> EvaluationEpisode:
+class SeededSteeringPerturbationAgent:
+    """Apply a small reproducible actuator disturbance around a fixed TD3 policy."""
+
+    def __init__(
+        self,
+        agent: Td3ScratchAgent,
+        *,
+        seed: int,
+        steering_noise_std: float,
+    ) -> None:
+        self._agent = agent
+        self.seed = seed
+        self._steering_noise_std = float(steering_noise_std)
+        self._random = random.Random(seed)
+        self._steering_noise = 0.0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._agent, name)
+
+    def reset(self) -> None:
+        self._agent.reset()
+        self._random.seed(self.seed)
+        self._steering_noise = 0.0
+
+    def act(
+        self,
+        observation: Any,
+        telemetry: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        action = self._agent.act(observation, telemetry)
+        if action.get("terminate", False) or self._steering_noise_std == 0.0:
+            return action
+
+        innovation_scale = self._steering_noise_std * math.sqrt(
+            1.0 - (STEERING_NOISE_CORRELATION**2)
+        )
+        self._steering_noise = (
+            STEERING_NOISE_CORRELATION * self._steering_noise
+            + self._random.gauss(0.0, innovation_scale)
+        )
+        perturbed_action = dict(action)
+        perturbed_action["steer"] = max(
+            -MAX_STEER,
+            min(MAX_STEER, float(action["steer"]) + self._steering_noise),
+        )
+        return perturbed_action
+
+    def telemetry_debug(self) -> dict[str, Any]:
+        debug = dict(self._agent.telemetry_debug())
+        debug.update(
+            {
+                "evaluation_seed": self.seed,
+                "evaluation_steering_noise": self._steering_noise,
+            }
+        )
+        return debug
+
+
+def evaluation_episode(
+    repeat: int,
+    seed: int,
+    results: Mapping[str, Any],
+) -> EvaluationEpisode:
     return EvaluationEpisode(
         repeat=repeat,
+        seed=seed,
         reason=str(results.get("termination_reason", "")),
         steps=int(results.get("steps", 0)),
         laps=int(results.get("laps_completed", 0)),
@@ -250,6 +410,8 @@ def aggregate_evaluations(
     policy_path: Path,
     track: str,
     episodes: list[EvaluationEpisode],
+    *,
+    steering_noise_std: float = DEFAULT_STEERING_NOISE_STD,
 ) -> EvaluationSummary:
     if not episodes:
         raise ValueError("At least one deterministic evaluation is required")
@@ -262,6 +424,9 @@ def aggregate_evaluations(
         policy_path=str(policy_path),
         track=track,
         deterministic=True,
+        evaluation_protocol=EVALUATION_PROTOCOL,
+        evaluation_seeds=tuple(episode.seed for episode in episodes),
+        steering_noise_std=float(steering_noise_std),
         repeats=len(episodes),
         completed_repeats=sum(1 for episode in episodes if episode.laps > 0),
         completed_laps=sum(episode.laps for episode in episodes),
@@ -320,12 +485,21 @@ def promote_best_evaluation(
     best_path: Path,
     summary: EvaluationSummary,
     episodes: list[EvaluationEpisode],
+    *,
+    allow_protocol_migration: bool = False,
 ) -> bool:
     existing = read_policy_metadata(best_path).get("best_evaluation")
-    if isinstance(existing, Mapping) and evaluation_quality(existing) >= evaluation_quality(
-        asdict(summary)
-    ):
-        return False
+    candidate_evaluation = asdict(summary)
+    if isinstance(existing, Mapping):
+        same_protocol = evaluation_protocol_key(existing) == evaluation_protocol_key(
+            candidate_evaluation
+        )
+        if not same_protocol and not allow_protocol_migration:
+            return False
+        if same_protocol and (
+            evaluation_quality(existing) >= evaluation_quality(candidate_evaluation)
+        ):
+            return False
 
     best_path.parent.mkdir(parents=True, exist_ok=True)
     if candidate_path.resolve() != best_path.resolve():
@@ -338,7 +512,7 @@ def promote_best_evaluation(
         "action_version": AGENT6_ACTION_VERSION,
         "feature_names": FEATURE_NAMES,
         "action_shape": [3],
-        "checkpoint_type": "best_deterministic_evaluation",
+        "checkpoint_type": "best_seeded_robustness_evaluation",
         "best_evaluation": {
             **asdict(summary),
             "source_policy_path": str(candidate_path),
@@ -353,11 +527,29 @@ def promote_best_evaluation(
     return True
 
 
-def evaluation_quality(evaluation: Mapping[str, Any]) -> tuple[int, float, float]:
+def evaluation_protocol_key(
+    evaluation: Mapping[str, Any],
+) -> tuple[str, tuple[int, ...], float]:
+    seeds = evaluation.get("evaluation_seeds", ())
+    if not isinstance(seeds, (list, tuple)):
+        seeds = ()
+    return (
+        str(evaluation.get("evaluation_protocol", "legacy_unperturbed_v0")),
+        tuple(int(seed) for seed in seeds),
+        float(evaluation.get("steering_noise_std", 0.0)),
+    )
+
+
+def evaluation_quality(
+    evaluation: Mapping[str, Any],
+) -> tuple[int, int, float, float, float, float]:
     return (
         int(evaluation.get("completed_repeats", 0)),
+        int(evaluation.get("completed_laps", 0)),
         float(evaluation.get("median_progress_m", 0.0)),
+        float(evaluation.get("minimum_progress_m", 0.0)),
         -float(evaluation.get("median_off_track_steps", 0.0)),
+        float(evaluation.get("mean_total_score", 0.0)),
     )
 
 
@@ -402,7 +594,7 @@ def summary_text(summary: EvaluationSummary) -> str:
         else f"{summary.best_lap_seconds:.3f}s"
     )
     return (
-        f"Deterministic result: median={summary.median_progress_m:.1f}m | "
+        f"Seeded robustness result: median={summary.median_progress_m:.1f}m | "
         f"range={summary.minimum_progress_m:.1f}-{summary.maximum_progress_m:.1f}m | "
         f"completed={summary.completed_repeats}/{summary.repeats} | "
         f"best_lap={best_lap}"

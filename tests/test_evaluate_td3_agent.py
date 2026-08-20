@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -53,6 +54,78 @@ class Td3EvaluationTests(unittest.TestCase):
         self.assertEqual(summary.minimum_progress_m, 80.0)
         self.assertEqual(summary.maximum_progress_m, 140.0)
         self.assertEqual(summary.median_off_track_steps, 3.0)
+        self.assertEqual(summary.evaluation_seeds, (1, 2, 3))
+
+    def test_seed_suite_is_unique_and_reproducible(self):
+        first = evaluate_td3_agent.build_evaluation_seeds(
+            repeats=5,
+            base_seed=1234,
+            explicit_seeds=None,
+        )
+        second = evaluate_td3_agent.build_evaluation_seeds(
+            repeats=5,
+            base_seed=1234,
+            explicit_seeds=None,
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(set(first)), 5)
+        self.assertEqual(
+            evaluate_td3_agent.build_evaluation_seeds(
+                repeats=99,
+                base_seed=0,
+                explicit_seeds=[11, 22, 33],
+            ),
+            (11, 22, 33),
+        )
+
+    def test_seeded_steering_disturbance_is_reproducible_and_bounded(self):
+        first = evaluate_td3_agent.SeededSteeringPerturbationAgent(
+            _FixedAgent(),
+            seed=42,
+            steering_noise_std=0.2,
+        )
+        second = evaluate_td3_agent.SeededSteeringPerturbationAgent(
+            _FixedAgent(),
+            seed=42,
+            steering_noise_std=0.2,
+        )
+        different = evaluate_td3_agent.SeededSteeringPerturbationAgent(
+            _FixedAgent(),
+            seed=43,
+            steering_noise_std=0.2,
+        )
+        for agent in (first, second, different):
+            agent.reset()
+
+        first_actions = [first.act(None)["steer"] for _ in range(20)]
+        second_actions = [second.act(None)["steer"] for _ in range(20)]
+        different_actions = [different.act(None)["steer"] for _ in range(20)]
+
+        self.assertEqual(first_actions, second_actions)
+        self.assertNotEqual(first_actions, different_actions)
+        self.assertTrue(
+            all(
+                -evaluate_td3_agent.MAX_STEER <= steer <= evaluate_td3_agent.MAX_STEER
+                for steer in first_actions
+            )
+        )
+
+    def test_evaluation_quality_uses_worst_case_progress_after_median(self):
+        common = {
+            "completed_repeats": 0,
+            "completed_laps": 0,
+            "median_progress_m": 500.0,
+            "median_off_track_steps": 2.0,
+            "mean_total_score": 100.0,
+        }
+        stronger_worst_case = {**common, "minimum_progress_m": 450.0}
+        weaker_worst_case = {**common, "minimum_progress_m": 300.0}
+
+        self.assertGreater(
+            evaluate_td3_agent.evaluation_quality(stronger_worst_case),
+            evaluate_td3_agent.evaluation_quality(weaker_worst_case),
+        )
 
     def test_promoted_evaluation_checkpoint_is_verified_and_not_downgraded(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -100,6 +173,61 @@ class Td3EvaluationTests(unittest.TestCase):
                 )
             )
 
+    def test_protocol_migration_requires_evaluated_baseline_authorisation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / "candidate.zip"
+            best = root / "best_evaluation.zip"
+            candidate.write_bytes(b"candidate-policy")
+            best.write_bytes(b"protected-policy")
+            evaluate_td3_agent.metadata_path_for_policy(best).write_text(
+                json.dumps(
+                    {
+                        "best_evaluation": {
+                            "deterministic": True,
+                            "repeats": 3,
+                            "completed_repeats": 0,
+                            "completed_laps": 0,
+                            "median_progress_m": 1000.0,
+                            "minimum_progress_m": 1000.0,
+                            "median_off_track_steps": 1.0,
+                            "mean_total_score": 100.0,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            episodes = [
+                _episode(1, progress=800.0, off_track=2),
+                _episode(2, progress=700.0, off_track=2),
+                _episode(3, progress=600.0, off_track=2),
+            ]
+            summary = evaluate_td3_agent.aggregate_evaluations(
+                candidate,
+                "g-track-3",
+                episodes,
+            )
+
+            self.assertFalse(
+                evaluate_td3_agent.promote_best_evaluation(
+                    candidate,
+                    best,
+                    summary,
+                    episodes,
+                )
+            )
+            self.assertEqual(best.read_bytes(), b"protected-policy")
+            self.assertTrue(
+                evaluate_td3_agent.promote_best_evaluation(
+                    candidate,
+                    best,
+                    summary,
+                    episodes,
+                    allow_protocol_migration=True,
+                )
+            )
+            self.assertEqual(best.read_bytes(), b"candidate-policy")
+
     def test_checkpoint_collection_is_numeric_and_deduplicated(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -115,6 +243,26 @@ class Td3EvaluationTests(unittest.TestCase):
 
             self.assertEqual(policies, [checkpoint_100.resolve(), checkpoint_25.resolve()])
 
+    def test_verified_baseline_is_added_once_for_fair_promotion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / "candidate.zip"
+            baseline = root / "baseline.zip"
+            candidate.touch()
+            baseline.touch()
+
+            policies = evaluate_td3_agent.include_verified_baseline(
+                [candidate.resolve()],
+                baseline,
+            )
+            deduplicated = evaluate_td3_agent.include_verified_baseline(
+                policies,
+                baseline,
+            )
+
+            self.assertEqual(policies, [candidate.resolve(), baseline.resolve()])
+            self.assertEqual(deduplicated, policies)
+
 
 def _episode(
     repeat: int,
@@ -124,6 +272,7 @@ def _episode(
 ) -> evaluate_td3_agent.EvaluationEpisode:
     return evaluate_td3_agent.EvaluationEpisode(
         repeat=repeat,
+        seed=repeat,
         reason="out of bounds",
         steps=500,
         laps=0,
@@ -134,6 +283,24 @@ def _episode(
         average_speed_kmh=45.0,
         off_track_steps=off_track,
     )
+
+
+class _FixedAgent:
+    def reset(self) -> None:
+        return None
+
+    def act(self, _observation, _telemetry=None):
+        return {
+            "steer": 0.0,
+            "accel": 0.5,
+            "brake": 0.0,
+            "gear": 1,
+            "terminate": False,
+            "termination_reason": "",
+        }
+
+    def telemetry_debug(self):
+        return {}
 
 
 if __name__ == "__main__":

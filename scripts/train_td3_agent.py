@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import contextlib
 import csv
 import io
@@ -60,12 +61,22 @@ DEFAULT_PROGRESS_INTERVAL_SECONDS = 1.0
 ACTION_NOISE_UPDATE_INTERVAL_STEPS = 1_000
 DEFAULT_LEARNING_RATE = 3e-4
 DEFAULT_FINAL_LEARNING_RATE = 1e-4
-DEFAULT_CONTINUATION_LEARNING_RATE = 1e-4
-DEFAULT_CONTINUATION_FINAL_LEARNING_RATE = 3e-5
+DEFAULT_CONTINUATION_LEARNING_RATE = 3e-5
+DEFAULT_CONTINUATION_FINAL_LEARNING_RATE = 1e-5
+DEFAULT_CONTINUATION_ACTOR_LEARNING_RATE = 1e-5
+DEFAULT_CONTINUATION_FINAL_ACTOR_LEARNING_RATE = 3e-6
 DEFAULT_CONTINUATION_BUFFER_SIZE = 300_000
-DEFAULT_CONTINUATION_REPLAY_REFILL_STEPS = 10_000
-DEFAULT_CONTINUATION_ACTION_NOISE_SIGMA = 0.04
-DEFAULT_CONTINUATION_FINAL_ACTION_NOISE_SIGMA = 0.02
+DEFAULT_CONTINUATION_REPLAY_REFILL_STEPS = 20_000
+DEFAULT_CONTINUATION_CRITIC_WARMUP_STEPS = 20_000
+DEFAULT_CONTINUATION_ACTOR_UNFREEZE_STEPS = 40_000
+DEFAULT_CONTINUATION_ACTION_NOISE_SIGMA = 0.02
+DEFAULT_CONTINUATION_FINAL_ACTION_NOISE_SIGMA = 0.006
+DEFAULT_SAFE_ACTOR_MAX_ACTION_DELTA = 0.025
+DEFAULT_SAFE_ACTOR_GRADIENT_NORM = 1.0
+DEFAULT_SAFE_ACTOR_BLOCK_UPDATES = 250
+DEFAULT_SAFE_ACTOR_PROBE_REPEATS = 3
+DEFAULT_SAFE_ACTOR_MIN_IMPROVEMENT_M = 5.0
+DEFAULT_SAFE_ACTOR_ANCHOR_BATCH_SIZE = 256
 
 REWARD_VERSION = "agent6_td3_reward_v1_raw_progress_curriculum"
 OFF_TRACK_GRACE_STEPS = 4
@@ -154,6 +165,12 @@ EPISODE_COLUMNS = [
     "global_timestep",
     "policy_controlled",
     "deterministic_probe",
+    "safe_actor_candidate_probe",
+    "safe_actor_candidate_id",
+    "safe_actor_probe_index",
+    "safe_actor_decision",
+    "safe_actor_probe_median_distance_m",
+    "safe_actor_accepted_distance_m",
     "curriculum_eligible",
     "training_phase",
     "action_noise_sigma",
@@ -357,6 +374,38 @@ def gradient_update_start_timestep(args: argparse.Namespace) -> int:
     return max(0, int(args.learning_starts))
 
 
+def actor_update_start_timestep(args: argparse.Namespace) -> int:
+    gradient_start = gradient_update_start_timestep(args)
+    if not args.continuation:
+        return gradient_start
+    return gradient_start + max(0, int(args.critic_warmup_steps))
+
+
+def actor_full_unfreeze_timestep(args: argparse.Namespace) -> int:
+    return actor_update_start_timestep(args) + max(
+        0,
+        int(args.actor_unfreeze_steps),
+    )
+
+
+def continuation_training_phase(
+    timestep: int,
+    *,
+    gradient_update_start: int,
+    actor_update_start: int,
+    actor_full_unfreeze: int,
+    pre_update_phase: str,
+) -> str:
+    current = max(0, int(timestep))
+    if current < max(0, int(gradient_update_start)):
+        return str(pre_update_phase)
+    if current < max(0, int(actor_update_start)):
+        return "critic_warmup"
+    if current < max(0, int(actor_full_unfreeze)):
+        return "actor_unfreeze"
+    return "learning"
+
+
 def calculate_progress_delta(
     previous_telemetry: Mapping[str, Any] | None,
     telemetry: Mapping[str, Any],
@@ -498,6 +547,36 @@ def linear_learning_rate_schedule(
     return schedule
 
 
+def gradual_actor_learning_rate_schedule(
+    initial_rate: float,
+    final_rate: float,
+    *,
+    actor_update_start: int,
+    unfreeze_steps: int,
+    total_timesteps: int,
+) -> Callable[[int], float]:
+    """Keep the actor fixed, ramp it in, then decay its learning rate."""
+    initial = float(initial_rate)
+    final = float(final_rate)
+    start = max(0, int(actor_update_start))
+    ramp_steps = max(1, int(unfreeze_steps))
+    ramp_end = start + ramp_steps
+    total = max(ramp_end + 1, int(total_timesteps))
+    decay_steps = max(1, total - ramp_end)
+
+    def schedule(timestep: int) -> float:
+        current = max(0, int(timestep))
+        if current <= start:
+            return 0.0
+        if current < ramp_end:
+            ramp_progress = (current - start) / ramp_steps
+            return initial * clamp(ramp_progress, 0.0, 1.0)
+        decay_progress = clamp((current - ramp_end) / decay_steps, 0.0, 1.0)
+        return initial + (final - initial) * decay_progress
+
+    return schedule
+
+
 def should_schedule_policy_probe(
     *,
     timestep: int,
@@ -511,6 +590,24 @@ def should_schedule_policy_probe(
     if int(probe_episodes_completed) == 0:
         return True
     return int(policy_episodes_since_probe) >= max(1, int(probe_interval))
+
+
+def safe_actor_probe_decision(
+    probe_distances_m: list[float],
+    *,
+    accepted_distance_m: float,
+    minimum_improvement_m: float,
+) -> tuple[str, float]:
+    """Classify a complete candidate probe set by its median progress."""
+    if not probe_distances_m:
+        raise ValueError("safe actor decision requires at least one probe")
+    median_distance_m = float(np.median(np.asarray(probe_distances_m, dtype=float)))
+    required_distance_m = max(0.0, float(accepted_distance_m)) + max(
+        0.0,
+        float(minimum_improvement_m),
+    )
+    decision = "accepted" if median_distance_m >= required_distance_m else "rolled_back"
+    return decision, median_distance_m
 
 
 def calculate_td3_reward(
@@ -658,6 +755,34 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "replay_refill_steps": args.replay_refill_steps,
             "replay_refill_uses_loaded_policy": args.continuation,
             "replay_refill_freezes_gradient_updates": args.continuation,
+            "critic_only_warmup_steps": args.critic_warmup_steps,
+            "critic_only_warmup_updates_critic_target": args.continuation,
+            "actor_frozen_until_timestep": actor_update_start_timestep(args),
+            "actor_unfreeze_steps": args.actor_unfreeze_steps,
+            "actor_fully_unfrozen_at_timestep": actor_full_unfreeze_timestep(args),
+        },
+        "safe_actor_improvement": {
+            "enabled": args.safe_actor_improvement,
+            "learning_source": "reward_only",
+            "external_teacher": False,
+            "behaviour_cloning": False,
+            "racing_line_imitation": False,
+            "constraint": "action_space_trust_region_to_last_accepted_actor",
+            "max_normalized_action_delta": args.safe_actor_max_action_delta,
+            "gradient_clip_norm": args.safe_actor_gradient_norm,
+            "actor_updates_per_candidate_block": args.safe_actor_block_updates,
+            "deterministic_probe_repeats": args.safe_actor_probe_repeats,
+            "acceptance_metric": "median_distance_m",
+            "minimum_improvement_m": args.safe_actor_min_improvement_m,
+            "anchor_batch_size": args.safe_actor_anchor_batch_size,
+            "rejected_candidate_restores": [
+                "actor",
+                "actor_target",
+                "actor_optimizer",
+            ],
+            "critic_and_replay_survive_rollback": True,
+            "candidate_probes_deferred_from_curriculum": True,
+            "saved_checkpoint_actor": "last_accepted_actor",
         },
         "total_timesteps_requested": args.total_timesteps,
         "seed": args.seed,
@@ -683,15 +808,23 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "learning_starts": args.learning_starts,
             "policy_action_starts_at_timestep": policy_action_start_timestep(args),
             "gradient_updates_start_at_timestep": gradient_update_start_timestep(args),
+            "actor_updates_start_at_timestep": actor_update_start_timestep(args),
+            "actor_fully_unfrozen_at_timestep": actor_full_unfreeze_timestep(args),
             "batch_size": args.batch_size,
             "gamma": args.gamma,
             "tau": args.tau,
             "learning_rate": args.learning_rate,
             "learning_rate_final": args.learning_rate_final,
-            "learning_rate_schedule": "linear_after_learning_starts",
+            "critic_learning_rate_schedule": "linear_after_replay_refill",
             "learning_rate_decay_starts_at_timestep": (
                 gradient_update_start_timestep(args)
             ),
+            "actor_learning_rate": args.actor_learning_rate,
+            "actor_learning_rate_final": args.actor_learning_rate_final,
+            "actor_learning_rate_schedule": "frozen_then_linear_ramp_and_decay",
+            "critic_warmup_steps": args.critic_warmup_steps,
+            "actor_unfreeze_steps": args.actor_unfreeze_steps,
+            "safe_actor_improvement": args.safe_actor_improvement,
             "train_freq": args.train_freq,
             "gradient_steps": args.gradient_steps,
             "policy_delay": args.policy_delay,
@@ -848,6 +981,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             self.episode_start_time = 0.0
             self.episode_start_timestep = 0
             self.deterministic_probe = False
+            self.safe_actor_candidate_probe = False
             self.action_noise_sigma: float | None = None
             self.episode_max_speed = 0.0
             self.episode_off_track_steps = 0
@@ -869,10 +1003,56 @@ def make_training_env_class(gym: Any, spaces: Any):
             deterministic_probe: bool,
             action_noise_sigma: float,
             training_phase: str,
+            safe_actor_candidate_probe: bool = False,
         ) -> None:
             self.deterministic_probe = bool(deterministic_probe)
+            self.safe_actor_candidate_probe = bool(
+                deterministic_probe and safe_actor_candidate_probe
+            )
             self.action_noise_sigma = max(0.0, float(action_noise_sigma))
             self.training_phase = str(training_phase)
+
+        def accept_safe_actor_probe(
+            self,
+            summary: dict[str, Any],
+            *,
+            median_distance_m: float,
+        ) -> None:
+            """Commit one accepted probe result to the curriculum state."""
+            if str(summary.get("stage_id")) != self.current_stage.stage_id:
+                return
+            completed_lap = int(summary.get("laps_completed") or 0) > 0
+            stage_success = (
+                float(median_distance_m) >= self.current_stage.distance_target_m
+                or completed_lap
+            )
+            history = self.stage_success_windows[self.current_stage.stage_id]
+            history.append(stage_success)
+            if len(history) > DEFAULT_STAGE_SUCCESS_WINDOW_SIZE:
+                del history[: len(history) - DEFAULT_STAGE_SUCCESS_WINDOW_SIZE]
+            if stage_success:
+                self.stage_success_streak += 1
+                self.stage_success_totals[self.current_stage.stage_id] += 1
+            else:
+                self.stage_success_streak = 0
+
+            summary["curriculum_eligible"] = True
+            summary["stage_success_streak"] = self.stage_success_streak
+            summary["stage_recent_successes"] = recent_success_count(history)
+            summary["stage_success_total"] = self.stage_success_totals[
+                self.current_stage.stage_id
+            ]
+            stage_completed = curriculum_stage_can_advance(
+                self.current_stage,
+                history,
+                completed_lap=(1.0 if completed_lap else None),
+                curriculum_eligible=True,
+            )
+            if stage_completed:
+                summary["termination_reason"] = "curriculum_stage_completed"
+                if self.stage_index < len(CURRICULUM) - 1:
+                    self.stage_index += 1
+                    self.stage_success_streak = 0
 
         def reset(self, *, seed: int | None = None, options: Mapping[str, Any] | None = None):
             super().reset(seed=seed)
@@ -1028,7 +1208,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             curriculum_eligible = episode_is_curriculum_eligible(
                 policy_controlled=policy_controlled,
                 deterministic_probe=self.deterministic_probe,
-            )
+            ) and not self.safe_actor_candidate_probe
             applied_action_noise_sigma = (
                 None
                 if not policy_controlled
@@ -1112,6 +1292,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             info: dict[str, Any] = {
                 "policy_controlled": policy_controlled,
                 "deterministic_probe": self.deterministic_probe,
+                "safe_actor_candidate_probe": self.safe_actor_candidate_probe,
                 "curriculum_eligible": curriculum_eligible,
                 "training_phase": self.training_phase,
                 "action_noise_sigma": applied_action_noise_sigma,
@@ -1196,7 +1377,7 @@ def make_training_env_class(gym: Any, spaces: Any):
                 curriculum_eligible = episode_is_curriculum_eligible(
                     policy_controlled=policy_controlled,
                     deterministic_probe=deterministic_probe,
-                )
+                ) and not self.safe_actor_candidate_probe
             applied_action_noise_sigma = (
                 None
                 if not policy_controlled
@@ -1207,6 +1388,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             return {
                 "policy_controlled": policy_controlled,
                 "deterministic_probe": deterministic_probe,
+                "safe_actor_candidate_probe": self.safe_actor_candidate_probe,
                 "curriculum_eligible": curriculum_eligible,
                 "training_phase": self.training_phase,
                 "action_noise_sigma": applied_action_noise_sigma,
@@ -1520,6 +1702,8 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             probe_interval: int,
             training_gradient_steps: int,
             pre_update_training_phase: str = "warmup",
+            actor_update_start: int | None = None,
+            actor_full_unfreeze: int | None = None,
         ) -> None:
             super().__init__(verbose=0)
             self.raw_env = raw_env
@@ -1531,6 +1715,16 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             self.probe_interval = max(1, int(probe_interval))
             self.training_gradient_steps = int(training_gradient_steps)
             self.pre_update_training_phase = str(pre_update_training_phase)
+            self.actor_update_start = (
+                self.learning_starts
+                if actor_update_start is None
+                else max(self.learning_starts, int(actor_update_start))
+            )
+            self.actor_full_unfreeze = (
+                self.actor_update_start
+                if actor_full_unfreeze is None
+                else max(self.actor_update_start, int(actor_full_unfreeze))
+            )
             self.probe_episodes_completed = 0
             self.policy_episodes_since_probe = 0
             self.current_episode_is_probe = False
@@ -1549,18 +1743,24 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                 completed_episode = True
                 if bool(summary.get("policy_controlled")):
                     if bool(summary.get("deterministic_probe")):
+                        safe_result = self._record_safe_actor_probe(summary)
+                        if safe_result is not None:
+                            self._annotate_safe_actor_probe(summary, safe_result)
                         self.probe_episodes_completed += 1
                         self.policy_episodes_since_probe = 0
                     else:
                         self.policy_episodes_since_probe += 1
 
             if completed_episode:
-                next_episode_is_probe = should_schedule_policy_probe(
-                    timestep=self.num_timesteps,
-                    learning_starts=self.learning_starts,
-                    probe_episodes_completed=self.probe_episodes_completed,
-                    policy_episodes_since_probe=self.policy_episodes_since_probe,
-                    probe_interval=self.probe_interval,
+                next_episode_is_probe = (
+                    self._safe_actor_probe_required()
+                    or should_schedule_policy_probe(
+                        timestep=self.num_timesteps,
+                        learning_starts=self.learning_starts,
+                        probe_episodes_completed=self.probe_episodes_completed,
+                        policy_episodes_since_probe=self.policy_episodes_since_probe,
+                        probe_interval=self.probe_interval,
+                    )
                 )
                 self._apply_policy_mode(
                     deterministic_probe=next_episode_is_probe,
@@ -1584,6 +1784,15 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             return True
 
         def _on_training_end(self):
+            finalize = getattr(self.model, "finalize_safe_actor_candidate", None)
+            if callable(finalize):
+                result = finalize()
+                if result is not None:
+                    print(
+                        "\nSafe actor candidate "
+                        f"{result['candidate_id']} rolled back at training end "
+                        "because its probe set was incomplete."
+                    )
             sigma = action_noise_sigma_at_timestep(
                 self.num_timesteps,
                 learning_starts=self.learning_starts,
@@ -1619,18 +1828,65 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             )
             self.current_episode_is_probe = deterministic_probe
             self.last_noise_update_timestep = self.num_timesteps
-            training_phase = (
-                "deterministic_probe"
-                if deterministic_probe
-                else self.pre_update_training_phase
-                if self.num_timesteps < self.learning_starts
-                else "learning"
+            training_phase = "deterministic_probe" if deterministic_probe else (
+                continuation_training_phase(
+                    self.num_timesteps,
+                    gradient_update_start=self.learning_starts,
+                    actor_update_start=self.actor_update_start,
+                    actor_full_unfreeze=self.actor_full_unfreeze,
+                    pre_update_phase=self.pre_update_training_phase,
+                )
             )
             self.raw_env.set_policy_mode(
                 deterministic_probe=deterministic_probe,
                 action_noise_sigma=sigma,
                 training_phase=training_phase,
+                safe_actor_candidate_probe=(
+                    deterministic_probe and self._safe_actor_probe_required()
+                ),
             )
+
+        def _safe_actor_probe_required(self) -> bool:
+            required = getattr(self.model, "safe_actor_probe_required", None)
+            return bool(callable(required) and required())
+
+        def _record_safe_actor_probe(
+            self,
+            summary: Mapping[str, Any],
+        ) -> dict[str, Any] | None:
+            record = getattr(self.model, "record_safe_actor_probe", None)
+            if not callable(record) or not self._safe_actor_probe_required():
+                return None
+            return record(summary)
+
+        def _annotate_safe_actor_probe(
+            self,
+            summary: dict[str, Any],
+            result: Mapping[str, Any],
+        ) -> None:
+            summary["safe_actor_candidate_probe"] = True
+            summary["safe_actor_candidate_id"] = result.get("candidate_id")
+            summary["safe_actor_probe_index"] = result.get("probe_index")
+            summary["safe_actor_decision"] = result.get("decision")
+            summary["safe_actor_probe_median_distance_m"] = result.get(
+                "median_distance_m"
+            )
+            summary["safe_actor_accepted_distance_m"] = result.get(
+                "accepted_distance_m"
+            )
+            decision = str(result.get("decision") or "")
+            if decision == "accepted":
+                self.raw_env.accept_safe_actor_probe(
+                    summary,
+                    median_distance_m=float(result["median_distance_m"]),
+                )
+            if decision in {"accepted", "rolled_back"}:
+                print(
+                    "\nSafe actor candidate "
+                    f"{result['candidate_id']} {decision}: "
+                    f"median={float(result['median_distance_m']):.1f}m, "
+                    f"required={float(result['required_distance_m']):.1f}m."
+                )
 
     return ExplorationScheduleCallback
 
@@ -1666,6 +1922,11 @@ def make_best_model_callback_class(BaseCallback: Any):
             for info in infos:
                 summary = info.get("episode_summary") if isinstance(info, dict) else None
                 if summary is None:
+                    continue
+                if summary.get("safe_actor_decision") in {
+                    "pending",
+                    "rolled_back",
+                }:
                     continue
                 if (
                     not bool(summary.get("curriculum_eligible"))
@@ -1705,6 +1966,7 @@ def make_best_model_callback_class(BaseCallback: Any):
                             "distance_m": distance_m,
                             "episode_summary": summary,
                         },
+                        save_replay_buffer=self.save_best_replay_buffer,
                     )
             return True
 
@@ -1858,6 +2120,484 @@ def resolve_tensorboard_log_dir(tensorboard_dir: Path, *, disable_tensorboard: b
     return None
 
 
+def make_phased_continuation_td3_class(TD3: Any):
+    import torch as th
+    import torch.nn.functional as F
+    from stable_baselines3.common.utils import polyak_update, update_learning_rate
+
+    class PhasedContinuationTD3(TD3):
+        """TD3 continuation with phased and probe-gated actor improvement."""
+
+        def _excluded_save_params(self) -> list[str]:
+            return [
+                *super()._excluded_save_params(),
+                "_agent6_safe_actor_reference",
+                "_agent6_safe_actor_state",
+                "_agent6_safe_actor_target_state",
+                "_agent6_safe_actor_optimizer_state",
+                "_agent6_safe_actor_anchor_observations",
+            ]
+
+        def save(
+            self,
+            path: Any,
+            exclude: Any = None,
+            include: Any = None,
+        ) -> None:
+            candidate_updates = int(
+                getattr(self, "_agent6_safe_actor_candidate_updates", 0)
+            )
+            if (
+                not getattr(self, "_agent6_safe_actor_enabled", False)
+                or candidate_updates <= 0
+            ):
+                super().save(path, exclude=exclude, include=include)
+                return
+
+            candidate_actor = self._clone_module_state(self.actor)
+            candidate_actor_target = self._clone_module_state(self.actor_target)
+            candidate_optimizer = copy.deepcopy(self.actor.optimizer.state_dict())
+            self._restore_safe_actor()
+            try:
+                super().save(path, exclude=exclude, include=include)
+            finally:
+                self.actor.load_state_dict(candidate_actor)
+                self.actor_target.load_state_dict(candidate_actor_target)
+                self.actor.optimizer.load_state_dict(candidate_optimizer)
+
+        def configure_continuation_updates(
+            self,
+            *,
+            actor_learning_rate_schedule: Callable[[int], float],
+            actor_updates_start_at: int,
+            safe_actor_improvement: bool = False,
+            safe_actor_max_action_delta: float = DEFAULT_SAFE_ACTOR_MAX_ACTION_DELTA,
+            safe_actor_gradient_norm: float = DEFAULT_SAFE_ACTOR_GRADIENT_NORM,
+            safe_actor_block_updates: int = DEFAULT_SAFE_ACTOR_BLOCK_UPDATES,
+            safe_actor_probe_repeats: int = DEFAULT_SAFE_ACTOR_PROBE_REPEATS,
+            safe_actor_min_improvement_m: float = (
+                DEFAULT_SAFE_ACTOR_MIN_IMPROVEMENT_M
+            ),
+            safe_actor_anchor_batch_size: int = (
+                DEFAULT_SAFE_ACTOR_ANCHOR_BATCH_SIZE
+            ),
+            accepted_distance_m: float = 0.0,
+        ) -> None:
+            self._agent6_actor_learning_rate_schedule = actor_learning_rate_schedule
+            self._agent6_actor_updates_start_at = max(
+                0,
+                int(actor_updates_start_at),
+            )
+            self._agent6_safe_actor_enabled = bool(safe_actor_improvement)
+            self._agent6_safe_actor_max_action_delta = max(
+                0.0,
+                float(safe_actor_max_action_delta),
+            )
+            self._agent6_safe_actor_gradient_norm = max(
+                0.0,
+                float(safe_actor_gradient_norm),
+            )
+            self._agent6_safe_actor_block_updates = max(
+                1,
+                int(safe_actor_block_updates),
+            )
+            self._agent6_safe_actor_probe_repeats = max(
+                1,
+                int(safe_actor_probe_repeats),
+            )
+            self._agent6_safe_actor_min_improvement_m = max(
+                0.0,
+                float(safe_actor_min_improvement_m),
+            )
+            self._agent6_safe_actor_anchor_batch_size = max(
+                1,
+                int(safe_actor_anchor_batch_size),
+            )
+            self._agent6_safe_actor_accepted_distance_m = max(
+                0.0,
+                float(accepted_distance_m),
+            )
+            self._agent6_safe_actor_candidate_id = 0
+            self._agent6_safe_actor_candidate_updates = 0
+            self._agent6_safe_actor_waiting_for_probe = False
+            self._agent6_safe_actor_probe_distances_m: list[float] = []
+            self._agent6_safe_actor_accepted_blocks = 0
+            self._agent6_safe_actor_rolled_back_blocks = 0
+            self._agent6_safe_actor_anchor_observations = None
+            if self._agent6_safe_actor_enabled:
+                self._snapshot_safe_actor()
+
+        @staticmethod
+        def _clone_module_state(module: Any) -> dict[str, Any]:
+            return {
+                name: value.detach().clone()
+                for name, value in module.state_dict().items()
+            }
+
+        def _snapshot_safe_actor(self) -> None:
+            self._agent6_safe_actor_state = self._clone_module_state(self.actor)
+            self._agent6_safe_actor_target_state = self._clone_module_state(
+                self.actor_target
+            )
+            self._agent6_safe_actor_optimizer_state = copy.deepcopy(
+                self.actor.optimizer.state_dict()
+            )
+            self._agent6_safe_actor_reference = copy.deepcopy(self.actor)
+            self._agent6_safe_actor_reference.set_training_mode(False)
+            for parameter in self._agent6_safe_actor_reference.parameters():
+                parameter.requires_grad_(False)
+
+        def _restore_safe_actor(self) -> None:
+            self.actor.load_state_dict(self._agent6_safe_actor_state)
+            self.actor_target.load_state_dict(self._agent6_safe_actor_target_state)
+            self.actor.optimizer.load_state_dict(
+                copy.deepcopy(self._agent6_safe_actor_optimizer_state)
+            )
+
+        def safe_actor_probe_required(self) -> bool:
+            return bool(
+                getattr(self, "_agent6_safe_actor_enabled", False)
+                and getattr(self, "_agent6_safe_actor_waiting_for_probe", False)
+            )
+
+        def safe_actor_status(self) -> dict[str, Any]:
+            return {
+                "enabled": bool(
+                    getattr(self, "_agent6_safe_actor_enabled", False)
+                ),
+                "accepted_distance_m": float(
+                    getattr(self, "_agent6_safe_actor_accepted_distance_m", 0.0)
+                ),
+                "accepted_blocks": int(
+                    getattr(self, "_agent6_safe_actor_accepted_blocks", 0)
+                ),
+                "rolled_back_blocks": int(
+                    getattr(self, "_agent6_safe_actor_rolled_back_blocks", 0)
+                ),
+                "candidate_id": int(
+                    getattr(self, "_agent6_safe_actor_candidate_id", 0)
+                ),
+                "candidate_updates": int(
+                    getattr(self, "_agent6_safe_actor_candidate_updates", 0)
+                ),
+                "waiting_for_probe": self.safe_actor_probe_required(),
+                "completed_candidate_probes": len(
+                    getattr(self, "_agent6_safe_actor_probe_distances_m", [])
+                ),
+            }
+
+        def record_safe_actor_probe(
+            self,
+            summary: Mapping[str, Any],
+        ) -> dict[str, Any] | None:
+            if not self.safe_actor_probe_required():
+                return None
+            distances = self._agent6_safe_actor_probe_distances_m
+            distances.append(max(0.0, finite_float(summary.get("distance_m"))))
+            probe_index = len(distances)
+            result = {
+                "candidate_id": self._agent6_safe_actor_candidate_id,
+                "probe_index": probe_index,
+                "probe_repeats": self._agent6_safe_actor_probe_repeats,
+                "decision": "pending",
+                "median_distance_m": None,
+                "accepted_distance_m": self._agent6_safe_actor_accepted_distance_m,
+                "required_distance_m": (
+                    self._agent6_safe_actor_accepted_distance_m
+                    + self._agent6_safe_actor_min_improvement_m
+                ),
+            }
+            if probe_index < self._agent6_safe_actor_probe_repeats:
+                return result
+
+            decision, median_distance_m = safe_actor_probe_decision(
+                distances,
+                accepted_distance_m=self._agent6_safe_actor_accepted_distance_m,
+                minimum_improvement_m=self._agent6_safe_actor_min_improvement_m,
+            )
+            if decision == "accepted":
+                self._agent6_safe_actor_accepted_distance_m = median_distance_m
+                self._agent6_safe_actor_accepted_blocks += 1
+                self._snapshot_safe_actor()
+            else:
+                self._restore_safe_actor()
+                self._agent6_safe_actor_rolled_back_blocks += 1
+            self._agent6_safe_actor_candidate_updates = 0
+            self._agent6_safe_actor_waiting_for_probe = False
+            self._agent6_safe_actor_probe_distances_m = []
+            result.update(
+                {
+                    "decision": decision,
+                    "median_distance_m": median_distance_m,
+                    "accepted_distance_m": (
+                        self._agent6_safe_actor_accepted_distance_m
+                    ),
+                }
+            )
+            return result
+
+        def finalize_safe_actor_candidate(self) -> dict[str, Any] | None:
+            candidate_updates = int(
+                getattr(self, "_agent6_safe_actor_candidate_updates", 0)
+            )
+            if not getattr(self, "_agent6_safe_actor_enabled", False):
+                return None
+            if candidate_updates <= 0 and not self.safe_actor_probe_required():
+                return None
+            candidate_id = self._agent6_safe_actor_candidate_id
+            self._restore_safe_actor()
+            self._agent6_safe_actor_candidate_updates = 0
+            self._agent6_safe_actor_waiting_for_probe = False
+            self._agent6_safe_actor_probe_distances_m = []
+            self._agent6_safe_actor_rolled_back_blocks += 1
+            return {
+                "candidate_id": candidate_id,
+                "decision": "rolled_back_incomplete",
+            }
+
+        def _safe_actor_constraint_observations(self, observations: Any) -> Any:
+            anchors = self._agent6_safe_actor_anchor_observations
+            if anchors is None:
+                anchor_count = min(
+                    self._agent6_safe_actor_anchor_batch_size,
+                    int(observations.shape[0]),
+                )
+                anchors = observations[:anchor_count].detach().clone()
+                self._agent6_safe_actor_anchor_observations = anchors
+            return th.cat((observations, anchors), dim=0)
+
+        def _safe_actor_action_delta(self, observations: Any) -> float:
+            with th.no_grad():
+                candidate_actions = self.actor(observations)
+                accepted_actions = self._agent6_safe_actor_reference(observations)
+                return float(
+                    (candidate_actions - accepted_actions).abs().max().item()
+                )
+
+        def _project_safe_actor(self, observations: Any) -> float:
+            max_delta = self._agent6_safe_actor_max_action_delta
+            candidate_parameters = [
+                parameter.detach().clone()
+                for parameter in self.actor.parameters()
+            ]
+            accepted_parameters = list(
+                self._agent6_safe_actor_reference.parameters()
+            )
+            action_delta = self._safe_actor_action_delta(observations)
+            if action_delta <= max_delta:
+                return action_delta
+
+            lower = 0.0
+            upper = 1.0
+            for _ in range(8):
+                interpolation = (lower + upper) * 0.5
+                with th.no_grad():
+                    for parameter, accepted, candidate in zip(
+                        self.actor.parameters(),
+                        accepted_parameters,
+                        candidate_parameters,
+                    ):
+                        parameter.copy_(
+                            accepted + interpolation * (candidate - accepted)
+                        )
+                if self._safe_actor_action_delta(observations) <= max_delta:
+                    lower = interpolation
+                else:
+                    upper = interpolation
+            with th.no_grad():
+                for parameter, accepted, candidate in zip(
+                    self.actor.parameters(),
+                    accepted_parameters,
+                    candidate_parameters,
+                ):
+                    parameter.copy_(accepted + lower * (candidate - accepted))
+            return self._safe_actor_action_delta(observations)
+
+        def train(self, gradient_steps: int, batch_size: int = 100) -> None:
+            actor_schedule = getattr(
+                self,
+                "_agent6_actor_learning_rate_schedule",
+                None,
+            )
+            if actor_schedule is None:
+                super().train(gradient_steps, batch_size)
+                return
+
+            self.policy.set_training_mode(True)
+            critic_learning_rate = self.lr_schedule(
+                self._current_progress_remaining
+            )
+            actor_learning_rate = float(actor_schedule(self.num_timesteps))
+            update_learning_rate(self.critic.optimizer, critic_learning_rate)
+            update_learning_rate(self.actor.optimizer, actor_learning_rate)
+            self.logger.record("train/learning_rate", critic_learning_rate)
+            self.logger.record("train/critic_learning_rate", critic_learning_rate)
+            self.logger.record("train/actor_learning_rate", actor_learning_rate)
+
+            actor_updates_enabled = (
+                self.num_timesteps
+                > int(getattr(self, "_agent6_actor_updates_start_at", 0))
+                and actor_learning_rate > 0.0
+                and not self.safe_actor_probe_required()
+            )
+            self.logger.record(
+                "train/actor_updates_enabled",
+                int(actor_updates_enabled),
+            )
+
+            actor_losses: list[float] = []
+            actor_gradient_norms: list[float] = []
+            actor_action_deltas: list[float] = []
+            critic_losses: list[float] = []
+            for _ in range(gradient_steps):
+                self._n_updates += 1
+                replay_data = self.replay_buffer.sample(
+                    batch_size,
+                    env=self._vec_normalize_env,
+                )
+                discounts = (
+                    replay_data.discounts
+                    if replay_data.discounts is not None
+                    else self.gamma
+                )
+
+                with th.no_grad():
+                    noise = replay_data.actions.clone().data.normal_(
+                        0,
+                        self.target_policy_noise,
+                    )
+                    noise = noise.clamp(
+                        -self.target_noise_clip,
+                        self.target_noise_clip,
+                    )
+                    next_actions = (
+                        self.actor_target(replay_data.next_observations) + noise
+                    ).clamp(-1, 1)
+                    next_q_values = th.cat(
+                        self.critic_target(
+                            replay_data.next_observations,
+                            next_actions,
+                        ),
+                        dim=1,
+                    )
+                    next_q_values, _ = th.min(
+                        next_q_values,
+                        dim=1,
+                        keepdim=True,
+                    )
+                    target_q_values = (
+                        replay_data.rewards
+                        + (1 - replay_data.dones) * discounts * next_q_values
+                    )
+
+                current_q_values = self.critic(
+                    replay_data.observations,
+                    replay_data.actions,
+                )
+                critic_loss = sum(
+                    F.mse_loss(current_q, target_q_values)
+                    for current_q in current_q_values
+                )
+                critic_losses.append(float(critic_loss.item()))
+                self.critic.optimizer.zero_grad()
+                critic_loss.backward()
+                self.critic.optimizer.step()
+
+                if self._n_updates % self.policy_delay != 0:
+                    continue
+
+                if actor_updates_enabled and not self.safe_actor_probe_required():
+                    actor_loss = -self.critic.q1_forward(
+                        replay_data.observations,
+                        self.actor(replay_data.observations),
+                    ).mean()
+                    actor_losses.append(float(actor_loss.item()))
+                    self.actor.optimizer.zero_grad()
+                    actor_loss.backward()
+                    if getattr(self, "_agent6_safe_actor_enabled", False):
+                        gradient_norm = th.nn.utils.clip_grad_norm_(
+                            self.actor.parameters(),
+                            self._agent6_safe_actor_gradient_norm,
+                        )
+                        actor_gradient_norms.append(float(gradient_norm.item()))
+                    self.actor.optimizer.step()
+                    if getattr(self, "_agent6_safe_actor_enabled", False):
+                        if self._agent6_safe_actor_candidate_updates == 0:
+                            self._agent6_safe_actor_candidate_id += 1
+                        constraint_observations = (
+                            self._safe_actor_constraint_observations(
+                                replay_data.observations
+                            )
+                        )
+                        actor_action_deltas.append(
+                            self._project_safe_actor(constraint_observations)
+                        )
+                        self._agent6_safe_actor_candidate_updates += 1
+                        if (
+                            self._agent6_safe_actor_candidate_updates
+                            >= self._agent6_safe_actor_block_updates
+                        ):
+                            self._agent6_safe_actor_waiting_for_probe = True
+                    polyak_update(
+                        self.actor.parameters(),
+                        self.actor_target.parameters(),
+                        self.tau,
+                    )
+                    polyak_update(
+                        self.actor_batch_norm_stats,
+                        self.actor_batch_norm_stats_target,
+                        1.0,
+                    )
+
+                # The critic target must continue adapting while the actor is frozen.
+                polyak_update(
+                    self.critic.parameters(),
+                    self.critic_target.parameters(),
+                    self.tau,
+                )
+                polyak_update(
+                    self.critic_batch_norm_stats,
+                    self.critic_batch_norm_stats_target,
+                    1.0,
+                )
+
+            self.logger.record(
+                "train/n_updates",
+                self._n_updates,
+                exclude="tensorboard",
+            )
+            if actor_losses:
+                self.logger.record("train/actor_loss", np.mean(actor_losses))
+            if actor_gradient_norms:
+                self.logger.record(
+                    "train/actor_gradient_norm",
+                    np.mean(actor_gradient_norms),
+                )
+            if actor_action_deltas:
+                self.logger.record(
+                    "train/actor_max_action_delta",
+                    max(actor_action_deltas),
+                )
+            if critic_losses:
+                self.logger.record("train/critic_loss", np.mean(critic_losses))
+            if getattr(self, "_agent6_safe_actor_enabled", False):
+                status = self.safe_actor_status()
+                self.logger.record(
+                    "train/safe_actor_candidate_updates",
+                    status["candidate_updates"],
+                )
+                self.logger.record(
+                    "train/safe_actor_accepted_blocks",
+                    status["accepted_blocks"],
+                )
+                self.logger.record(
+                    "train/safe_actor_rolled_back_blocks",
+                    status["rolled_back_blocks"],
+                )
+
+    return PhasedContinuationTD3
+
+
 def create_td3_model(
     TD3: Any,
     *,
@@ -1945,6 +2685,68 @@ def parse_args() -> argparse.Namespace:
             "gradient updates frozen."
         ),
     )
+    parser.add_argument(
+        "--critic-warmup-steps",
+        type=int,
+        default=None,
+        help=(
+            "Continuation steps with critic updates enabled while the actor "
+            "and actor target remain frozen."
+        ),
+    )
+    parser.add_argument(
+        "--actor-unfreeze-steps",
+        type=int,
+        default=None,
+        help=(
+            "Continuation steps used to ramp the actor learning rate from zero."
+        ),
+    )
+    parser.add_argument(
+        "--safe-actor-improvement",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Gate continuation actor updates through bounded update blocks and "
+            "repeated deterministic acceptance probes."
+        ),
+    )
+    parser.add_argument(
+        "--safe-actor-max-action-delta",
+        type=float,
+        default=DEFAULT_SAFE_ACTOR_MAX_ACTION_DELTA,
+        help="Maximum normalized action deviation from the accepted actor.",
+    )
+    parser.add_argument(
+        "--safe-actor-gradient-norm",
+        type=float,
+        default=DEFAULT_SAFE_ACTOR_GRADIENT_NORM,
+        help="Maximum actor gradient norm before each optimizer step.",
+    )
+    parser.add_argument(
+        "--safe-actor-block-updates",
+        type=int,
+        default=DEFAULT_SAFE_ACTOR_BLOCK_UPDATES,
+        help="Actor optimizer updates allowed before an acceptance probe set.",
+    )
+    parser.add_argument(
+        "--safe-actor-probe-repeats",
+        type=int,
+        default=DEFAULT_SAFE_ACTOR_PROBE_REPEATS,
+        help="Consecutive deterministic probes used to rank each candidate.",
+    )
+    parser.add_argument(
+        "--safe-actor-min-improvement-m",
+        type=float,
+        default=DEFAULT_SAFE_ACTOR_MIN_IMPROVEMENT_M,
+        help="Required median-distance gain before a candidate is accepted.",
+    )
+    parser.add_argument(
+        "--safe-actor-anchor-batch-size",
+        type=int,
+        default=DEFAULT_SAFE_ACTOR_ANCHOR_BATCH_SIZE,
+        help="Replay observations retained for action-space trust-region checks.",
+    )
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument(
         "--best-distance-model-path",
@@ -1989,6 +2791,18 @@ def parse_args() -> argparse.Namespace:
             "end of the requested training run."
         ),
     )
+    parser.add_argument(
+        "--actor-learning-rate",
+        type=float,
+        default=None,
+        help="Peak actor learning rate after critic-only warm-up.",
+    )
+    parser.add_argument(
+        "--actor-learning-rate-final",
+        type=float,
+        default=None,
+        help="Final actor learning rate at the end of the training run.",
+    )
     parser.add_argument("--train-freq", type=int, default=1)
     parser.add_argument("--gradient-steps", type=int, default=1)
     parser.add_argument("--policy-delay", type=int, default=2)
@@ -2024,8 +2838,8 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Save an aligned replay buffer beside each exact best-distance model. "
-            "Enabled by default for continuation training."
+            "Save an aligned replay buffer beside each exact best-distance and "
+            "best-reward model. Enabled by default for continuation training."
         ),
     )
     args = parser.parse_args()
@@ -2035,6 +2849,14 @@ def parse_args() -> argparse.Namespace:
     if args.replay_refill_steps is None:
         args.replay_refill_steps = (
             DEFAULT_CONTINUATION_REPLAY_REFILL_STEPS if args.continuation else 0
+        )
+    if args.critic_warmup_steps is None:
+        args.critic_warmup_steps = (
+            DEFAULT_CONTINUATION_CRITIC_WARMUP_STEPS if args.continuation else 0
+        )
+    if args.actor_unfreeze_steps is None:
+        args.actor_unfreeze_steps = (
+            DEFAULT_CONTINUATION_ACTOR_UNFREEZE_STEPS if args.continuation else 0
         )
     if args.buffer_size is None:
         args.buffer_size = (
@@ -2052,6 +2874,18 @@ def parse_args() -> argparse.Namespace:
             if args.continuation
             else DEFAULT_FINAL_LEARNING_RATE
         )
+    if args.actor_learning_rate is None:
+        args.actor_learning_rate = (
+            DEFAULT_CONTINUATION_ACTOR_LEARNING_RATE
+            if args.continuation
+            else args.learning_rate
+        )
+    if args.actor_learning_rate_final is None:
+        args.actor_learning_rate_final = (
+            DEFAULT_CONTINUATION_FINAL_ACTOR_LEARNING_RATE
+            if args.continuation
+            else args.learning_rate_final
+        )
     if args.action_noise_sigma is None:
         args.action_noise_sigma = (
             DEFAULT_CONTINUATION_ACTION_NOISE_SIGMA
@@ -2066,6 +2900,8 @@ def parse_args() -> argparse.Namespace:
         )
     if args.save_best_replay_buffer is None:
         args.save_best_replay_buffer = args.continuation
+    if args.safe_actor_improvement is None:
+        args.safe_actor_improvement = args.continuation
 
     if not args.continuation and args.start_stage != "launch":
         parser.error("--start-stage requires --resume-from unless it is launch")
@@ -2089,8 +2925,36 @@ def parse_args() -> argparse.Namespace:
         parser.error("--total-timesteps must be at least 1")
     if args.replay_refill_steps < 0:
         parser.error("--replay-refill-steps cannot be negative")
-    if args.continuation and args.replay_refill_steps >= args.total_timesteps:
-        parser.error("--replay-refill-steps must be less than --total-timesteps")
+    if args.critic_warmup_steps < 0:
+        parser.error("--critic-warmup-steps cannot be negative")
+    if args.actor_unfreeze_steps < 0:
+        parser.error("--actor-unfreeze-steps cannot be negative")
+    if args.safe_actor_improvement and not args.continuation:
+        parser.error("--safe-actor-improvement requires --resume-from")
+    if args.safe_actor_max_action_delta <= 0.0:
+        parser.error("--safe-actor-max-action-delta must be greater than zero")
+    if args.safe_actor_gradient_norm <= 0.0:
+        parser.error("--safe-actor-gradient-norm must be greater than zero")
+    if args.safe_actor_block_updates < 1:
+        parser.error("--safe-actor-block-updates must be at least 1")
+    if args.safe_actor_probe_repeats < 1:
+        parser.error("--safe-actor-probe-repeats must be at least 1")
+    if args.safe_actor_min_improvement_m < 0.0:
+        parser.error("--safe-actor-min-improvement-m cannot be negative")
+    if args.safe_actor_anchor_batch_size < 1:
+        parser.error("--safe-actor-anchor-batch-size must be at least 1")
+    if args.continuation and actor_update_start_timestep(args) >= args.total_timesteps:
+        parser.error(
+            "replay refill plus critic warm-up must be less than --total-timesteps"
+        )
+    if (
+        args.continuation
+        and actor_full_unfreeze_timestep(args) >= args.total_timesteps
+    ):
+        parser.error(
+            "replay refill, critic warm-up, and actor unfreeze must leave "
+            "at least one fully unfrozen training step"
+        )
     if args.buffer_size < max(1, args.batch_size):
         parser.error("--buffer-size must be at least --batch-size")
     if args.checkpoint_freq < 1:
@@ -2101,6 +2965,13 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--learning-rate-final must be greater than zero and no greater "
             "than --learning-rate"
+        )
+    if args.actor_learning_rate <= 0.0:
+        parser.error("--actor-learning-rate must be greater than zero")
+    if not 0.0 < args.actor_learning_rate_final <= args.actor_learning_rate:
+        parser.error(
+            "--actor-learning-rate-final must be greater than zero and no "
+            "greater than --actor-learning-rate"
         )
     if args.action_noise_sigma < 0.0:
         parser.error("--action-noise-sigma cannot be negative")
@@ -2135,6 +3006,7 @@ def main() -> None:
         check_env,
         NormalActionNoise,
     ) = import_training_dependencies()
+    TrainingTD3 = make_phased_continuation_td3_class(TD3)
 
     run_dir = args.run_dir if args.run_dir is not None else make_default_run_dir()
     args.run_dir = run_dir
@@ -2179,6 +3051,7 @@ def main() -> None:
         info_keywords=(
             "policy_controlled",
             "deterministic_probe",
+            "safe_actor_candidate_probe",
             "curriculum_eligible",
             "training_phase",
             "action_noise_sigma",
@@ -2212,7 +3085,7 @@ def main() -> None:
         total_timesteps=args.total_timesteps,
     )
     model = create_td3_model(
-        TD3,
+        TrainingTD3,
         args=args,
         env=env,
         tensorboard_log=tensorboard_log,
@@ -2220,6 +3093,29 @@ def main() -> None:
         learning_rate_schedule=learning_rate_schedule,
     )
     if args.continuation:
+        actor_learning_rate_schedule = gradual_actor_learning_rate_schedule(
+            args.actor_learning_rate,
+            args.actor_learning_rate_final,
+            actor_update_start=actor_update_start_timestep(args),
+            unfreeze_steps=args.actor_unfreeze_steps,
+            total_timesteps=args.total_timesteps,
+        )
+        model.configure_continuation_updates(
+            actor_learning_rate_schedule=actor_learning_rate_schedule,
+            actor_updates_start_at=actor_update_start_timestep(args),
+            safe_actor_improvement=args.safe_actor_improvement,
+            safe_actor_max_action_delta=args.safe_actor_max_action_delta,
+            safe_actor_gradient_norm=args.safe_actor_gradient_norm,
+            safe_actor_block_updates=args.safe_actor_block_updates,
+            safe_actor_probe_repeats=args.safe_actor_probe_repeats,
+            safe_actor_min_improvement_m=args.safe_actor_min_improvement_m,
+            safe_actor_anchor_batch_size=args.safe_actor_anchor_batch_size,
+            accepted_distance_m=finite_float(
+                metadata["continuation"].get(
+                    "source_verified_evaluation_progress_m"
+                )
+            ),
+        )
         metadata["continuation"]["source_model_num_timesteps"] = int(
             getattr(model, "num_timesteps", 0)
         )
@@ -2228,7 +3124,10 @@ def main() -> None:
         print(
             "Continuing verified Agent 6 policy from "
             f"{args.resume_from} at stage={args.start_stage}; "
-            f"replay refill={args.replay_refill_steps:,} steps."
+            f"replay refill={args.replay_refill_steps:,}, "
+            f"critic warm-up={args.critic_warmup_steps:,}, "
+            f"actor unfreeze={args.actor_unfreeze_steps:,} steps; "
+            f"safe actor blocks={'on' if args.safe_actor_improvement else 'off'}."
         )
 
     progress_state = TrainingProgressState()
@@ -2250,6 +3149,8 @@ def main() -> None:
             pre_update_training_phase=(
                 "replay_refill" if args.continuation else "warmup"
             ),
+            actor_update_start=actor_update_start_timestep(args),
+            actor_full_unfreeze=actor_full_unfreeze_timestep(args),
         ),
         make_checkpoint_callback(CheckpointCallback, args),
         EpisodeSummaryCallback(run_dir, progress_state),
@@ -2279,6 +3180,9 @@ def main() -> None:
         if args.save_replay_buffer:
             model.save_replay_buffer(str(args.replay_buffer_path))
         metadata["finished_at"] = datetime.now(timezone.utc).isoformat()
+        safe_actor_status = getattr(model, "safe_actor_status", None)
+        if callable(safe_actor_status):
+            metadata["safe_actor_improvement"]["run_state"] = safe_actor_status()
         if end_summary is not None:
             metadata["end_of_run_summary"] = end_summary
         write_json(run_dir / "training_metadata.json", metadata)
