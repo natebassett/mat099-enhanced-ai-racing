@@ -27,8 +27,10 @@ DEFAULT_BEST_EVALUATION_MODEL_PATH = (
 AGENT6_MODEL_FAMILY = "agent6_td3_scratch_racer"
 AGENT6_OBSERVATION_VERSION = "agent6_td3_raw_telemetry_v1"
 AGENT6_ACTION_VERSION = "agent6_direct_steer_throttle_brake_v1"
-AGENT6_ROBUSTNESS_PROTOCOL = "agent6_matched_policy_robustness_v3"
+AGENT6_ROBUSTNESS_PROTOCOL = "agent6_order_stratified_robustness_v5"
 AGENT6_ROBUSTNESS_REPEATS = 5
+AGENT6_ROBUSTNESS_TRIALS_PER_SEED = 4
+AGENT6_ROBUSTNESS_MAX_PAIRED_REGRESSION_M = 100.0
 AGENT6_TRAINING_CHALLENGE_BASE_SEED = 20260820
 AGENT6_EXTERNAL_EVALUATION_BASE_SEED = 20260821
 AGENT6_ROBUSTNESS_STEERING_NOISE_STD = 0.006
@@ -356,6 +358,141 @@ def build_rotating_training_seed_suite(
             generated.append(seed)
     start = repeat_count * (block - 1)
     return tuple(generated[start : start + repeat_count])
+
+
+def counterbalanced_pair_order(
+    *,
+    seed_index: int,
+    trial_index: int,
+) -> tuple[str, str]:
+    """Alternate pair order across seeds and trials to reduce temporal bias."""
+    if int(seed_index) < 0 or int(trial_index) < 0:
+        raise ValueError("seed_index and trial_index must be non-negative")
+    accepted = "accepted_reference"
+    candidate = "candidate"
+    if (int(seed_index) + int(trial_index)) % 2 == 0:
+        return accepted, candidate
+    return candidate, accepted
+
+
+def balanced_pair_order_positions(
+    *,
+    seed_count: int,
+    trials_per_seed: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return seed-major positions for a fully counterbalanced policy pair."""
+    seeds = int(seed_count)
+    trials = int(trials_per_seed)
+    if seeds < 1:
+        raise ValueError("seed_count must be at least 1")
+    if trials < 2 or trials % 2 != 0:
+        raise ValueError("trials_per_seed must be an even value of at least 2")
+
+    reference_positions: list[int] = []
+    candidate_positions: list[int] = []
+    for seed_index in range(seeds):
+        for trial_index in range(trials):
+            order = counterbalanced_pair_order(
+                seed_index=seed_index,
+                trial_index=trial_index,
+            )
+            reference_positions.append(order.index("accepted_reference") + 1)
+            candidate_positions.append(order.index("candidate") + 1)
+    return tuple(reference_positions), tuple(candidate_positions)
+
+
+def order_stratified_seed_aggregates(
+    values: list[float] | tuple[float, ...],
+    order_positions: list[int] | tuple[int, ...],
+    *,
+    seed_count: int,
+    trials_per_seed: int,
+) -> tuple[float, ...]:
+    """Aggregate each order position first, then weight positions equally."""
+    seeds = int(seed_count)
+    trials = int(trials_per_seed)
+    if seeds < 1 or trials < 1:
+        raise ValueError("seed_count and trials_per_seed must be at least 1")
+    expected = seeds * trials
+    if len(values) != expected or len(order_positions) != expected:
+        raise ValueError(
+            f"expected {expected} values and order positions, received "
+            f"{len(values)} and {len(order_positions)}"
+        )
+    array = np.asarray(values, dtype=float)
+    positions = np.asarray(order_positions, dtype=int)
+    if not np.all(np.isfinite(array)):
+        raise ValueError("order-stratified values must be finite")
+    if np.any(positions < 1):
+        raise ValueError("order positions must be positive integers")
+
+    value_rows = array.reshape(seeds, trials)
+    position_rows = positions.reshape(seeds, trials)
+    aggregates: list[float] = []
+    for seed_values, seed_positions in zip(value_rows, position_rows):
+        unique_positions = sorted(set(int(value) for value in seed_positions))
+        position_counts = [
+            int(np.count_nonzero(seed_positions == position))
+            for position in unique_positions
+        ]
+        if len(set(position_counts)) != 1:
+            raise ValueError(
+                "each order position must occur equally often within every seed"
+            )
+        position_medians = [
+            float(np.median(seed_values[seed_positions == position]))
+            for position in unique_positions
+        ]
+        aggregates.append(float(np.mean(position_medians)))
+    return tuple(aggregates)
+
+
+def parameter_state_dicts_are_identical(
+    reference: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+) -> bool:
+    """Return whether two neural-network state dictionaries match exactly."""
+    if set(reference) != set(candidate):
+        return False
+    for name in sorted(reference):
+        reference_value = reference[name]
+        candidate_value = candidate[name]
+        if hasattr(reference_value, "detach"):
+            reference_value = reference_value.detach().cpu().numpy()
+        if hasattr(candidate_value, "detach"):
+            candidate_value = candidate_value.detach().cpu().numpy()
+        reference_array = np.asarray(reference_value)
+        candidate_array = np.asarray(candidate_value)
+        if (
+            reference_array.shape != candidate_array.shape
+            or reference_array.dtype != candidate_array.dtype
+            or not np.array_equal(reference_array, candidate_array)
+        ):
+            return False
+    return True
+
+
+def replicated_seed_medians(
+    values: list[float] | tuple[float, ...],
+    *,
+    seed_count: int,
+    trials_per_seed: int,
+) -> tuple[float, ...]:
+    """Collapse repeated seed-major trials with a median robust to one outlier."""
+    seeds = int(seed_count)
+    trials = int(trials_per_seed)
+    if seeds < 1 or trials < 1:
+        raise ValueError("seed_count and trials_per_seed must be at least 1")
+    expected = seeds * trials
+    if len(values) != expected:
+        raise ValueError(
+            f"expected {expected} replicated values, received {len(values)}"
+        )
+    array = np.asarray(values, dtype=float)
+    if not np.all(np.isfinite(array)):
+        raise ValueError("replicated values must be finite")
+    reshaped = array.reshape(seeds, trials)
+    return tuple(float(value) for value in np.median(reshaped, axis=1))
 
 
 class SeededSteeringActionNoise:

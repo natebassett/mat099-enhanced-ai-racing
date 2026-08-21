@@ -10,7 +10,7 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -23,9 +23,11 @@ from agents.td3_agent import (  # noqa: E402
     AGENT6_MODEL_FAMILY,
     AGENT6_OBSERVATION_VERSION,
     AGENT6_EXTERNAL_EVALUATION_BASE_SEED,
+    AGENT6_ROBUSTNESS_MAX_PAIRED_REGRESSION_M,
     AGENT6_ROBUSTNESS_PROTOCOL,
     AGENT6_ROBUSTNESS_REPEATS,
     AGENT6_ROBUSTNESS_STEERING_NOISE_STD,
+    AGENT6_ROBUSTNESS_TRIALS_PER_SEED,
     DEFAULT_BEST_EVALUATION_MODEL_PATH,
     DEFAULT_MODEL_PATH,
     FEATURE_NAMES,
@@ -36,6 +38,9 @@ from agents.td3_agent import (  # noqa: E402
     Td3ScratchAgent,
     build_reproducible_seed_suite,
     metadata_path_for_policy,
+    order_stratified_seed_aggregates,
+    parameter_state_dicts_are_identical,
+    policy_contract_mismatches,
     read_policy_metadata,
 )
 from gui.torcs_config import TorcsRaceSetup, TorcsRuntimeConfig  # noqa: E402
@@ -50,15 +55,19 @@ CHECKPOINT_GLOB = "agent6_td3_scratch_*_steps.zip"
 EVALUATION_PROTOCOL = AGENT6_ROBUSTNESS_PROTOCOL
 DEFAULT_BASE_SEED = AGENT6_EXTERNAL_EVALUATION_BASE_SEED
 DEFAULT_EVALUATION_REPEATS = AGENT6_ROBUSTNESS_REPEATS
+DEFAULT_TRIALS_PER_SEED = AGENT6_ROBUSTNESS_TRIALS_PER_SEED
 DEFAULT_STEERING_NOISE_STD = AGENT6_ROBUSTNESS_STEERING_NOISE_STD
 MIN_EVALUATION_SEED = EXTERNAL_EVALUATION_SEED_MIN
 MAX_EVALUATION_SEED = EXTERNAL_EVALUATION_SEED_MAX
+MAX_PAIRED_REGRESSION_M = AGENT6_ROBUSTNESS_MAX_PAIRED_REGRESSION_M
 
 
 @dataclass(frozen=True)
 class EvaluationEpisode:
     repeat: int
     seed: int
+    trial: int
+    order_position: int
     reason: str
     steps: int
     laps: int
@@ -79,14 +88,24 @@ class EvaluationSummary:
     evaluation_seeds: tuple[int, ...]
     steering_noise_std: float
     repeats: int
+    trials_per_seed: int
+    total_trials: int
     completed_repeats: int
     completed_laps: int
     median_progress_m: float
     minimum_progress_m: float
     maximum_progress_m: float
+    raw_minimum_progress_m: float
+    seed_median_progress_m: tuple[float, ...]
     median_off_track_steps: float
     mean_total_score: float
     best_lap_seconds: float | None
+
+
+@dataclass(frozen=True)
+class PolicyActorGroup:
+    representative_path: Path
+    member_paths: tuple[Path, ...]
 
 
 def parse_args() -> argparse.Namespace:
@@ -113,6 +132,15 @@ def parse_args() -> argparse.Namespace:
         help="Also evaluate every periodic TD3 checkpoint in this directory.",
     )
     parser.add_argument("--repeats", type=int, default=DEFAULT_EVALUATION_REPEATS)
+    parser.add_argument(
+        "--trials-per-seed",
+        type=int,
+        default=DEFAULT_TRIALS_PER_SEED,
+        help=(
+            "Trials per policy and seed. Protocol v5 requires four so each "
+            "policy runs twice in each order position."
+        ),
+    )
     parser.add_argument(
         "--base-seed",
         type=int,
@@ -153,8 +181,15 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_BEST_EVALUATION_MODEL_PATH,
     )
     args = parser.parse_args()
-    if args.repeats < 1:
-        parser.error("--repeats must be at least 1")
+    if args.repeats < 3:
+        parser.error("--repeats must be at least 3")
+    if args.repeats % 2 == 0:
+        parser.error("--repeats must be odd")
+    if args.trials_per_seed != AGENT6_ROBUSTNESS_TRIALS_PER_SEED:
+        parser.error(
+            "--trials-per-seed must be exactly "
+            f"{AGENT6_ROBUSTNESS_TRIALS_PER_SEED} for the balanced protocol"
+        )
     if not 0 <= args.base_seed <= MAX_EVALUATION_SEED:
         parser.error(
             f"--base-seed must be between 0 and {MAX_EVALUATION_SEED}"
@@ -185,6 +220,42 @@ def main() -> int:
             policies,
             args.best_evaluation_model_path,
         )
+    actor_groups = group_policy_actors(
+        policies,
+        preferred_representative=(
+            args.best_evaluation_model_path
+            if args.promote_best_if_improved
+            else None
+        ),
+    )
+    actor_equivalence = policy_actor_equivalence_records(actor_groups)
+    distinct_policies = [group.representative_path for group in actor_groups]
+    for record in actor_equivalence:
+        if record["classification"] == "policy_equivalent":
+            print(
+                f"Policy-equivalent actor: {record['policy_path']} == "
+                f"{record['representative_policy_path']}"
+            )
+    if len(distinct_policies) > 2:
+        raise SystemExit(
+            "The balanced robustness protocol compares at most two distinct "
+            "actors per run. Evaluate additional candidates pairwise."
+        )
+    if len(policies) > 1 and len(distinct_policies) == 1:
+        print(
+            "All requested policies have identical actor parameters; "
+            "classified as policy-equivalent without launching TORCS."
+        )
+        json_path, csv_path = write_evaluation_logs(
+            args.output_dir,
+            [],
+            {str(policy): [] for policy in policies},
+            policy_actor_equivalence=actor_equivalence,
+        )
+        print(f"Evaluation JSON: {json_path}")
+        print(f"Evaluation CSV: {csv_path}")
+        return 0
+    policies = distinct_policies
     seeds = build_evaluation_seeds(
         repeats=args.repeats,
         base_seed=args.base_seed,
@@ -192,28 +263,56 @@ def main() -> int:
     )
     print(f"Evaluation protocol: {EVALUATION_PROTOCOL}")
     print(f"Evaluation seeds: {', '.join(str(seed) for seed in seeds)}")
+    print(f"Trials per policy-seed: {args.trials_per_seed}")
     print(f"Steering disturbance std: {args.steering_noise_std:.4f}")
 
     # gym_torcs/snakeoil reads sys.argv internally.
     sys.argv = [sys.argv[0]]
     summaries: list[EvaluationSummary] = []
-    episodes_by_policy: dict[str, list[EvaluationEpisode]] = {}
+    episodes_by_policy: dict[str, list[EvaluationEpisode]] = {
+        str(policy): [] for policy in policies
+    }
+    total_trials = len(policies) * len(seeds) * args.trials_per_seed
+    completed_trials = 0
 
-    for policy_index, policy_path in enumerate(policies, start=1):
-        print(f"\nEvaluating policy {policy_index}/{len(policies)}: {policy_path}")
-        episodes = []
-        for repeat, seed in enumerate(seeds, start=1):
-            print(f"Robustness repeat {repeat}/{len(seeds)} | seed={seed}")
-            results = run_evaluation(
-                policy_path=policy_path,
-                track=args.track,
-                track_category=args.track_category,
-                car=args.car,
-                evaluation_seed=seed,
-                steering_noise_std=args.steering_noise_std,
+    for seed_index, seed in enumerate(seeds):
+        for trial_index in range(args.trials_per_seed):
+            ordered_policies = counterbalanced_policy_schedule(
+                policies,
+                seed_index=seed_index,
+                trial_index=trial_index,
             )
-            episodes.append(evaluation_episode(repeat, seed, results))
+            for order_position, policy_path in enumerate(
+                ordered_policies,
+                start=1,
+            ):
+                completed_trials += 1
+                print(
+                    f"\nRobustness trial {completed_trials}/{total_trials} | "
+                    f"seed={seed} ({seed_index + 1}/{len(seeds)}) | "
+                    f"replicate={trial_index + 1}/{args.trials_per_seed} | "
+                    f"order={order_position}/{len(policies)} | {policy_path}"
+                )
+                results = run_evaluation(
+                    policy_path=policy_path,
+                    track=args.track,
+                    track_category=args.track_category,
+                    car=args.car,
+                    evaluation_seed=seed,
+                    steering_noise_std=args.steering_noise_std,
+                )
+                episodes_by_policy[str(policy_path)].append(
+                    evaluation_episode(
+                        seed_index + 1,
+                        seed,
+                        results,
+                        trial=trial_index + 1,
+                        order_position=order_position,
+                    )
+                )
 
+    for policy_path in policies:
+        episodes = episodes_by_policy[str(policy_path)]
         summary = aggregate_evaluations(
             policy_path,
             args.track,
@@ -221,12 +320,37 @@ def main() -> int:
             steering_noise_std=args.steering_noise_std,
         )
         summaries.append(summary)
-        episodes_by_policy[str(policy_path)] = episodes
+        print(f"\nPolicy summary: {policy_path}")
         print(summary_text(summary))
 
     if args.promote_best_if_improved:
+        baseline_path = args.best_evaluation_model_path.resolve()
+        baseline_summary = next(
+            (
+                summary
+                for summary in summaries
+                if Path(summary.policy_path).resolve() == baseline_path
+            ),
+            None,
+        )
+        eligible_summaries = summaries
+        if baseline_summary is not None:
+            eligible_summaries = [baseline_summary]
+            for summary in summaries:
+                if summary is baseline_summary:
+                    continue
+                if evaluation_candidate_is_noninferior(
+                    summary,
+                    baseline_summary,
+                ):
+                    eligible_summaries.append(summary)
+                else:
+                    print(
+                        "Promotion guard rejected policy due to replicated "
+                        f"paired-seed regression: {summary.policy_path}"
+                    )
         best_summary = max(
-            summaries,
+            eligible_summaries,
             key=lambda candidate: evaluation_quality(asdict(candidate)),
         )
         best_episodes = episodes_by_policy[best_summary.policy_path]
@@ -251,6 +375,7 @@ def main() -> int:
         args.output_dir,
         summaries,
         episodes_by_policy,
+        policy_actor_equivalence=actor_equivalence,
     )
     print(f"Evaluation JSON: {json_path}")
     print(f"Evaluation CSV: {csv_path}")
@@ -283,6 +408,114 @@ def include_verified_baseline(policies: list[Path], best_path: Path) -> list[Pat
     if not baseline.is_file() or baseline in policies:
         return policies
     return [*policies, baseline]
+
+
+def load_policy_actor_state(policy_path: Path) -> dict[str, Any]:
+    from stable_baselines3 import TD3  # noqa: PLC0415
+
+    mismatches = policy_contract_mismatches(read_policy_metadata(policy_path))
+    if mismatches:
+        raise ValueError(
+            f"TD3 policy contract mismatch for {policy_path}: "
+            + ", ".join(mismatches)
+        )
+    model = TD3.load(str(policy_path), device="cpu")
+    return {
+        name: value.detach().cpu().clone()
+        for name, value in model.actor.state_dict().items()
+    }
+
+
+def group_policy_actors(
+    policies: list[Path],
+    *,
+    preferred_representative: Path | None = None,
+    actor_state_loader: Callable[[Path], Mapping[str, Any]] | None = None,
+) -> list[PolicyActorGroup]:
+    """Group checkpoints by exact actor parameters, ignoring critic state."""
+    loader = actor_state_loader or load_policy_actor_state
+    preferred = (
+        Path(preferred_representative).resolve()
+        if preferred_representative is not None
+        else None
+    )
+    groups: list[dict[str, Any]] = []
+    for policy in policies:
+        path = Path(policy).resolve()
+        actor_state = loader(path)
+        matching_group = next(
+            (
+                group
+                for group in groups
+                if parameter_state_dicts_are_identical(
+                    group["actor_state"],
+                    actor_state,
+                )
+            ),
+            None,
+        )
+        if matching_group is None:
+            groups.append({"actor_state": actor_state, "members": [path]})
+        else:
+            matching_group["members"].append(path)
+
+    result: list[PolicyActorGroup] = []
+    for group in groups:
+        members = tuple(group["members"])
+        representative = (
+            preferred if preferred is not None and preferred in members else members[0]
+        )
+        result.append(
+            PolicyActorGroup(
+                representative_path=representative,
+                member_paths=members,
+            )
+        )
+    return result
+
+
+def policy_actor_equivalence_records(
+    groups: list[PolicyActorGroup],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for group in groups:
+        equivalent_group = len(group.member_paths) > 1
+        for policy in group.member_paths:
+            is_representative = policy == group.representative_path
+            records.append(
+                {
+                    "policy_path": str(policy),
+                    "representative_policy_path": str(
+                        group.representative_path
+                    ),
+                    "classification": (
+                        "equivalence_representative"
+                        if equivalent_group and is_representative
+                        else (
+                            "policy_equivalent"
+                            if equivalent_group
+                            else "distinct"
+                        )
+                    ),
+                    "actor_parameters_identical": equivalent_group,
+                }
+            )
+    return records
+
+
+def counterbalanced_policy_schedule(
+    policies: list[Path],
+    *,
+    seed_index: int,
+    trial_index: int,
+) -> tuple[Path, ...]:
+    """Rotate policy order across seed trials to distribute temporal bias."""
+    if not policies:
+        raise ValueError("at least one policy is required")
+    if int(seed_index) < 0 or int(trial_index) < 0:
+        raise ValueError("seed_index and trial_index must be non-negative")
+    rotation = (int(seed_index) + int(trial_index)) % len(policies)
+    return tuple([*policies[rotation:], *policies[:rotation]])
 
 
 def build_evaluation_seeds(
@@ -365,10 +598,15 @@ def evaluation_episode(
     repeat: int,
     seed: int,
     results: Mapping[str, Any],
+    *,
+    trial: int = 1,
+    order_position: int = 1,
 ) -> EvaluationEpisode:
     return EvaluationEpisode(
         repeat=repeat,
         seed=seed,
+        trial=int(trial),
+        order_position=int(order_position),
         reason=str(results.get("termination_reason", "")),
         steps=int(results.get("steps", 0)),
         laps=int(results.get("laps_completed", 0)),
@@ -390,6 +628,39 @@ def aggregate_evaluations(
 ) -> EvaluationSummary:
     if not episodes:
         raise ValueError("At least one deterministic evaluation is required")
+    episodes_by_seed: dict[int, list[EvaluationEpisode]] = {}
+    for episode in episodes:
+        episodes_by_seed.setdefault(episode.seed, []).append(episode)
+    trial_counts = {len(seed_episodes) for seed_episodes in episodes_by_seed.values()}
+    if len(trial_counts) != 1:
+        raise ValueError("every evaluation seed must have the same trial count")
+    trials_per_seed = trial_counts.pop()
+    if trials_per_seed < 1:
+        raise ValueError("every evaluation seed must include at least one trial")
+    for seed_episodes in episodes_by_seed.values():
+        trial_ids = [episode.trial for episode in seed_episodes]
+        if len(set(trial_ids)) != len(trial_ids):
+            raise ValueError("evaluation trial identifiers must be unique per seed")
+        order_positions = {episode.order_position for episode in seed_episodes}
+        if not order_positions.issubset({1, 2}):
+            raise ValueError("pairwise evaluation order positions must be 1 or 2")
+
+    seed_median_progress = tuple(
+        _order_stratified_episode_metric(seed_episodes, "progress_m")
+        for seed_episodes in episodes_by_seed.values()
+    )
+    seed_median_off_track = tuple(
+        _order_stratified_episode_metric(seed_episodes, "off_track_steps")
+        for seed_episodes in episodes_by_seed.values()
+    )
+    seed_median_scores = tuple(
+        _order_stratified_episode_metric(seed_episodes, "total_score")
+        for seed_episodes in episodes_by_seed.values()
+    )
+    seed_lap_rates = tuple(
+        _order_stratified_episode_metric(seed_episodes, "laps")
+        for seed_episodes in episodes_by_seed.values()
+    )
     lap_times = [
         episode.best_lap_seconds
         for episode in episodes
@@ -400,24 +671,34 @@ def aggregate_evaluations(
         track=track,
         deterministic=True,
         evaluation_protocol=EVALUATION_PROTOCOL,
-        evaluation_seeds=tuple(episode.seed for episode in episodes),
+        evaluation_seeds=tuple(episodes_by_seed),
         steering_noise_std=float(steering_noise_std),
-        repeats=len(episodes),
-        completed_repeats=sum(1 for episode in episodes if episode.laps > 0),
-        completed_laps=sum(episode.laps for episode in episodes),
-        median_progress_m=float(
-            statistics.median(episode.progress_m for episode in episodes)
-        ),
-        minimum_progress_m=min(episode.progress_m for episode in episodes),
-        maximum_progress_m=max(episode.progress_m for episode in episodes),
-        median_off_track_steps=float(
-            statistics.median(episode.off_track_steps for episode in episodes)
-        ),
-        mean_total_score=float(
-            statistics.fmean(episode.total_score for episode in episodes)
-        ),
+        repeats=len(episodes_by_seed),
+        trials_per_seed=trials_per_seed,
+        total_trials=len(episodes),
+        completed_repeats=sum(1 for laps in seed_lap_rates if laps > 0.5),
+        completed_laps=sum(1 for laps in seed_lap_rates if laps > 0.5),
+        median_progress_m=float(statistics.median(seed_median_progress)),
+        minimum_progress_m=min(seed_median_progress),
+        maximum_progress_m=max(seed_median_progress),
+        raw_minimum_progress_m=min(episode.progress_m for episode in episodes),
+        seed_median_progress_m=seed_median_progress,
+        median_off_track_steps=float(statistics.median(seed_median_off_track)),
+        mean_total_score=float(statistics.fmean(seed_median_scores)),
         best_lap_seconds=min(lap_times) if lap_times else None,
     )
+
+
+def _order_stratified_episode_metric(
+    episodes: list[EvaluationEpisode],
+    attribute: str,
+) -> float:
+    return order_stratified_seed_aggregates(
+        [float(getattr(episode, attribute)) for episode in episodes],
+        [episode.order_position for episode in episodes],
+        seed_count=1,
+        trials_per_seed=len(episodes),
+    )[0]
 
 
 def episode_progress_m(
@@ -504,13 +785,14 @@ def promote_best_evaluation(
 
 def evaluation_protocol_key(
     evaluation: Mapping[str, Any],
-) -> tuple[str, tuple[int, ...], float]:
+) -> tuple[str, tuple[int, ...], int, float]:
     seeds = evaluation.get("evaluation_seeds", ())
     if not isinstance(seeds, (list, tuple)):
         seeds = ()
     return (
         str(evaluation.get("evaluation_protocol", "legacy_unperturbed_v0")),
         tuple(int(seed) for seed in seeds),
+        int(evaluation.get("trials_per_seed", 1)),
         float(evaluation.get("steering_noise_std", 0.0)),
     )
 
@@ -528,10 +810,46 @@ def evaluation_quality(
     )
 
 
+def evaluation_candidate_is_noninferior(
+    candidate: EvaluationSummary,
+    reference: EvaluationSummary,
+    *,
+    maximum_paired_regression_m: float = MAX_PAIRED_REGRESSION_M,
+) -> bool:
+    """Require aggregate and paired non-inferiority before promotion."""
+    if evaluation_protocol_key(asdict(candidate)) != evaluation_protocol_key(
+        asdict(reference)
+    ):
+        return False
+    candidate_medians = candidate.seed_median_progress_m
+    reference_medians = reference.seed_median_progress_m
+    if not candidate_medians or len(candidate_medians) != len(reference_medians):
+        return False
+    regression_limit = float(maximum_paired_regression_m)
+    if not math.isfinite(regression_limit) or regression_limit < 0.0:
+        raise ValueError("paired regression limit must be finite and non-negative")
+    paired_deltas = tuple(
+        candidate_value - reference_value
+        for candidate_value, reference_value in zip(
+            candidate_medians,
+            reference_medians,
+        )
+    )
+    return (
+        evaluation_quality(asdict(candidate)) > evaluation_quality(asdict(reference))
+        and candidate.median_progress_m >= reference.median_progress_m
+        and candidate.minimum_progress_m >= reference.minimum_progress_m
+        and statistics.median(paired_deltas) >= 0.0
+        and min(paired_deltas) >= -regression_limit
+    )
+
+
 def write_evaluation_logs(
     output_dir: Path,
     summaries: list[EvaluationSummary],
     episodes_by_policy: Mapping[str, list[EvaluationEpisode]],
+    *,
+    policy_actor_equivalence: list[dict[str, Any]] | None = None,
 ) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -541,6 +859,9 @@ def write_evaluation_logs(
         json.dumps(
             {
                 "summaries": [asdict(summary) for summary in summaries],
+                "policy_actor_equivalence": list(
+                    policy_actor_equivalence or []
+                ),
                 "episodes": {
                     policy: [asdict(episode) for episode in episodes]
                     for policy, episodes in episodes_by_policy.items()
@@ -569,9 +890,11 @@ def summary_text(summary: EvaluationSummary) -> str:
         else f"{summary.best_lap_seconds:.3f}s"
     )
     return (
-        f"Seeded robustness result: median={summary.median_progress_m:.1f}m | "
+        f"Order-stratified robustness: median={summary.median_progress_m:.1f}m | "
         f"range={summary.minimum_progress_m:.1f}-{summary.maximum_progress_m:.1f}m | "
-        f"completed={summary.completed_repeats}/{summary.repeats} | "
+        f"raw_min={summary.raw_minimum_progress_m:.1f}m | "
+        f"completed={summary.completed_repeats}/{summary.repeats} seeds | "
+        f"design={summary.repeats} seeds x {summary.trials_per_seed} | "
         f"best_lap={best_lap}"
     )
 
