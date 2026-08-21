@@ -70,46 +70,60 @@ class Td3EvaluationTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertEqual(len(set(first)), 5)
+        self.assertTrue(
+            all(
+                evaluate_td3_agent.MIN_EVALUATION_SEED
+                <= seed
+                <= evaluate_td3_agent.MAX_EVALUATION_SEED
+                for seed in first
+            )
+        )
+        external_seeds = [
+            evaluate_td3_agent.MIN_EVALUATION_SEED + offset
+            for offset in (11, 22, 33)
+        ]
         self.assertEqual(
             evaluate_td3_agent.build_evaluation_seeds(
                 repeats=99,
                 base_seed=0,
-                explicit_seeds=[11, 22, 33],
+                explicit_seeds=external_seeds,
             ),
-            (11, 22, 33),
+            tuple(external_seeds),
         )
+        with self.assertRaises(ValueError):
+            evaluate_td3_agent.build_evaluation_seeds(
+                repeats=1,
+                base_seed=0,
+                explicit_seeds=[11],
+            )
 
-    def test_seeded_steering_disturbance_is_reproducible_and_bounded(self):
-        first = evaluate_td3_agent.SeededSteeringPerturbationAgent(
-            _FixedAgent(),
+    def test_seeded_steering_disturbance_is_reproducible_and_steering_only(self):
+        first = evaluate_td3_agent.SeededSteeringActionNoise(
             seed=42,
             steering_noise_std=0.2,
         )
-        second = evaluate_td3_agent.SeededSteeringPerturbationAgent(
-            _FixedAgent(),
+        second = evaluate_td3_agent.SeededSteeringActionNoise(
             seed=42,
             steering_noise_std=0.2,
         )
-        different = evaluate_td3_agent.SeededSteeringPerturbationAgent(
-            _FixedAgent(),
+        different = evaluate_td3_agent.SeededSteeringActionNoise(
             seed=43,
             steering_noise_std=0.2,
         )
         for agent in (first, second, different):
             agent.reset()
 
-        first_actions = [first.act(None)["steer"] for _ in range(20)]
-        second_actions = [second.act(None)["steer"] for _ in range(20)]
-        different_actions = [different.act(None)["steer"] for _ in range(20)]
+        first_actions = [first().tolist() for _ in range(20)]
+        second_actions = [second().tolist() for _ in range(20)]
+        different_actions = [different().tolist() for _ in range(20)]
 
         self.assertEqual(first_actions, second_actions)
         self.assertNotEqual(first_actions, different_actions)
         self.assertTrue(
-            all(
-                -evaluate_td3_agent.MAX_STEER <= steer <= evaluate_td3_agent.MAX_STEER
-                for steer in first_actions
-            )
+            all(action[1:] == [0.0, 0.0] for action in first_actions)
         )
+        first.reset()
+        self.assertEqual(first_actions[0], first().tolist())
 
     def test_evaluation_quality_uses_worst_case_progress_after_median(self):
         common = {
@@ -283,25 +297,6 @@ def _episode(
         average_speed_kmh=45.0,
         off_track_steps=off_track,
     )
-
-
-class _FixedAgent:
-    def reset(self) -> None:
-        return None
-
-    def act(self, _observation, _telemetry=None):
-        return {
-            "steer": 0.0,
-            "accel": 0.5,
-            "brake": 0.0,
-            "gear": 1,
-            "terminate": False,
-            "termination_reason": "",
-        }
-
-    def telemetry_debug(self):
-        return {}
-
 
 if __name__ == "__main__":
     unittest.main()

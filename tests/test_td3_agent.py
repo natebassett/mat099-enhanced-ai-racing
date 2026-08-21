@@ -34,8 +34,11 @@ from agents.td3_agent import (  # noqa: E402
     AGENT6_ACTION_VERSION,
     AGENT6_MODEL_FAMILY,
     AGENT6_OBSERVATION_VERSION,
+    EXTERNAL_EVALUATION_SEED_MIN,
     FEATURE_NAMES,
+    TRAINING_CHALLENGE_SEED_MAX,
     Td3ScratchAgent,
+    build_rotating_training_seed_suite,
     build_td3_observation,
     decode_td3_action,
     episode_metadata_is_deterministic_probe,
@@ -115,6 +118,31 @@ class Td3ScratchAgentTests(unittest.TestCase):
         self.assertAlmostEqual(action["accel"], 0.16)
         self.assertEqual(action["brake"], 0.0)
         self.assertIn(action["gear"], range(1, 7))
+
+    def test_seeded_noise_is_applied_before_action_decode_and_rate_limit(self):
+        class FixedNoise:
+            steering_noise = 0.09
+
+            def __call__(self):
+                return np.asarray([0.1, 0.0, 0.0], dtype=np.float32)
+
+            def reset(self):
+                return None
+
+        agent = Td3ScratchAgent(
+            policy=DummyPolicy([0.0, 0.7, 0.0]),
+            action_noise=FixedNoise(),
+        )
+
+        action = agent.act(None, _telemetry(speed=20.0))
+
+        self.assertAlmostEqual(agent.last_policy_action[0], 0.0)
+        self.assertAlmostEqual(agent.last_raw_action[0], 0.1)
+        self.assertAlmostEqual(action["steer"], 0.09)
+        self.assertAlmostEqual(
+            agent.telemetry_debug()["td3_action_steering_noise"],
+            0.09,
+        )
 
     def test_rate_limiter_smooths_actuator_changes(self):
         limited = rate_limit_td3_action(
@@ -478,22 +506,64 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             )
         )
 
-    def test_safe_actor_probe_decision_requires_median_improvement(self):
-        decision, median_distance = train_td3_agent.safe_actor_probe_decision(
-            [1442.0, 1438.0, 1440.0],
-            accepted_distance_m=1430.0,
+    def test_safe_actor_probe_decision_requires_paired_non_inferiority(self):
+        accepted = train_td3_agent.safe_actor_probe_decision(
+            [1430.0, 1300.0, 1420.0],
+            [1442.0, 1310.0, 1440.0],
             minimum_improvement_m=5.0,
+            maximum_paired_regression_m=100.0,
         )
-        self.assertEqual(decision, "accepted")
-        self.assertEqual(median_distance, 1440.0)
+        self.assertEqual(accepted.decision, "accepted")
+        self.assertEqual(accepted.candidate_median_distance_m, 1440.0)
+        self.assertEqual(accepted.candidate_minimum_distance_m, 1310.0)
+        self.assertEqual(accepted.worst_paired_delta_m, 10.0)
 
-        decision, median_distance = train_td3_agent.safe_actor_probe_decision(
-            [1436.0, 1200.0, 1432.0],
-            accepted_distance_m=1430.0,
-            minimum_improvement_m=5.0,
+        aggregate_improvement_with_seed_collapse = (
+            train_td3_agent.safe_actor_probe_decision(
+                [1400.0, 900.0, 500.0],
+                [1200.0, 1500.0, 600.0],
+                minimum_improvement_m=5.0,
+                maximum_paired_regression_m=100.0,
+            )
         )
-        self.assertEqual(decision, "rolled_back")
-        self.assertEqual(median_distance, 1432.0)
+        self.assertGreater(
+            aggregate_improvement_with_seed_collapse.aggregate_median_gain_m,
+            0.0,
+        )
+        self.assertGreater(
+            aggregate_improvement_with_seed_collapse.minimum_gain_m,
+            0.0,
+        )
+        self.assertEqual(
+            aggregate_improvement_with_seed_collapse.decision,
+            "rolled_back",
+        )
+        self.assertEqual(
+            aggregate_improvement_with_seed_collapse.worst_paired_delta_m,
+            -200.0,
+        )
+
+    def test_training_challenge_seed_suites_rotate_outside_evaluation_domain(self):
+        first = build_rotating_training_seed_suite(
+            repeats=5,
+            base_seed=20260820,
+            candidate_id=1,
+        )
+        repeated = build_rotating_training_seed_suite(
+            repeats=5,
+            base_seed=20260820,
+            candidate_id=1,
+        )
+        second = build_rotating_training_seed_suite(
+            repeats=5,
+            base_seed=20260820,
+            candidate_id=2,
+        )
+
+        self.assertEqual(first, repeated)
+        self.assertTrue(set(first).isdisjoint(second))
+        self.assertTrue(all(seed <= TRAINING_CHALLENGE_SEED_MAX for seed in first))
+        self.assertTrue(all(seed < EXTERNAL_EVALUATION_SEED_MIN for seed in second))
 
     def test_exploration_callback_toggles_probe_mode_at_episode_boundaries(self):
         class FakeBaseCallback:
@@ -649,21 +719,58 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             def safe_actor_probe_required(self):
                 return self.waiting
 
+            def safe_actor_probe_context(self):
+                if not self.waiting:
+                    return None
+                return {
+                    "mode": (
+                        "accepted_reference" if self.probes == 0 else "candidate"
+                    ),
+                    "candidate_id": 1,
+                    "probe_index": 1,
+                    "probe_repeats": 1,
+                    "seed": 100,
+                }
+
             def record_safe_actor_probe(self, summary):
                 self.probes += 1
-                decision = "pending" if self.probes == 1 else "rolled_back"
+                decision = (
+                    "reference_recorded" if self.probes == 1 else "rolled_back"
+                )
                 if decision == "rolled_back":
                     self.waiting = False
                 return {
                     "candidate_id": 1,
-                    "probe_index": self.probes,
-                    "probe_repeats": 2,
+                    "probe_index": 1,
+                    "probe_repeats": 1,
                     "decision": decision,
-                    "median_distance_m": (
-                        None if decision == "pending" else 400.0
+                    "mode": (
+                        "accepted_reference" if self.probes == 1 else "candidate"
                     ),
-                    "accepted_distance_m": 1430.0,
-                    "required_distance_m": 1435.0,
+                    "seed": 100,
+                    "median_distance_m": (
+                        None if decision == "reference_recorded" else 300.0
+                    ),
+                    "minimum_distance_m": (
+                        None if decision == "reference_recorded" else 300.0
+                    ),
+                    "reference_median_distance_m": (
+                        None if decision == "reference_recorded" else 500.0
+                    ),
+                    "reference_minimum_distance_m": (
+                        None if decision == "reference_recorded" else 500.0
+                    ),
+                    "paired_median_delta_m": (
+                        None if decision == "reference_recorded" else -200.0
+                    ),
+                    "worst_paired_delta_m": (
+                        None if decision == "reference_recorded" else -200.0
+                    ),
+                    "paired_regressions": (
+                        None if decision == "reference_recorded" else 1
+                    ),
+                    "accepted_distance_m": 0.0,
+                    "accepted_minimum_distance_m": 0.0,
                 }
 
         class FakeEnv:
@@ -692,6 +799,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         first_summary = {
             "policy_controlled": True,
             "deterministic_probe": True,
+            "safe_actor_candidate_probe": True,
             "curriculum_eligible": False,
             "distance_m": 500.0,
         }
@@ -699,13 +807,23 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
         callback._on_step()
 
-        self.assertEqual(first_summary["safe_actor_decision"], "pending")
+        self.assertEqual(
+            first_summary["safe_actor_decision"],
+            "reference_recorded",
+        )
         self.assertTrue(env.modes[-1]["deterministic_probe"])
         self.assertTrue(env.modes[-1]["safe_actor_candidate_probe"])
+        self.assertEqual(env.modes[-1]["safe_actor_probe_mode"], "candidate")
+        self.assertEqual(env.modes[-1]["safe_actor_probe_seed"], 100)
+        self.assertIsInstance(
+            callback.model.action_noise,
+            train_td3_agent.SeededSteeringActionNoise,
+        )
 
         second_summary = {
             "policy_controlled": True,
             "deterministic_probe": True,
+            "safe_actor_candidate_probe": True,
             "curriculum_eligible": False,
             "distance_m": 300.0,
         }
@@ -730,6 +848,17 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             def safe_actor_probe_required(self):
                 return self.waiting
 
+            def safe_actor_probe_context(self):
+                if not self.waiting:
+                    return None
+                return {
+                    "mode": "candidate",
+                    "candidate_id": 2,
+                    "probe_index": 3,
+                    "probe_repeats": 3,
+                    "seed": 102,
+                }
+
             def record_safe_actor_probe(self, summary):
                 self.waiting = False
                 return {
@@ -737,9 +866,17 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                     "probe_index": 3,
                     "probe_repeats": 3,
                     "decision": "accepted",
+                    "mode": "candidate",
+                    "seed": 102,
                     "median_distance_m": 1760.0,
+                    "minimum_distance_m": 1500.0,
+                    "reference_median_distance_m": 1740.0,
+                    "reference_minimum_distance_m": 1490.0,
+                    "paired_median_delta_m": 20.0,
+                    "worst_paired_delta_m": 10.0,
+                    "paired_regressions": 0,
                     "accepted_distance_m": 1760.0,
-                    "required_distance_m": 1435.0,
+                    "accepted_minimum_distance_m": 1500.0,
                 }
 
         class FakeEnv:
@@ -773,6 +910,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         summary = {
             "policy_controlled": True,
             "deterministic_probe": True,
+            "safe_actor_candidate_probe": True,
             "curriculum_eligible": False,
             "distance_m": 1750.0,
         }
@@ -805,12 +943,16 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(args.action_noise_decay_steps, 200_000)
         self.assertEqual(args.policy_probe_interval, 10)
         self.assertFalse(args.safe_actor_improvement)
-        self.assertEqual(args.safe_actor_max_action_delta, 0.025)
+        self.assertEqual(args.safe_actor_max_action_delta, 0.01)
         self.assertEqual(args.safe_actor_gradient_norm, 1.0)
-        self.assertEqual(args.safe_actor_block_updates, 250)
-        self.assertEqual(args.safe_actor_probe_repeats, 3)
+        self.assertEqual(args.safe_actor_block_updates, 100)
+        self.assertEqual(args.safe_actor_probe_repeats, 5)
+        self.assertEqual(args.safe_actor_probe_base_seed, 20260820)
+        self.assertEqual(args.safe_actor_probe_noise_std, 0.006)
         self.assertEqual(args.safe_actor_min_improvement_m, 5.0)
+        self.assertEqual(args.safe_actor_max_paired_regression_m, 100.0)
         self.assertEqual(args.safe_actor_anchor_batch_size, 256)
+        self.assertFalse(args.allow_non_champion_source)
         self.assertEqual(args.warmup_steer_std, 0.18)
         self.assertFalse(args.save_best_replay_buffer)
 
@@ -837,10 +979,22 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            guarded_argv = [
+                str(SCRIPT_PATH),
+                "--resume-from",
+                str(checkpoint),
+                "--no-safe-actor-improvement",
+                "--total-timesteps",
+                "100000",
+            ]
+            with mock.patch.object(sys, "argv", guarded_argv):
+                with self.assertRaises(SystemExit):
+                    train_td3_agent.parse_args()
             argv = [
                 str(SCRIPT_PATH),
                 "--resume-from",
                 str(checkpoint),
+                "--allow-non-champion-source",
                 "--total-timesteps",
                 "100000",
             ]
@@ -861,11 +1015,15 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(args.action_noise_final_sigma, 0.006)
         self.assertTrue(args.save_best_replay_buffer)
         self.assertTrue(args.safe_actor_improvement)
-        self.assertEqual(args.safe_actor_max_action_delta, 0.025)
+        self.assertEqual(args.safe_actor_max_action_delta, 0.01)
         self.assertEqual(args.safe_actor_gradient_norm, 1.0)
-        self.assertEqual(args.safe_actor_block_updates, 250)
-        self.assertEqual(args.safe_actor_probe_repeats, 3)
+        self.assertEqual(args.safe_actor_block_updates, 100)
+        self.assertEqual(args.safe_actor_probe_repeats, 5)
+        self.assertEqual(args.safe_actor_probe_base_seed, 20260820)
+        self.assertEqual(args.safe_actor_probe_noise_std, 0.006)
         self.assertEqual(args.safe_actor_min_improvement_m, 5.0)
+        self.assertEqual(args.safe_actor_max_paired_regression_m, 100.0)
+        self.assertTrue(args.allow_non_champion_source)
         self.assertEqual(train_td3_agent.policy_action_start_timestep(args), 0)
         self.assertEqual(
             train_td3_agent.gradient_update_start_timestep(args),
@@ -938,6 +1096,97 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(model.policy.action_space, "standard_action_space")
         self.assertEqual(model.replay_buffer.action_space, "standard_action_space")
 
+    def test_safe_actor_interleaves_matched_pairs_and_rotates_seed_suites(self):
+        import gymnasium as gym
+        import torch
+        from stable_baselines3 import TD3
+
+        class TinyEnv(gym.Env):
+            observation_space = gym.spaces.Box(
+                -1.0,
+                1.0,
+                shape=(4,),
+                dtype=np.float32,
+            )
+            action_space = gym.spaces.Box(
+                -1.0,
+                1.0,
+                shape=(3,),
+                dtype=np.float32,
+            )
+
+            def reset(self, *, seed=None, options=None):
+                super().reset(seed=seed)
+                return np.zeros(4, dtype=np.float32), {}
+
+            def step(self, action):
+                return np.zeros(4, dtype=np.float32), 0.0, False, False, {}
+
+        SafeTD3 = train_td3_agent.make_phased_continuation_td3_class(TD3)
+        model = SafeTD3(
+            "MlpPolicy",
+            TinyEnv(),
+            policy_kwargs={"net_arch": [8, 8]},
+            learning_starts=0,
+            buffer_size=32,
+            batch_size=4,
+            device="cpu",
+        )
+        model.configure_continuation_updates(
+            actor_learning_rate_schedule=lambda _: 1e-4,
+            actor_updates_start_at=0,
+            safe_actor_improvement=True,
+            safe_actor_probe_repeats=2,
+            safe_actor_min_improvement_m=5.0,
+            safe_actor_max_paired_regression_m=100.0,
+            safe_actor_probe_base_seed=1234,
+        )
+        with torch.no_grad():
+            next(model.actor.parameters()).add_(0.01)
+        model._agent6_safe_actor_candidate_id = 1
+        model._agent6_safe_actor_candidate_updates = 1
+        model._agent6_safe_actor_waiting_for_probe = True
+
+        reference_one = model.safe_actor_probe_context()
+        first_suite = tuple(model.safe_actor_status()["challenge_seeds"])
+        self.assertEqual(reference_one["mode"], "accepted_reference")
+        self.assertEqual(reference_one["seed"], first_suite[0])
+        self.assertEqual(
+            model.record_safe_actor_probe({"distance_m": 100.0})["decision"],
+            "reference_recorded",
+        )
+        candidate_one = model.safe_actor_probe_context()
+        self.assertEqual(candidate_one["mode"], "candidate")
+        self.assertEqual(candidate_one["seed"], reference_one["seed"])
+        self.assertEqual(
+            model.record_safe_actor_probe({"distance_m": 110.0})["decision"],
+            "pair_complete",
+        )
+
+        reference_two = model.safe_actor_probe_context()
+        self.assertEqual(reference_two["mode"], "accepted_reference")
+        self.assertNotEqual(reference_two["seed"], reference_one["seed"])
+        model.record_safe_actor_probe({"distance_m": 90.0})
+        candidate_two = model.safe_actor_probe_context()
+        self.assertEqual(candidate_two["seed"], reference_two["seed"])
+        accepted = model.record_safe_actor_probe({"distance_m": 95.0})
+
+        self.assertEqual(accepted["decision"], "accepted")
+        self.assertEqual(accepted["paired_deltas_m"], [10.0, 5.0])
+        self.assertFalse(model.safe_actor_probe_required())
+        self.assertEqual(model.safe_actor_status()["accepted_blocks"], 1)
+
+        with torch.no_grad():
+            next(model.actor.parameters()).add_(0.01)
+        model._agent6_safe_actor_candidate_id = 2
+        model._agent6_safe_actor_candidate_updates = 1
+        model._agent6_safe_actor_waiting_for_probe = True
+        model.safe_actor_probe_context()
+        second_suite = tuple(model.safe_actor_status()["challenge_seeds"])
+
+        self.assertTrue(set(first_suite).isdisjoint(second_suite))
+        model.finalize_safe_actor_candidate()
+
     def test_safe_actor_model_rolls_back_degraded_candidate_exactly(self):
         import gymnasium as gym
         import torch
@@ -971,7 +1220,8 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             safe_actor_block_updates=1,
             safe_actor_probe_repeats=2,
             safe_actor_min_improvement_m=5.0,
-            accepted_distance_m=100.0,
+            safe_actor_max_paired_regression_m=100.0,
+            safe_actor_probe_base_seed=4321,
         )
         accepted_actor = {
             name: value.detach().clone()
@@ -991,6 +1241,15 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             name: value.detach().clone()
             for name, value in model.actor.state_dict().items()
         }
+        reference_context = model.safe_actor_probe_context()
+        self.assertEqual(reference_context["mode"], "accepted_reference")
+        self.assertEqual(
+            model.record_safe_actor_probe({"distance_m": 100.0})["decision"],
+            "reference_recorded",
+        )
+        candidate_context = model.safe_actor_probe_context()
+        self.assertEqual(candidate_context["mode"], "candidate")
+        self.assertEqual(candidate_context["seed"], reference_context["seed"])
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "candidate_checkpoint.zip"
             model.save(checkpoint)
@@ -1001,10 +1260,13 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             self.assertTrue(torch.equal(value, candidate_actor[name]))
 
         pending = model.record_safe_actor_probe({"distance_m": 102.0})
+        model.safe_actor_probe_context()
+        model.record_safe_actor_probe({"distance_m": 100.0})
         result = model.record_safe_actor_probe({"distance_m": 80.0})
 
-        self.assertEqual(pending["decision"], "pending")
+        self.assertEqual(pending["decision"], "pair_complete")
         self.assertEqual(result["decision"], "rolled_back")
+        self.assertEqual(result["paired_deltas_m"], [2.0, -20.0])
         self.assertFalse(model.safe_actor_probe_required())
         for name, value in model.actor.state_dict().items():
             self.assertTrue(torch.equal(value, accepted_actor[name]))
@@ -1017,7 +1279,11 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         model._agent6_safe_actor_candidate_id = 2
         model._agent6_safe_actor_candidate_updates = 1
         model._agent6_safe_actor_waiting_for_probe = True
+        model.safe_actor_probe_context()
+        model.record_safe_actor_probe({"distance_m": 100.0})
         model.record_safe_actor_probe({"distance_m": 110.0})
+        model.safe_actor_probe_context()
+        model.record_safe_actor_probe({"distance_m": 100.0})
         accepted = model.record_safe_actor_probe({"distance_m": 112.0})
         accepted_actor = {
             name: value.detach().clone()

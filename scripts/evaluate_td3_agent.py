@@ -4,7 +4,6 @@ import argparse
 import csv
 import json
 import math
-import random
 import shutil
 import statistics
 import sys
@@ -23,12 +22,19 @@ from agents.td3_agent import (  # noqa: E402
     AGENT6_ACTION_VERSION,
     AGENT6_MODEL_FAMILY,
     AGENT6_OBSERVATION_VERSION,
+    AGENT6_EXTERNAL_EVALUATION_BASE_SEED,
+    AGENT6_ROBUSTNESS_PROTOCOL,
+    AGENT6_ROBUSTNESS_REPEATS,
+    AGENT6_ROBUSTNESS_STEERING_NOISE_STD,
     DEFAULT_BEST_EVALUATION_MODEL_PATH,
     DEFAULT_MODEL_PATH,
     FEATURE_NAMES,
     G_TRACK_3_LENGTH_METRES,
-    MAX_STEER,
+    EXTERNAL_EVALUATION_SEED_MAX,
+    EXTERNAL_EVALUATION_SEED_MIN,
+    SeededSteeringActionNoise,
     Td3ScratchAgent,
+    build_reproducible_seed_suite,
     metadata_path_for_policy,
     read_policy_metadata,
 )
@@ -41,11 +47,12 @@ DEFAULT_TRACK_ID = "g-track-3"
 DEFAULT_TRACK_CATEGORY = "road"
 DEFAULT_CAR_ID = "car1-ow1"
 CHECKPOINT_GLOB = "agent6_td3_scratch_*_steps.zip"
-EVALUATION_PROTOCOL = "agent6_seeded_steering_robustness_v1"
-DEFAULT_BASE_SEED = 20260819
-DEFAULT_STEERING_NOISE_STD = 0.006
-STEERING_NOISE_CORRELATION = 0.985
-MAX_EVALUATION_SEED = (2**32) - 1
+EVALUATION_PROTOCOL = AGENT6_ROBUSTNESS_PROTOCOL
+DEFAULT_BASE_SEED = AGENT6_EXTERNAL_EVALUATION_BASE_SEED
+DEFAULT_EVALUATION_REPEATS = AGENT6_ROBUSTNESS_REPEATS
+DEFAULT_STEERING_NOISE_STD = AGENT6_ROBUSTNESS_STEERING_NOISE_STD
+MIN_EVALUATION_SEED = EXTERNAL_EVALUATION_SEED_MIN
+MAX_EVALUATION_SEED = EXTERNAL_EVALUATION_SEED_MAX
 
 
 @dataclass(frozen=True)
@@ -105,7 +112,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Also evaluate every periodic TD3 checkpoint in this directory.",
     )
-    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--repeats", type=int, default=DEFAULT_EVALUATION_REPEATS)
     parser.add_argument(
         "--base-seed",
         type=int,
@@ -148,11 +155,21 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be at least 1")
+    if not 0 <= args.base_seed <= MAX_EVALUATION_SEED:
+        parser.error(
+            f"--base-seed must be between 0 and {MAX_EVALUATION_SEED}"
+        )
     if not math.isfinite(args.steering_noise_std) or args.steering_noise_std < 0.0:
         parser.error("--steering-noise-std must be finite and non-negative")
     if args.seeds is not None:
-        if any(seed < 0 or seed > MAX_EVALUATION_SEED for seed in args.seeds):
-            parser.error(f"--seeds must be between 0 and {MAX_EVALUATION_SEED}")
+        if any(
+            seed < MIN_EVALUATION_SEED or seed > MAX_EVALUATION_SEED
+            for seed in args.seeds
+        ):
+            parser.error(
+                "--seeds must use the external evaluation range "
+                f"{MIN_EVALUATION_SEED}..{MAX_EVALUATION_SEED}"
+            )
         if len(set(args.seeds)) != len(args.seeds):
             parser.error("--seeds must be unique")
     return args
@@ -275,9 +292,26 @@ def build_evaluation_seeds(
     explicit_seeds: list[int] | None,
 ) -> tuple[int, ...]:
     if explicit_seeds is not None:
-        return tuple(explicit_seeds)
-    generator = random.Random(base_seed)
-    return tuple(generator.sample(range(MAX_EVALUATION_SEED + 1), repeats))
+        seeds = tuple(int(seed) for seed in explicit_seeds)
+        if not seeds:
+            raise ValueError("explicit evaluation seeds cannot be empty")
+        if any(
+            seed < MIN_EVALUATION_SEED or seed > MAX_EVALUATION_SEED
+            for seed in seeds
+        ):
+            raise ValueError(
+                "evaluation seeds must use the held-out external range "
+                f"{MIN_EVALUATION_SEED}..{MAX_EVALUATION_SEED}"
+            )
+        if len(set(seeds)) != len(seeds):
+            raise ValueError("evaluation seeds must be unique")
+        return seeds
+    return build_reproducible_seed_suite(
+        repeats=repeats,
+        base_seed=base_seed,
+        seed_min=MIN_EVALUATION_SEED,
+        seed_max=MAX_EVALUATION_SEED,
+    )
 
 
 def _checkpoint_step(path: Path) -> int:
@@ -317,73 +351,14 @@ def run_evaluation(
                 policy_path=policy_path,
                 require_policy=True,
                 deterministic=True,
+                action_noise=SeededSteeringActionNoise(
+                    seed=evaluation_seed,
+                    steering_noise_std=steering_noise_std,
+                ),
             )
-            agent = SeededSteeringPerturbationAgent(
-                policy_agent,
-                seed=evaluation_seed,
-                steering_noise_std=steering_noise_std,
-            )
-            return runner.run(agent)
+            return runner.run(policy_agent)
         finally:
             runner.shutdown()
-
-
-class SeededSteeringPerturbationAgent:
-    """Apply a small reproducible actuator disturbance around a fixed TD3 policy."""
-
-    def __init__(
-        self,
-        agent: Td3ScratchAgent,
-        *,
-        seed: int,
-        steering_noise_std: float,
-    ) -> None:
-        self._agent = agent
-        self.seed = seed
-        self._steering_noise_std = float(steering_noise_std)
-        self._random = random.Random(seed)
-        self._steering_noise = 0.0
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._agent, name)
-
-    def reset(self) -> None:
-        self._agent.reset()
-        self._random.seed(self.seed)
-        self._steering_noise = 0.0
-
-    def act(
-        self,
-        observation: Any,
-        telemetry: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        action = self._agent.act(observation, telemetry)
-        if action.get("terminate", False) or self._steering_noise_std == 0.0:
-            return action
-
-        innovation_scale = self._steering_noise_std * math.sqrt(
-            1.0 - (STEERING_NOISE_CORRELATION**2)
-        )
-        self._steering_noise = (
-            STEERING_NOISE_CORRELATION * self._steering_noise
-            + self._random.gauss(0.0, innovation_scale)
-        )
-        perturbed_action = dict(action)
-        perturbed_action["steer"] = max(
-            -MAX_STEER,
-            min(MAX_STEER, float(action["steer"]) + self._steering_noise),
-        )
-        return perturbed_action
-
-    def telemetry_debug(self) -> dict[str, Any]:
-        debug = dict(self._agent.telemetry_debug())
-        debug.update(
-            {
-                "evaluation_seed": self.seed,
-                "evaluation_steering_noise": self._steering_noise,
-            }
-        )
-        return debug
 
 
 def evaluation_episode(

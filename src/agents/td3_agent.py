@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import secrets
 from pathlib import Path
 from typing import Any, Mapping
@@ -26,6 +27,11 @@ DEFAULT_BEST_EVALUATION_MODEL_PATH = (
 AGENT6_MODEL_FAMILY = "agent6_td3_scratch_racer"
 AGENT6_OBSERVATION_VERSION = "agent6_td3_raw_telemetry_v1"
 AGENT6_ACTION_VERSION = "agent6_direct_steer_throttle_brake_v1"
+AGENT6_ROBUSTNESS_PROTOCOL = "agent6_matched_policy_robustness_v3"
+AGENT6_ROBUSTNESS_REPEATS = 5
+AGENT6_TRAINING_CHALLENGE_BASE_SEED = 20260820
+AGENT6_EXTERNAL_EVALUATION_BASE_SEED = 20260821
+AGENT6_ROBUSTNESS_STEERING_NOISE_STD = 0.006
 
 GEAR_SPEEDS = [0.0, 45.0, 85.0, 125.0, 165.0, 205.0]
 MAX_STEER = 0.90
@@ -36,6 +42,12 @@ BRAKE_RAMP_UP_PER_STEP = 0.40
 BRAKE_RELEASE_PER_STEP = 0.50
 STUCK_SPEED_KMH = 5.0
 STUCK_STEP_LIMIT = 240
+MAX_REPRODUCIBLE_SEED = (2**32) - 1
+TRAINING_CHALLENGE_SEED_MIN = 0
+TRAINING_CHALLENGE_SEED_MAX = (2**31) - 1
+EXTERNAL_EVALUATION_SEED_MIN = 2**31
+EXTERNAL_EVALUATION_SEED_MAX = MAX_REPRODUCIBLE_SEED
+STEERING_ACTION_NOISE_CORRELATION = 0.985
 
 FEATURE_NAMES = [
     "speed_x",
@@ -277,6 +289,121 @@ def rate_limit_td3_action(
     }
 
 
+def build_reproducible_seed_suite(
+    *,
+    repeats: int,
+    base_seed: int,
+    seed_min: int = 0,
+    seed_max: int = MAX_REPRODUCIBLE_SEED,
+) -> tuple[int, ...]:
+    repeat_count = int(repeats)
+    seed = int(base_seed)
+    lower = int(seed_min)
+    upper = int(seed_max)
+    if repeat_count < 1:
+        raise ValueError("repeats must be at least 1")
+    if lower < 0 or upper > MAX_REPRODUCIBLE_SEED or lower > upper:
+        raise ValueError("seed range must be within the 32-bit unsigned range")
+    if repeat_count > upper - lower + 1:
+        raise ValueError("repeats exceeds the reproducible seed population")
+    if not 0 <= seed <= MAX_REPRODUCIBLE_SEED:
+        raise ValueError(
+            f"base_seed must be between 0 and {MAX_REPRODUCIBLE_SEED}"
+        )
+    generator = random.Random(seed)
+    return tuple(
+        generator.sample(range(lower, upper + 1), repeat_count)
+    )
+
+
+def build_rotating_training_seed_suite(
+    *,
+    repeats: int,
+    base_seed: int,
+    candidate_id: int,
+) -> tuple[int, ...]:
+    """Return one deterministic, non-overlapping challenge suite per candidate."""
+    repeat_count = int(repeats)
+    block = int(candidate_id)
+    generator_seed = int(base_seed)
+    if repeat_count < 1:
+        raise ValueError("repeats must be at least 1")
+    if block < 1:
+        raise ValueError("candidate_id must be at least 1")
+    if not 0 <= generator_seed <= MAX_REPRODUCIBLE_SEED:
+        raise ValueError(
+            f"base_seed must be between 0 and {MAX_REPRODUCIBLE_SEED}"
+        )
+    required_count = repeat_count * block
+    available_count = (
+        TRAINING_CHALLENGE_SEED_MAX - TRAINING_CHALLENGE_SEED_MIN + 1
+    )
+    if required_count > available_count:
+        raise ValueError(
+            "requested challenge suites exceed the training seed domain"
+        )
+
+    generator = random.Random(generator_seed)
+    generated: list[int] = []
+    seen: set[int] = set()
+    while len(generated) < required_count:
+        seed = generator.randint(
+            TRAINING_CHALLENGE_SEED_MIN,
+            TRAINING_CHALLENGE_SEED_MAX,
+        )
+        if seed not in seen:
+            seen.add(seed)
+            generated.append(seed)
+    start = repeat_count * (block - 1)
+    return tuple(generated[start : start + repeat_count])
+
+
+class SeededSteeringActionNoise:
+    """Reproducible correlated steering noise in normalized TD3 action space."""
+
+    def __init__(
+        self,
+        *,
+        seed: int,
+        steering_noise_std: float,
+        correlation: float = STEERING_ACTION_NOISE_CORRELATION,
+    ) -> None:
+        if not 0 <= int(seed) <= MAX_REPRODUCIBLE_SEED:
+            raise ValueError(
+                f"seed must be between 0 and {MAX_REPRODUCIBLE_SEED}"
+            )
+        if not math.isfinite(steering_noise_std) or steering_noise_std < 0.0:
+            raise ValueError("steering_noise_std must be finite and non-negative")
+        if not math.isfinite(correlation) or not 0.0 <= correlation < 1.0:
+            raise ValueError("correlation must be finite and in [0, 1)")
+        self.seed = int(seed)
+        self.steering_noise_std = float(steering_noise_std)
+        self.correlation = float(correlation)
+        self._random = random.Random(self.seed)
+        self._steering_noise = 0.0
+
+    @property
+    def steering_noise(self) -> float:
+        return self._steering_noise
+
+    def __call__(self) -> np.ndarray:
+        innovation_scale = self.steering_noise_std * math.sqrt(
+            1.0 - (self.correlation**2)
+        )
+        self._steering_noise = (
+            self.correlation * self._steering_noise
+            + self._random.gauss(0.0, innovation_scale)
+        )
+        return np.asarray(
+            [self._steering_noise / MAX_STEER, 0.0, 0.0],
+            dtype=np.float32,
+        )
+
+    def reset(self) -> None:
+        self._random.seed(self.seed)
+        self._steering_noise = 0.0
+
+
 def metadata_path_for_policy(policy_path: Path) -> Path:
     return Path(policy_path).with_suffix(".metadata.json")
 
@@ -357,12 +484,14 @@ class Td3ScratchAgent:
         policy: Any = None,
         require_policy: bool = False,
         deterministic: bool = True,
+        action_noise: Any = None,
     ) -> None:
         self.seed = seed if seed is not None else secrets.randbits(32)
         self.policy_path = Path(policy_path or _default_policy_path())
         self.policy = policy
         self.policy_loaded = policy is not None
         self.deterministic = bool(deterministic)
+        self.action_noise = action_noise
         self.policy_metadata = read_policy_metadata(self.policy_path)
         mismatches = policy_contract_mismatches(self.policy_metadata)
         if mismatches:
@@ -402,10 +531,14 @@ class Td3ScratchAgent:
         }
 
     def reset(self) -> None:
+        reset_action_noise = getattr(self.action_noise, "reset", None)
+        if callable(reset_action_noise):
+            reset_action_noise()
         self.previous_action = {"steer": 0.0, "accel": 0.0, "brake": 0.0}
         self.previous_gear = 1
         self.stuck_counter = 0
         self.last_raw_action = [0.0, 0.0, 0.0]
+        self.last_policy_action = [0.0, 0.0, 0.0]
 
     def act(
         self,
@@ -431,7 +564,17 @@ class Td3ScratchAgent:
             self.previous_action,
             track_length_m=self.track_length_m,
         )
-        raw_action = self._predict_action(features)
+        predicted_action = np.asarray(
+            self._predict_action(features),
+            dtype=np.float32,
+        ).reshape(-1)
+        policy_action = np.zeros(3, dtype=np.float32)
+        policy_action[: min(3, len(predicted_action))] = predicted_action[:3]
+        raw_action = policy_action.copy()
+        if self.action_noise is not None:
+            noise = np.asarray(self.action_noise(), dtype=np.float32).reshape(-1)
+            raw_action[: min(3, len(noise))] += noise[:3]
+        raw_action = np.clip(raw_action, -1.0, 1.0)
         action = decode_td3_action(raw_action)
         speed = finite_float(telemetry.get("speedX", 0.0))
         action = rate_limit_td3_action(
@@ -452,6 +595,7 @@ class Td3ScratchAgent:
             "brake": action["brake"],
         }
         self.previous_gear = action["gear"]
+        self.last_policy_action = list(policy_action)
         self.last_raw_action = list(raw_action)
         return action
 
@@ -482,6 +626,10 @@ class Td3ScratchAgent:
             "td3_raw_steer": self.last_raw_action[0],
             "td3_raw_accel": self.last_raw_action[1],
             "td3_raw_brake": self.last_raw_action[2],
+            "td3_policy_raw_steer": self.last_policy_action[0],
+            "td3_action_steering_noise": finite_float(
+                getattr(self.action_noise, "steering_noise", 0.0)
+            ),
         }
 
     def close(self) -> None:
