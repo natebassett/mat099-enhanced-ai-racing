@@ -59,6 +59,7 @@ from agents.td3_agent import (  # noqa: E402
     finite_float,
     metadata_path_for_policy,
     order_stratified_seed_aggregates,
+    order_stratified_seed_position_medians,
     parameter_state_dicts_are_identical,
     policy_contract_mismatches,
     rate_limit_td3_action,
@@ -92,16 +93,23 @@ DEFAULT_CONTINUATION_FINAL_ACTION_NOISE_SIGMA = 0.006
 DEFAULT_SAFE_ACTOR_MAX_ACTION_DELTA = 0.01
 DEFAULT_SAFE_ACTOR_GRADIENT_NORM = 1.0
 DEFAULT_SAFE_ACTOR_BLOCK_UPDATES = 100
+DEFAULT_SAFE_ACTOR_BLOCKS_PER_PROBE = 10
 DEFAULT_SAFE_ACTOR_PROBE_REPEATS = AGENT6_ROBUSTNESS_REPEATS
 DEFAULT_SAFE_ACTOR_TRIALS_PER_SEED = AGENT6_ROBUSTNESS_TRIALS_PER_SEED
+DEFAULT_SAFE_ACTOR_SCREENING_TRIALS_PER_SEED = 2
+DEFAULT_SAFE_ACTOR_SCREENING_MAX_EPISODE_STEPS = 1_200
 DEFAULT_SAFE_ACTOR_PROBE_BASE_SEED = AGENT6_TRAINING_CHALLENGE_BASE_SEED
 DEFAULT_SAFE_ACTOR_PROBE_NOISE_STD = AGENT6_ROBUSTNESS_STEERING_NOISE_STD
 DEFAULT_SAFE_ACTOR_MIN_IMPROVEMENT_M = 5.0
 DEFAULT_SAFE_ACTOR_MAX_PAIRED_REGRESSION_M = (
     AGENT6_ROBUSTNESS_MAX_PAIRED_REGRESSION_M
 )
+DEFAULT_SAFE_ACTOR_SCREENING_MAX_REGRESSION_M = 250.0
 DEFAULT_SAFE_ACTOR_ANCHOR_BATCH_SIZE = 256
-SAFE_ACTOR_ROBUSTNESS_PROTOCOL = AGENT6_ROBUSTNESS_PROTOCOL
+DEFAULT_PROBE_OVERHEAD_MULTIPLIER = 10
+SAFE_ACTOR_ROBUSTNESS_PROTOCOL = (
+    "agent6_budgeted_multifidelity_order_position_guard_v8"
+)
 
 REWARD_VERSION = "agent6_td3_reward_v1_raw_progress_curriculum"
 OFF_TRACK_GRACE_STEPS = 4
@@ -188,6 +196,8 @@ CURRICULUM_STAGE_IDS = tuple(stage.stage_id for stage in CURRICULUM)
 EPISODE_COLUMNS = [
     "episodes_seen",
     "global_timestep",
+    "training_budget_timestep",
+    "probe_overhead_timestep",
     "policy_controlled",
     "deterministic_probe",
     "safe_actor_candidate_probe",
@@ -197,8 +207,12 @@ EPISODE_COLUMNS = [
     "safe_actor_probe_index",
     "safe_actor_probe_trial",
     "safe_actor_trials_per_seed",
+    "safe_actor_probe_stage",
     "safe_actor_probe_order_position",
     "safe_actor_decision",
+    "safe_actor_probe_episodes_completed",
+    "safe_actor_probe_episodes_maximum",
+    "safe_actor_probe_episodes_skipped",
     "safe_actor_probe_median_distance_m",
     "safe_actor_probe_minimum_distance_m",
     "safe_actor_reference_median_distance_m",
@@ -206,6 +220,9 @@ EPISODE_COLUMNS = [
     "safe_actor_paired_median_delta_m",
     "safe_actor_worst_paired_delta_m",
     "safe_actor_paired_regressions",
+    "safe_actor_worst_order_position_delta_m",
+    "safe_actor_order_position_regressions",
+    "safe_actor_order_position_deltas_m",
     "safe_actor_raw_paired_regressions",
     "safe_actor_reference_seed_medians_m",
     "safe_actor_candidate_seed_medians_m",
@@ -446,6 +463,18 @@ def continuation_training_phase(
     return "learning"
 
 
+def safe_actor_probe_episode_step_limit(
+    stage: CurriculumStage,
+    *,
+    probe_stage: str | None,
+    screening_max_episode_steps: int,
+) -> int:
+    stage_limit = max(1, int(stage.max_episode_steps))
+    if probe_stage != "screening":
+        return stage_limit
+    return min(stage_limit, max(1, int(screening_max_episode_steps)))
+
+
 def calculate_progress_delta(
     previous_telemetry: Mapping[str, Any] | None,
     telemetry: Mapping[str, Any],
@@ -645,6 +674,9 @@ class SafeActorProbeComparison:
     worst_paired_delta_m: float
     paired_regressions: int
     paired_deltas_m: tuple[float, ...]
+    worst_order_position_delta_m: float
+    order_position_regressions: int
+    order_position_deltas_m: tuple[float, ...]
     raw_paired_regressions: int
     reference_seed_medians_m: tuple[float, ...]
     candidate_seed_medians_m: tuple[float, ...]
@@ -711,6 +743,32 @@ def safe_actor_probe_decision(
         ),
         dtype=float,
     )
+    reference_seed_positions = order_stratified_seed_position_medians(
+        reference_distances_m,
+        reference_order_positions,
+        seed_count=seed_count,
+        trials_per_seed=trials_per_seed,
+    )
+    candidate_seed_positions = order_stratified_seed_position_medians(
+        candidate_distances_m,
+        candidate_order_positions,
+        seed_count=seed_count,
+        trials_per_seed=trials_per_seed,
+    )
+    order_position_deltas: list[float] = []
+    for reference_positions, candidate_positions in zip(
+        reference_seed_positions,
+        candidate_seed_positions,
+    ):
+        if set(reference_positions) != set(candidate_positions):
+            raise ValueError(
+                "reference and candidate must cover identical order positions"
+            )
+        order_position_deltas.extend(
+            candidate_positions[position] - reference_positions[position]
+            for position in sorted(reference_positions)
+        )
+    position_deltas = np.asarray(order_position_deltas, dtype=float)
     paired_deltas = candidate_seed_medians - reference_seed_medians
     raw_paired_deltas = candidate - reference
     reference_median = float(np.median(reference_seed_medians))
@@ -722,11 +780,16 @@ def safe_actor_probe_decision(
     paired_median_delta = float(np.median(paired_deltas))
     worst_paired_delta = float(np.min(paired_deltas))
     paired_regressions = int(np.count_nonzero(paired_deltas < 0.0))
+    worst_order_position_delta = float(np.min(position_deltas))
+    order_position_regressions = int(
+        np.count_nonzero(position_deltas < 0.0)
+    )
     accepted = (
         aggregate_median_gain >= required_gain
         and minimum_gain >= 0.0
         and paired_median_delta >= required_gain
         and worst_paired_delta >= -regression_limit
+        and worst_order_position_delta >= -regression_limit
     )
     return SafeActorProbeComparison(
         decision="accepted" if accepted else "rolled_back",
@@ -740,6 +803,11 @@ def safe_actor_probe_decision(
         worst_paired_delta_m=worst_paired_delta,
         paired_regressions=paired_regressions,
         paired_deltas_m=tuple(float(delta) for delta in paired_deltas),
+        worst_order_position_delta_m=worst_order_position_delta,
+        order_position_regressions=order_position_regressions,
+        order_position_deltas_m=tuple(
+            float(delta) for delta in position_deltas
+        ),
         raw_paired_regressions=int(np.count_nonzero(raw_paired_deltas < 0.0)),
         reference_seed_medians_m=tuple(
             float(value) for value in reference_seed_medians
@@ -927,10 +995,25 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "constraint": "action_space_trust_region_to_last_accepted_actor",
             "max_normalized_action_delta": args.safe_actor_max_action_delta,
             "gradient_clip_norm": args.safe_actor_gradient_norm,
-            "actor_updates_per_candidate_block": args.safe_actor_block_updates,
+            "actor_updates_per_inner_block": args.safe_actor_block_updates,
+            "inner_blocks_per_robustness_probe": (
+                args.safe_actor_blocks_per_probe
+            ),
+            "actor_updates_per_candidate": (
+                args.safe_actor_block_updates * args.safe_actor_blocks_per_probe
+            ),
             "robustness_protocol": SAFE_ACTOR_ROBUSTNESS_PROTOCOL,
             "robustness_challenge_seeds": args.safe_actor_probe_repeats,
             "robustness_trials_per_seed": args.safe_actor_trials_per_seed,
+            "screening_trials_per_seed": (
+                args.safe_actor_screening_trials_per_seed
+            ),
+            "screening_maximum_regression_m": (
+                args.safe_actor_screening_max_regression_m
+            ),
+            "screening_maximum_episode_steps": (
+                args.safe_actor_screening_max_episode_steps
+            ),
             "training_challenge_base_seed": args.safe_actor_probe_base_seed,
             "training_challenge_seed_range": [
                 TRAINING_CHALLENGE_SEED_MIN,
@@ -943,7 +1026,10 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "challenge_seed_rotation": "unique_suite_per_candidate_block",
             "policy_equivalence_check": "exact_actor_parameter_equality",
             "policy_equivalent_action": "skip_matched_robustness_probes",
-            "probe_pairing": "four_trial_ab_ba_ab_ba_per_seed",
+            "probe_pairing": "staged_ab_ba_screen_then_ab_ba_confirmation",
+            "early_rejection": (
+                "relaxed_screen_then_irreversible_guard_after_each_seed"
+            ),
             "probe_aggregation": (
                 "median_within_order_position_then_equal_weight_across_positions"
             ),
@@ -952,17 +1038,29 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
                 * args.safe_actor_probe_repeats
                 * args.safe_actor_trials_per_seed
             ),
+            "maximum_probe_episodes_per_candidate": (
+                2
+                * args.safe_actor_probe_repeats
+                * args.safe_actor_trials_per_seed
+            ),
+            "minimum_probe_episodes_before_rejection": (
+                2 * args.safe_actor_screening_trials_per_seed
+            ),
             "robustness_probe_steering_noise_std": (
                 args.safe_actor_probe_noise_std
             ),
             "reference_policy": "last_accepted_actor_on_same_challenge_seeds",
             "acceptance_metric": (
-                "replicated_seed_medians_with_aggregate_and_paired_guards"
+                "order_stratified_seed_metrics_with_seed_and_position_guards"
             ),
             "minimum_improvement_m": args.safe_actor_min_improvement_m,
             "maximum_paired_regression_m": (
                 args.safe_actor_max_paired_regression_m
             ),
+            "maximum_order_position_regression_m": (
+                args.safe_actor_max_paired_regression_m
+            ),
+            "external_evaluation_remains_final_authority": True,
             "anchor_batch_size": args.safe_actor_anchor_batch_size,
             "rejected_candidate_restores": [
                 "actor",
@@ -974,6 +1072,17 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "saved_checkpoint_actor": "last_accepted_actor",
         },
         "total_timesteps_requested": args.total_timesteps,
+        "timestep_budget": {
+            "semantics": "non_probe_environment_interactions",
+            "training_steps_requested": args.total_timesteps,
+            "probe_steps_excluded_from_training_budget": True,
+            "maximum_probe_overhead_steps": args.max_probe_overhead_steps,
+            "maximum_environment_steps": (
+                args.total_timesteps + args.max_probe_overhead_steps
+            ),
+            "learning_rate_and_noise_schedules_use_training_steps": True,
+            "checkpoints_use_training_steps": True,
+        },
         "seed": args.seed,
         "manual_start": args.manual_start,
         "relaunch_frequency": args.relaunch_frequency,
@@ -1112,6 +1221,10 @@ def make_training_env_class(gym: Any, spaces: Any):
             initial_stage_id: str = "launch",
             pre_update_training_phase: str = "warmup",
             use_custom_warmup_action_space: bool = True,
+            training_budget_state: TrainingBudgetState | None = None,
+            safe_actor_screening_max_episode_steps: int = (
+                DEFAULT_SAFE_ACTOR_SCREENING_MAX_EPISODE_STEPS
+            ),
         ) -> None:
             super().__init__()
             self.track_name = track_name
@@ -1121,6 +1234,11 @@ def make_training_env_class(gym: Any, spaces: Any):
             self.quiet_reset_log = quiet_reset_log
             self.run_dir = Path(run_dir) if run_dir is not None else None
             self.learning_starts = max(0, int(learning_starts))
+            self.training_budget_state = training_budget_state
+            self.safe_actor_screening_max_episode_steps = max(
+                1,
+                int(safe_actor_screening_max_episode_steps),
+            )
             self.runner = make_torcs_runner()
             if use_custom_warmup_action_space:
                 self.action_space = make_scratch_action_space(
@@ -1175,6 +1293,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             self.safe_actor_probe_seed: int | None = None
             self.safe_actor_probe_trial: int | None = None
             self.safe_actor_trials_per_seed: int | None = None
+            self.safe_actor_probe_stage: str | None = None
             self.safe_actor_probe_order_position: int | None = None
             self.action_noise_sigma: float | None = None
             self.episode_max_speed = 0.0
@@ -1202,6 +1321,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             safe_actor_probe_seed: int | None = None,
             safe_actor_probe_trial: int | None = None,
             safe_actor_trials_per_seed: int | None = None,
+            safe_actor_probe_stage: str | None = None,
             safe_actor_probe_order_position: int | None = None,
         ) -> None:
             self.deterministic_probe = bool(deterministic_probe)
@@ -1229,6 +1349,11 @@ def make_training_env_class(gym: Any, spaces: Any):
                 int(safe_actor_trials_per_seed)
                 if self.safe_actor_candidate_probe
                 and safe_actor_trials_per_seed is not None
+                else None
+            )
+            self.safe_actor_probe_stage = (
+                str(safe_actor_probe_stage)
+                if self.safe_actor_candidate_probe and safe_actor_probe_stage
                 else None
             )
             self.safe_actor_probe_order_position = (
@@ -1310,7 +1435,11 @@ def make_training_env_class(gym: Any, spaces: Any):
                 self.current_telemetry.get("distRaced")
             )
             self.episode_start_time = finite_float(self.current_telemetry.get("curLapTime"))
-            self.episode_start_timestep = self.total_steps
+            self.episode_start_timestep = (
+                self.training_budget_state.training_steps
+                if self.training_budget_state is not None
+                else self.total_steps
+            )
             self.episode_max_speed = finite_float(self.current_telemetry.get("speedX"))
             self.episode_off_track_steps = 0
             self.episode_furthest_distance = 0.0
@@ -1428,7 +1557,24 @@ def make_training_env_class(gym: Any, spaces: Any):
                 self.episode_off_track_steps += 1
 
             terminated = bool(stage_success or terminal_failure)
-            truncated = self.steps >= self.current_stage.max_episode_steps
+            episode_step_limit = safe_actor_probe_episode_step_limit(
+                self.current_stage,
+                probe_stage=(
+                    self.safe_actor_probe_stage
+                    if self.safe_actor_candidate_probe
+                    else None
+                ),
+                screening_max_episode_steps=(
+                    self.safe_actor_screening_max_episode_steps
+                ),
+            )
+            screening_horizon_reached = bool(
+                self.safe_actor_candidate_probe
+                and self.safe_actor_probe_stage == "screening"
+                and episode_step_limit < self.current_stage.max_episode_steps
+                and self.steps >= episode_step_limit
+            )
+            truncated = self.steps >= episode_step_limit
             policy_controlled = episode_is_policy_controlled(
                 self.episode_start_timestep,
                 self.learning_starts,
@@ -1508,6 +1654,8 @@ def make_training_env_class(gym: Any, spaces: Any):
                     reason = "stuck"
                 elif done:
                     reason = "torcs_done"
+                elif screening_horizon_reached:
+                    reason = "safe_actor_screening_horizon"
 
             self._write_step_telemetry(
                 telemetry,
@@ -1527,6 +1675,7 @@ def make_training_env_class(gym: Any, spaces: Any):
                 "safe_actor_probe_seed": self.safe_actor_probe_seed,
                 "safe_actor_probe_trial": self.safe_actor_probe_trial,
                 "safe_actor_trials_per_seed": self.safe_actor_trials_per_seed,
+                "safe_actor_probe_stage": self.safe_actor_probe_stage,
                 "safe_actor_probe_order_position": (
                     self.safe_actor_probe_order_position
                 ),
@@ -1632,6 +1781,7 @@ def make_training_env_class(gym: Any, spaces: Any):
                 "safe_actor_probe_seed": self.safe_actor_probe_seed,
                 "safe_actor_probe_trial": self.safe_actor_probe_trial,
                 "safe_actor_trials_per_seed": self.safe_actor_trials_per_seed,
+                "safe_actor_probe_stage": self.safe_actor_probe_stage,
                 "safe_actor_probe_order_position": (
                     self.safe_actor_probe_order_position
                 ),
@@ -1830,6 +1980,65 @@ class TrainingProgressState:
         self.best_reward = float(reward)
 
 
+@dataclass
+class TrainingBudgetState:
+    """Track optimization-eligible interactions separately from probes."""
+
+    target_training_steps: int
+    maximum_probe_steps: int
+    training_steps: int = 0
+    probe_steps: int = 0
+    environment_steps: int = 0
+    stop_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        self.target_training_steps = max(1, int(self.target_training_steps))
+        self.maximum_probe_steps = max(1, int(self.maximum_probe_steps))
+
+    @property
+    def maximum_environment_steps(self) -> int:
+        return self.target_training_steps + self.maximum_probe_steps
+
+    @property
+    def progress_remaining(self) -> float:
+        completed = min(self.training_steps, self.target_training_steps)
+        return 1.0 - completed / self.target_training_steps
+
+    def record_infos(self, infos: list[Any] | tuple[Any, ...]) -> None:
+        for info in infos:
+            self.environment_steps += 1
+            deterministic_probe = bool(
+                isinstance(info, Mapping) and info.get("deterministic_probe")
+            )
+            if deterministic_probe:
+                self.probe_steps += 1
+            else:
+                self.training_steps += 1
+        self._update_stop_reason()
+
+    def _update_stop_reason(self) -> None:
+        if self.training_steps >= self.target_training_steps:
+            self.stop_reason = "training_budget_reached"
+        elif self.probe_steps >= self.maximum_probe_steps:
+            self.stop_reason = "probe_overhead_limit_reached"
+
+    def should_stop(self) -> bool:
+        return self.stop_reason is not None
+
+    def as_dict(self) -> dict[str, Any]:
+        total = max(1, self.environment_steps)
+        return {
+            "target_training_steps": self.target_training_steps,
+            "maximum_probe_steps": self.maximum_probe_steps,
+            "maximum_environment_steps": self.maximum_environment_steps,
+            "training_steps": self.training_steps,
+            "probe_steps": self.probe_steps,
+            "environment_steps": self.environment_steps,
+            "probe_fraction": self.probe_steps / total,
+            "stop_reason": self.stop_reason,
+        }
+
+
 def format_duration(seconds: float | None) -> str:
     if seconds is None or not math.isfinite(float(seconds)):
         return "--:--:--"
@@ -1846,6 +2055,8 @@ def format_training_progress_line(
     progress_state: TrainingProgressState,
     *,
     width: int = 28,
+    probe_steps: int = 0,
+    maximum_probe_steps: int | None = None,
 ) -> str:
     total_steps = max(1, int(total_steps))
     completed_steps = max(0, min(int(completed_steps), total_steps))
@@ -1879,10 +2090,13 @@ def format_training_progress_line(
     if progress_state.best_reward is not None:
         best_parts.append(f"best_R={progress_state.best_reward:.0f}")
     best_text = f" | {' '.join(best_parts)}" if best_parts else ""
+    probe_text = f" | probes={max(0, int(probe_steps)):,}"
+    if maximum_probe_steps is not None:
+        probe_text += f"/{max(1, int(maximum_probe_steps)):,}"
     return (
         f"Training [{bar}] {percent:5.1f}% | "
         f"{completed_steps:,}/{total_steps:,} steps | {rate} | "
-        f"ETA {eta} | stage={progress_state.current_stage} | "
+        f"ETA {eta}{probe_text} | stage={progress_state.current_stage} | "
         f"{episode_text}{best_text}"
     )
 
@@ -1952,6 +2166,7 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             actor_full_unfreeze: int | None = None,
             safe_probe_noise_factory: Any = None,
             safe_probe_noise_std: float = DEFAULT_SAFE_ACTOR_PROBE_NOISE_STD,
+            training_budget_state: TrainingBudgetState | None = None,
         ) -> None:
             super().__init__(verbose=0)
             self.raw_env = raw_env
@@ -1975,6 +2190,7 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             )
             self.safe_probe_noise_factory = safe_probe_noise_factory
             self.safe_probe_noise_std = max(0.0, float(safe_probe_noise_std))
+            self.training_budget_state = training_budget_state
             self.probe_episodes_completed = 0
             self.policy_episodes_since_probe = 0
             self.current_episode_is_probe = False
@@ -1986,10 +2202,19 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
         def _on_step(self):
             completed_episode = False
             infos = self.locals.get("infos", [])
+            if self.training_budget_state is not None:
+                self.training_budget_state.record_infos(infos)
             for info in infos:
                 summary = info.get("episode_summary") if isinstance(info, dict) else None
                 if summary is None:
                     continue
+                if self.training_budget_state is not None:
+                    summary["training_budget_timestep"] = (
+                        self.training_budget_state.training_steps
+                    )
+                    summary["probe_overhead_timestep"] = (
+                        self.training_budget_state.probe_steps
+                    )
                 completed_episode = True
                 if bool(summary.get("policy_controlled")):
                     if bool(summary.get("deterministic_probe")):
@@ -2005,7 +2230,7 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                 next_episode_is_probe = (
                     self._safe_actor_probe_required()
                     or should_schedule_policy_probe(
-                        timestep=self.num_timesteps,
+                        timestep=self._budget_timestep(),
                         learning_starts=self.learning_starts,
                         probe_episodes_completed=self.probe_episodes_completed,
                         policy_episodes_since_probe=self.policy_episodes_since_probe,
@@ -2021,17 +2246,20 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                 # final update. Freeze from this point until the probe terminates.
                 self.model.gradient_steps = 0
             elif (
-                self.num_timesteps >= self.learning_starts
+                self._budget_timestep() >= self.learning_starts
                 and self.model.gradient_steps != self.training_gradient_steps
             ):
                 self._apply_policy_mode(deterministic_probe=False, force=True)
             elif (
                 not self.current_episode_is_probe
-                and self.num_timesteps - self.last_noise_update_timestep
+                and self._budget_timestep() - self.last_noise_update_timestep
                 >= ACTION_NOISE_UPDATE_INTERVAL_STEPS
             ):
                 self._apply_policy_mode(deterministic_probe=False, force=False)
-            return True
+            return not (
+                self.training_budget_state is not None
+                and self.training_budget_state.should_stop()
+            )
 
         def _on_training_end(self):
             finalize = getattr(self.model, "finalize_safe_actor_candidate", None)
@@ -2044,7 +2272,7 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                         "because its matched comparison was incomplete."
                     )
             sigma = action_noise_sigma_at_timestep(
-                self.num_timesteps,
+                self._budget_timestep(),
                 learning_starts=self.learning_starts,
                 initial_sigma=self.initial_sigma,
                 final_sigma=self.final_sigma,
@@ -2060,7 +2288,7 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             force: bool,
         ) -> None:
             sigma = action_noise_sigma_at_timestep(
-                self.num_timesteps,
+                self._budget_timestep(),
                 learning_starts=self.learning_starts,
                 initial_sigma=self.initial_sigma,
                 final_sigma=self.final_sigma,
@@ -2089,18 +2317,18 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                     )
             self.model.gradient_steps = (
                 0
-                if self.num_timesteps < self.learning_starts
+                if self._budget_timestep() < self.learning_starts
                 else self.training_gradient_steps
             )
             self.current_episode_is_probe = deterministic_probe
-            self.last_noise_update_timestep = self.num_timesteps
+            self.last_noise_update_timestep = self._budget_timestep()
             if safe_actor_probe:
                 training_phase = f"safe_actor_{safe_context['mode']}_probe"
             elif deterministic_probe:
                 training_phase = "deterministic_probe"
             else:
                 training_phase = continuation_training_phase(
-                    self.num_timesteps,
+                    self._budget_timestep(),
                     gradient_update_start=self.learning_starts,
                     actor_update_start=self.actor_update_start,
                     actor_full_unfreeze=self.actor_full_unfreeze,
@@ -2125,10 +2353,18 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                 safe_actor_trials_per_seed=(
                     safe_context.get("trials_per_seed") if safe_context else None
                 ),
+                safe_actor_probe_stage=(
+                    safe_context.get("probe_stage") if safe_context else None
+                ),
                 safe_actor_probe_order_position=(
                     safe_context.get("order_position") if safe_context else None
                 ),
             )
+
+        def _budget_timestep(self) -> int:
+            if self.training_budget_state is None:
+                return int(self.num_timesteps)
+            return int(self.training_budget_state.training_steps)
 
         def _safe_actor_probe_required(self) -> bool:
             required = getattr(self.model, "safe_actor_probe_required", None)
@@ -2166,10 +2402,20 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             summary["safe_actor_trials_per_seed"] = result.get(
                 "trials_per_seed"
             )
+            summary["safe_actor_probe_stage"] = result.get("probe_stage")
             summary["safe_actor_probe_order_position"] = result.get(
                 "order_position"
             )
             summary["safe_actor_decision"] = result.get("decision")
+            summary["safe_actor_probe_episodes_completed"] = result.get(
+                "probe_episodes_completed"
+            )
+            summary["safe_actor_probe_episodes_maximum"] = result.get(
+                "probe_episodes_maximum"
+            )
+            summary["safe_actor_probe_episodes_skipped"] = result.get(
+                "probe_episodes_skipped"
+            )
             summary["safe_actor_probe_median_distance_m"] = result.get(
                 "median_distance_m"
             )
@@ -2190,6 +2436,15 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             )
             summary["safe_actor_paired_regressions"] = result.get(
                 "paired_regressions"
+            )
+            summary["safe_actor_worst_order_position_delta_m"] = result.get(
+                "worst_order_position_delta_m"
+            )
+            summary["safe_actor_order_position_regressions"] = result.get(
+                "order_position_regressions"
+            )
+            summary["safe_actor_order_position_deltas_m"] = result.get(
+                "order_position_deltas_m"
             )
             summary["safe_actor_raw_paired_regressions"] = result.get(
                 "raw_paired_regressions"
@@ -2212,7 +2467,33 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                     summary,
                     median_distance_m=float(result["median_distance_m"]),
                 )
-            if decision in {"accepted", "rolled_back"}:
+            terminal_decisions = {
+                "accepted",
+                "rolled_back",
+                "rolled_back_early",
+                "rolled_back_screening",
+            }
+            if decision in terminal_decisions:
+                worst_position_delta = result.get(
+                    "worst_order_position_delta_m"
+                )
+                if worst_position_delta is None:
+                    worst_position_delta = result["worst_paired_delta_m"]
+                probe_episodes_completed = result.get(
+                    "probe_episodes_completed"
+                )
+                probe_episodes_maximum = result.get(
+                    "probe_episodes_maximum"
+                )
+                probe_suffix = "."
+                if (
+                    probe_episodes_completed is not None
+                    and probe_episodes_maximum is not None
+                ):
+                    probe_suffix = (
+                        f"; probes={probe_episodes_completed}/"
+                        f"{probe_episodes_maximum}."
+                    )
                 print(
                     "\nSafe actor candidate "
                     f"{result['candidate_id']} {decision}: "
@@ -2223,7 +2504,10 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                     "paired seed median="
                     f"{float(result['paired_median_delta_m']):+.1f}m, "
                     "worst seed="
-                    f"{float(result['worst_paired_delta_m']):+.1f}m."
+                    f"{float(result['worst_paired_delta_m']):+.1f}m, "
+                    "worst seed-position="
+                    f"{float(worst_position_delta):+.1f}m"
+                    f"{probe_suffix}"
                 )
 
     return ExplorationScheduleCallback
@@ -2239,6 +2523,7 @@ def make_best_model_callback_class(BaseCallback: Any):
             progress_state: TrainingProgressState | None = None,
             learning_starts: int = 0,
             save_best_replay_buffer: bool = False,
+            training_budget_state: TrainingBudgetState | None = None,
         ) -> None:
             super().__init__(verbose=0)
             self.best_distance_model_path = Path(best_distance_model_path)
@@ -2247,6 +2532,7 @@ def make_best_model_callback_class(BaseCallback: Any):
             self.progress_state = progress_state
             self.learning_starts = max(0, int(learning_starts))
             self.save_best_replay_buffer = bool(save_best_replay_buffer)
+            self.training_budget_state = training_budget_state
             self.best_distance_m = self._read_existing_best_distance()
             self.best_reward = self._read_existing_best_reward()
             if self.progress_state is not None:
@@ -2268,7 +2554,7 @@ def make_best_model_callback_class(BaseCallback: Any):
                     continue
                 if (
                     not bool(summary.get("curriculum_eligible"))
-                    or self.num_timesteps <= self.learning_starts
+                    or self._budget_timestep() <= self.learning_starts
                 ):
                     continue
                 distance_m = float(summary.get("distance_m") or 0.0)
@@ -2307,6 +2593,11 @@ def make_best_model_callback_class(BaseCallback: Any):
                         save_replay_buffer=self.save_best_replay_buffer,
                     )
             return True
+
+        def _budget_timestep(self) -> int:
+            if self.training_budget_state is None:
+                return int(self.num_timesteps)
+            return int(self.training_budget_state.training_steps)
 
         def _save_best(
             self,
@@ -2376,10 +2667,12 @@ def make_console_progress_callback_class(BaseCallback: Any):
             progress_state: TrainingProgressState,
             *,
             interval_seconds: float = DEFAULT_PROGRESS_INTERVAL_SECONDS,
+            training_budget_state: TrainingBudgetState | None = None,
         ) -> None:
             super().__init__(verbose=0)
             self.total_timesteps = int(total_timesteps)
             self.progress_state = progress_state
+            self.training_budget_state = training_budget_state
             self.interval_seconds = float(interval_seconds)
             self.start_timestep = 0
             self.start_time = 0.0
@@ -2406,12 +2699,26 @@ def make_console_progress_callback_class(BaseCallback: Any):
             now = time.monotonic() if now is None else now
             if not force and now - self.last_render_time < self.interval_seconds:
                 return
-            completed_steps = self.num_timesteps - self.start_timestep
+            completed_steps = (
+                self.training_budget_state.training_steps
+                if self.training_budget_state is not None
+                else self.num_timesteps - self.start_timestep
+            )
             line = format_training_progress_line(
                 completed_steps,
                 self.total_timesteps,
                 now - self.start_time,
                 self.progress_state,
+                probe_steps=(
+                    self.training_budget_state.probe_steps
+                    if self.training_budget_state is not None
+                    else 0
+                ),
+                maximum_probe_steps=(
+                    self.training_budget_state.maximum_probe_steps
+                    if self.training_budget_state is not None
+                    else None
+                ),
             )
             terminal_width = shutil.get_terminal_size((120, 20)).columns
             max_width = max(60, terminal_width - 1)
@@ -2425,7 +2732,42 @@ def make_console_progress_callback_class(BaseCallback: Any):
     return ConsoleProgressCallback
 
 
-def make_checkpoint_callback(CheckpointCallback: Any, args: argparse.Namespace):
+def make_checkpoint_callback(
+    CheckpointCallback: Any,
+    args: argparse.Namespace,
+    *,
+    BaseCallback: Any = None,
+    training_budget_state: TrainingBudgetState | None = None,
+):
+    if training_budget_state is not None and BaseCallback is not None:
+        class TrainingBudgetCheckpointCallback(BaseCallback):
+            def __init__(self) -> None:
+                super().__init__(verbose=0)
+                self.next_checkpoint_step = int(args.checkpoint_freq)
+
+            def _on_step(self):
+                training_steps = training_budget_state.training_steps
+                if training_steps < self.next_checkpoint_step:
+                    return True
+                checkpoint_stem = (
+                    Path(args.checkpoint_dir)
+                    / f"agent6_td3_scratch_{training_steps}_steps"
+                )
+                self.model.save(str(checkpoint_stem))
+                if args.save_checkpoint_replay_buffer:
+                    self.model.save_replay_buffer(
+                        str(
+                            checkpoint_stem.with_name(
+                                f"{checkpoint_stem.name}_replay_buffer.pkl"
+                            )
+                        )
+                    )
+                while self.next_checkpoint_step <= training_steps:
+                    self.next_checkpoint_step += int(args.checkpoint_freq)
+                return True
+
+        return TrainingBudgetCheckpointCallback()
+
     checkpoint_kwargs = {
         "save_freq": args.checkpoint_freq,
         "save_path": str(args.checkpoint_dir),
@@ -2477,7 +2819,25 @@ def make_phased_continuation_td3_class(TD3: Any):
                 "_agent6_safe_actor_candidate_state",
                 "_agent6_safe_actor_candidate_target_state",
                 "_agent6_safe_actor_candidate_optimizer_state",
+                "_agent6_training_budget_state",
             ]
+
+        def configure_training_budget(
+            self,
+            training_budget_state: TrainingBudgetState,
+        ) -> None:
+            self._agent6_training_budget_state = training_budget_state
+
+        def _training_budget_timestep(self) -> int:
+            state = getattr(self, "_agent6_training_budget_state", None)
+            if state is None:
+                return int(self.num_timesteps)
+            return int(state.training_steps)
+
+        def _apply_training_budget_progress(self) -> None:
+            state = getattr(self, "_agent6_training_budget_state", None)
+            if state is not None:
+                self._current_progress_remaining = state.progress_remaining
 
         def save(
             self,
@@ -2513,15 +2873,24 @@ def make_phased_continuation_td3_class(TD3: Any):
             safe_actor_max_action_delta: float = DEFAULT_SAFE_ACTOR_MAX_ACTION_DELTA,
             safe_actor_gradient_norm: float = DEFAULT_SAFE_ACTOR_GRADIENT_NORM,
             safe_actor_block_updates: int = DEFAULT_SAFE_ACTOR_BLOCK_UPDATES,
+            safe_actor_blocks_per_probe: int = (
+                DEFAULT_SAFE_ACTOR_BLOCKS_PER_PROBE
+            ),
             safe_actor_probe_repeats: int = DEFAULT_SAFE_ACTOR_PROBE_REPEATS,
             safe_actor_trials_per_seed: int = (
                 DEFAULT_SAFE_ACTOR_TRIALS_PER_SEED
+            ),
+            safe_actor_screening_trials_per_seed: int = (
+                DEFAULT_SAFE_ACTOR_SCREENING_TRIALS_PER_SEED
             ),
             safe_actor_min_improvement_m: float = (
                 DEFAULT_SAFE_ACTOR_MIN_IMPROVEMENT_M
             ),
             safe_actor_max_paired_regression_m: float = (
                 DEFAULT_SAFE_ACTOR_MAX_PAIRED_REGRESSION_M
+            ),
+            safe_actor_screening_max_regression_m: float = (
+                DEFAULT_SAFE_ACTOR_SCREENING_MAX_REGRESSION_M
             ),
             safe_actor_anchor_batch_size: int = (
                 DEFAULT_SAFE_ACTOR_ANCHOR_BATCH_SIZE
@@ -2546,6 +2915,10 @@ def make_phased_continuation_td3_class(TD3: Any):
                 1,
                 int(safe_actor_block_updates),
             )
+            self._agent6_safe_actor_blocks_per_probe = max(
+                1,
+                int(safe_actor_blocks_per_probe),
+            )
             self._agent6_safe_actor_probe_repeats = max(
                 1,
                 int(safe_actor_probe_repeats),
@@ -2562,6 +2935,19 @@ def make_phased_continuation_td3_class(TD3: Any):
                     "safe actor robustness probes require exactly "
                     f"{AGENT6_ROBUSTNESS_TRIALS_PER_SEED} trials per seed"
                 )
+            self._agent6_safe_actor_screening_trials_per_seed = int(
+                safe_actor_screening_trials_per_seed
+            )
+            if (
+                self._agent6_safe_actor_enabled
+                and self._agent6_safe_actor_screening_trials_per_seed
+                != DEFAULT_SAFE_ACTOR_SCREENING_TRIALS_PER_SEED
+            ):
+                raise ValueError(
+                    "safe actor screening requires exactly "
+                    f"{DEFAULT_SAFE_ACTOR_SCREENING_TRIALS_PER_SEED} trials "
+                    "per seed"
+                )
             self._agent6_safe_actor_min_improvement_m = max(
                 0.0,
                 float(safe_actor_min_improvement_m),
@@ -2570,6 +2956,19 @@ def make_phased_continuation_td3_class(TD3: Any):
                 0.0,
                 float(safe_actor_max_paired_regression_m),
             )
+            self._agent6_safe_actor_screening_max_regression_m = max(
+                0.0,
+                float(safe_actor_screening_max_regression_m),
+            )
+            if (
+                self._agent6_safe_actor_enabled
+                and self._agent6_safe_actor_screening_max_regression_m
+                < self._agent6_safe_actor_max_paired_regression_m
+            ):
+                raise ValueError(
+                    "safe actor screening regression limit must be no smaller "
+                    "than the final paired regression limit"
+                )
             self._agent6_safe_actor_anchor_batch_size = max(
                 1,
                 int(safe_actor_anchor_batch_size),
@@ -2596,7 +2995,10 @@ def make_phased_continuation_td3_class(TD3: Any):
             self._agent6_safe_actor_candidate_order_positions: list[int] = []
             self._agent6_safe_actor_accepted_blocks = 0
             self._agent6_safe_actor_rolled_back_blocks = 0
+            self._agent6_safe_actor_screened_out_blocks = 0
+            self._agent6_safe_actor_early_rolled_back_blocks = 0
             self._agent6_safe_actor_equivalent_blocks = 0
+            self._agent6_safe_actor_probe_episodes_skipped = 0
             self._agent6_safe_actor_last_decision: dict[str, Any] | None = None
             self._agent6_safe_actor_anchor_observations = None
             self._clear_safe_actor_candidate_snapshot()
@@ -2675,14 +3077,16 @@ def make_phased_continuation_td3_class(TD3: Any):
             self._agent6_safe_actor_candidate_updates = 0
             self._agent6_safe_actor_waiting_for_probe = False
             self._agent6_safe_actor_equivalent_blocks += 1
+            skipped_episodes = (
+                2
+                * self._agent6_safe_actor_probe_repeats
+                * self._agent6_safe_actor_trials_per_seed
+            )
+            self._agent6_safe_actor_probe_episodes_skipped += skipped_episodes
             self._agent6_safe_actor_last_decision = {
                 "candidate_id": candidate_id,
                 "decision": "policy_equivalent",
-                "probe_episodes_skipped": (
-                    2
-                    * self._agent6_safe_actor_probe_repeats
-                    * self._agent6_safe_actor_trials_per_seed
-                ),
+                "probe_episodes_skipped": skipped_episodes,
             }
             self._clear_safe_actor_candidate_snapshot()
             print(
@@ -2747,13 +3151,20 @@ def make_phased_continuation_td3_class(TD3: Any):
                 return None
             self._begin_safe_actor_comparison()
             probe_index = self._agent6_safe_actor_probe_seed_index + 1
+            trial_index = self._agent6_safe_actor_probe_trial_index + 1
             return {
                 "mode": self._agent6_safe_actor_probe_phase,
                 "candidate_id": self._agent6_safe_actor_candidate_id,
                 "probe_index": probe_index,
                 "probe_repeats": self._agent6_safe_actor_probe_repeats,
-                "trial_index": self._agent6_safe_actor_probe_trial_index + 1,
+                "trial_index": trial_index,
                 "trials_per_seed": self._agent6_safe_actor_trials_per_seed,
+                "probe_stage": (
+                    "screening"
+                    if trial_index
+                    <= self._agent6_safe_actor_screening_trials_per_seed
+                    else "confirmation"
+                ),
                 "order_position": (
                     self._agent6_safe_actor_probe_order_position + 1
                 ),
@@ -2781,8 +3192,25 @@ def make_phased_continuation_td3_class(TD3: Any):
                 "rolled_back_blocks": int(
                     getattr(self, "_agent6_safe_actor_rolled_back_blocks", 0)
                 ),
+                "screened_out_blocks": int(
+                    getattr(self, "_agent6_safe_actor_screened_out_blocks", 0)
+                ),
+                "early_rolled_back_blocks": int(
+                    getattr(
+                        self,
+                        "_agent6_safe_actor_early_rolled_back_blocks",
+                        0,
+                    )
+                ),
                 "policy_equivalent_blocks": int(
                     getattr(self, "_agent6_safe_actor_equivalent_blocks", 0)
+                ),
+                "probe_episodes_skipped": int(
+                    getattr(
+                        self,
+                        "_agent6_safe_actor_probe_episodes_skipped",
+                        0,
+                    )
                 ),
                 "last_decision": copy.deepcopy(
                     getattr(self, "_agent6_safe_actor_last_decision", None)
@@ -2792,6 +3220,17 @@ def make_phased_continuation_td3_class(TD3: Any):
                 ),
                 "candidate_updates": int(
                     getattr(self, "_agent6_safe_actor_candidate_updates", 0)
+                ),
+                "candidate_inner_blocks": int(
+                    getattr(self, "_agent6_safe_actor_candidate_updates", 0)
+                    // max(
+                        1,
+                        getattr(self, "_agent6_safe_actor_block_updates", 1),
+                    )
+                ),
+                "actor_updates_per_probe": int(
+                    getattr(self, "_agent6_safe_actor_block_updates", 1)
+                    * getattr(self, "_agent6_safe_actor_blocks_per_probe", 1)
                 ),
                 "waiting_for_probe": self.safe_actor_probe_required(),
                 "probe_phase": str(
@@ -2825,6 +3264,162 @@ def make_phased_continuation_td3_class(TD3: Any):
                 ),
             }
 
+        def _compare_safe_actor_probes(
+            self,
+            *,
+            seed_count: int,
+            trials_per_seed: int,
+            start: int = 0,
+            stop: int | None = None,
+            minimum_improvement_m: float | None = None,
+            maximum_regression_m: float | None = None,
+        ) -> SafeActorProbeComparison:
+            probe_slice = slice(int(start), stop)
+            return safe_actor_probe_decision(
+                self._agent6_safe_actor_reference_distances_m[probe_slice],
+                self._agent6_safe_actor_candidate_distances_m[probe_slice],
+                seed_count=seed_count,
+                trials_per_seed=trials_per_seed,
+                reference_order_positions=(
+                    self._agent6_safe_actor_reference_order_positions[
+                        probe_slice
+                    ]
+                ),
+                candidate_order_positions=(
+                    self._agent6_safe_actor_candidate_order_positions[
+                        probe_slice
+                    ]
+                ),
+                minimum_improvement_m=(
+                    self._agent6_safe_actor_min_improvement_m
+                    if minimum_improvement_m is None
+                    else minimum_improvement_m
+                ),
+                maximum_paired_regression_m=(
+                    self._agent6_safe_actor_max_paired_regression_m
+                    if maximum_regression_m is None
+                    else maximum_regression_m
+                ),
+            )
+
+        @staticmethod
+        def _safe_actor_comparison_metrics(
+            comparison: SafeActorProbeComparison,
+        ) -> dict[str, Any]:
+            return {
+                "median_distance_m": comparison.candidate_median_distance_m,
+                "minimum_distance_m": (
+                    comparison.candidate_minimum_distance_m
+                ),
+                "reference_median_distance_m": (
+                    comparison.reference_median_distance_m
+                ),
+                "reference_minimum_distance_m": (
+                    comparison.reference_minimum_distance_m
+                ),
+                "aggregate_median_gain_m": comparison.aggregate_median_gain_m,
+                "minimum_gain_m": comparison.minimum_gain_m,
+                "paired_median_delta_m": comparison.paired_median_delta_m,
+                "worst_paired_delta_m": comparison.worst_paired_delta_m,
+                "paired_regressions": comparison.paired_regressions,
+                "paired_deltas_m": list(comparison.paired_deltas_m),
+                "worst_order_position_delta_m": (
+                    comparison.worst_order_position_delta_m
+                ),
+                "order_position_regressions": (
+                    comparison.order_position_regressions
+                ),
+                "order_position_deltas_m": list(
+                    comparison.order_position_deltas_m
+                ),
+                "raw_paired_regressions": comparison.raw_paired_regressions,
+                "reference_seed_medians_m": list(
+                    comparison.reference_seed_medians_m
+                ),
+                "candidate_seed_medians_m": list(
+                    comparison.candidate_seed_medians_m
+                ),
+            }
+
+        def _reset_safe_actor_probe_runtime(self) -> None:
+            self._agent6_safe_actor_candidate_updates = 0
+            self._agent6_safe_actor_waiting_for_probe = False
+            self._agent6_safe_actor_probe_phase = "idle"
+            self._agent6_safe_actor_probe_seed_index = 0
+            self._agent6_safe_actor_probe_trial_index = 0
+            self._agent6_safe_actor_probe_order_position = 0
+            self._agent6_safe_actor_probe_seeds = ()
+            self._agent6_safe_actor_reference_distances_m = []
+            self._agent6_safe_actor_candidate_distances_m = []
+            self._agent6_safe_actor_reference_order_positions = []
+            self._agent6_safe_actor_candidate_order_positions = []
+            self._clear_safe_actor_candidate_snapshot()
+
+        def _resolve_safe_actor_comparison(
+            self,
+            result: dict[str, Any],
+            comparison: SafeActorProbeComparison,
+            *,
+            decision: str,
+        ) -> dict[str, Any]:
+            probe_episodes_completed = (
+                len(self._agent6_safe_actor_reference_distances_m)
+                + len(self._agent6_safe_actor_candidate_distances_m)
+            )
+            probe_episodes_maximum = (
+                2
+                * self._agent6_safe_actor_probe_repeats
+                * self._agent6_safe_actor_trials_per_seed
+            )
+            probe_episodes_skipped = (
+                probe_episodes_maximum - probe_episodes_completed
+            )
+            if decision == "accepted":
+                self._restore_safe_actor_candidate()
+                self._agent6_safe_actor_accepted_distance_m = (
+                    comparison.candidate_median_distance_m
+                )
+                self._agent6_safe_actor_accepted_minimum_distance_m = (
+                    comparison.candidate_minimum_distance_m
+                )
+                self._agent6_safe_actor_accepted_blocks += 1
+                self._snapshot_safe_actor()
+            else:
+                self._restore_safe_actor()
+                self._agent6_safe_actor_rolled_back_blocks += 1
+                if decision == "rolled_back_screening":
+                    self._agent6_safe_actor_screened_out_blocks += 1
+                elif decision == "rolled_back_early":
+                    self._agent6_safe_actor_early_rolled_back_blocks += 1
+            self._agent6_safe_actor_probe_episodes_skipped += (
+                probe_episodes_skipped
+            )
+
+            self._agent6_safe_actor_last_decision = {
+                "candidate_id": result["candidate_id"],
+                "decision": decision,
+                "probe_episodes_completed": probe_episodes_completed,
+                "probe_episodes_skipped": probe_episodes_skipped,
+            }
+            metrics = self._safe_actor_comparison_metrics(comparison)
+            self._reset_safe_actor_probe_runtime()
+            result.update(metrics)
+            result.update(
+                {
+                    "decision": decision,
+                    "probe_episodes_completed": probe_episodes_completed,
+                    "probe_episodes_maximum": probe_episodes_maximum,
+                    "probe_episodes_skipped": probe_episodes_skipped,
+                    "accepted_distance_m": (
+                        self._agent6_safe_actor_accepted_distance_m
+                    ),
+                    "accepted_minimum_distance_m": (
+                        self._agent6_safe_actor_accepted_minimum_distance_m
+                    ),
+                }
+            )
+            return result
+
         def record_safe_actor_probe(
             self,
             summary: Mapping[str, Any],
@@ -2843,8 +3438,16 @@ def make_phased_continuation_td3_class(TD3: Any):
                 "probe_repeats": self._agent6_safe_actor_probe_repeats,
                 "trial_index": context["trial_index"],
                 "trials_per_seed": self._agent6_safe_actor_trials_per_seed,
+                "probe_stage": context["probe_stage"],
                 "order_position": context["order_position"],
                 "decision": "pending",
+                "probe_episodes_completed": None,
+                "probe_episodes_maximum": (
+                    2
+                    * self._agent6_safe_actor_probe_repeats
+                    * self._agent6_safe_actor_trials_per_seed
+                ),
+                "probe_episodes_skipped": None,
                 "median_distance_m": None,
                 "minimum_distance_m": None,
                 "reference_median_distance_m": None,
@@ -2852,6 +3455,9 @@ def make_phased_continuation_td3_class(TD3: Any):
                 "paired_median_delta_m": None,
                 "worst_paired_delta_m": None,
                 "paired_regressions": None,
+                "worst_order_position_delta_m": None,
+                "order_position_regressions": None,
+                "order_position_deltas_m": None,
                 "accepted_distance_m": self._agent6_safe_actor_accepted_distance_m,
                 "accepted_minimum_distance_m": (
                     self._agent6_safe_actor_accepted_minimum_distance_m
@@ -2872,6 +3478,10 @@ def make_phased_continuation_td3_class(TD3: Any):
                 self._agent6_safe_actor_candidate_order_positions.append(
                     int(context["order_position"])
                 )
+            result["probe_episodes_completed"] = (
+                len(self._agent6_safe_actor_reference_distances_m)
+                + len(self._agent6_safe_actor_candidate_distances_m)
+            )
 
             order = self._current_safe_actor_probe_order()
             if self._agent6_safe_actor_probe_order_position == 0:
@@ -2888,12 +3498,87 @@ def make_phased_continuation_td3_class(TD3: Any):
                 self._agent6_safe_actor_probe_seed_index + 1
                 >= self._agent6_safe_actor_probe_repeats
             )
+            completed_trial = self._agent6_safe_actor_probe_trial_index + 1
+
+            if (
+                completed_trial
+                == self._agent6_safe_actor_screening_trials_per_seed
+            ):
+                seed_start = (
+                    self._agent6_safe_actor_probe_seed_index
+                    * self._agent6_safe_actor_trials_per_seed
+                )
+                screening = self._compare_safe_actor_probes(
+                    seed_count=1,
+                    trials_per_seed=(
+                        self._agent6_safe_actor_screening_trials_per_seed
+                    ),
+                    start=seed_start,
+                    stop=(
+                        seed_start
+                        + self._agent6_safe_actor_screening_trials_per_seed
+                    ),
+                    minimum_improvement_m=0.0,
+                    maximum_regression_m=(
+                        self._agent6_safe_actor_screening_max_regression_m
+                    ),
+                )
+                screening_limit = (
+                    self._agent6_safe_actor_screening_max_regression_m
+                )
+                screening_failed = (
+                    screening.worst_paired_delta_m < -screening_limit
+                    or screening.worst_order_position_delta_m
+                    < -screening_limit
+                )
+                if screening_failed:
+                    return self._resolve_safe_actor_comparison(
+                        result,
+                        screening,
+                        decision="rolled_back_screening",
+                    )
+                result.update(self._safe_actor_comparison_metrics(screening))
+                result["decision"] = "screening_passed"
+                self._agent6_safe_actor_probe_trial_index += 1
+                self._agent6_safe_actor_probe_order_position = 0
+                self._activate_safe_actor_probe_mode(
+                    self._current_safe_actor_probe_order()[0]
+                )
+                return result
+
+            if final_trial and not final_seed:
+                completed_seeds = self._agent6_safe_actor_probe_seed_index + 1
+                completed_values = (
+                    completed_seeds * self._agent6_safe_actor_trials_per_seed
+                )
+                confirmed = self._compare_safe_actor_probes(
+                    seed_count=completed_seeds,
+                    trials_per_seed=self._agent6_safe_actor_trials_per_seed,
+                    stop=completed_values,
+                )
+                final_limit = self._agent6_safe_actor_max_paired_regression_m
+                irreversibly_failed = (
+                    confirmed.worst_paired_delta_m < -final_limit
+                    or confirmed.worst_order_position_delta_m < -final_limit
+                )
+                if irreversibly_failed:
+                    return self._resolve_safe_actor_comparison(
+                        result,
+                        confirmed,
+                        decision="rolled_back_early",
+                    )
+                result.update(self._safe_actor_comparison_metrics(confirmed))
+                result["decision"] = "seed_confirmed"
+                self._agent6_safe_actor_probe_seed_index += 1
+                self._agent6_safe_actor_probe_trial_index = 0
+                self._agent6_safe_actor_probe_order_position = 0
+                self._activate_safe_actor_probe_mode(
+                    self._current_safe_actor_probe_order()[0]
+                )
+                return result
+
             if not (final_trial and final_seed):
-                if final_trial:
-                    self._agent6_safe_actor_probe_seed_index += 1
-                    self._agent6_safe_actor_probe_trial_index = 0
-                else:
-                    self._agent6_safe_actor_probe_trial_index += 1
+                self._agent6_safe_actor_probe_trial_index += 1
                 self._agent6_safe_actor_probe_order_position = 0
                 self._activate_safe_actor_probe_mode(
                     self._current_safe_actor_probe_order()[0]
@@ -2901,88 +3586,15 @@ def make_phased_continuation_td3_class(TD3: Any):
                 result["decision"] = "trial_complete"
                 return result
 
-            comparison = safe_actor_probe_decision(
-                self._agent6_safe_actor_reference_distances_m,
-                self._agent6_safe_actor_candidate_distances_m,
+            comparison = self._compare_safe_actor_probes(
                 seed_count=self._agent6_safe_actor_probe_repeats,
                 trials_per_seed=self._agent6_safe_actor_trials_per_seed,
-                reference_order_positions=(
-                    self._agent6_safe_actor_reference_order_positions
-                ),
-                candidate_order_positions=(
-                    self._agent6_safe_actor_candidate_order_positions
-                ),
-                minimum_improvement_m=self._agent6_safe_actor_min_improvement_m,
-                maximum_paired_regression_m=(
-                    self._agent6_safe_actor_max_paired_regression_m
-                ),
             )
-            if comparison.decision == "accepted":
-                self._restore_safe_actor_candidate()
-                self._agent6_safe_actor_accepted_distance_m = (
-                    comparison.candidate_median_distance_m
-                )
-                self._agent6_safe_actor_accepted_minimum_distance_m = (
-                    comparison.candidate_minimum_distance_m
-                )
-                self._agent6_safe_actor_accepted_blocks += 1
-                self._snapshot_safe_actor()
-            else:
-                self._restore_safe_actor()
-                self._agent6_safe_actor_rolled_back_blocks += 1
-            self._agent6_safe_actor_last_decision = {
-                "candidate_id": context["candidate_id"],
-                "decision": comparison.decision,
-            }
-            self._agent6_safe_actor_candidate_updates = 0
-            self._agent6_safe_actor_waiting_for_probe = False
-            self._agent6_safe_actor_probe_phase = "idle"
-            self._agent6_safe_actor_probe_seed_index = 0
-            self._agent6_safe_actor_probe_trial_index = 0
-            self._agent6_safe_actor_probe_order_position = 0
-            self._agent6_safe_actor_probe_seeds = ()
-            self._agent6_safe_actor_reference_distances_m = []
-            self._agent6_safe_actor_candidate_distances_m = []
-            self._agent6_safe_actor_reference_order_positions = []
-            self._agent6_safe_actor_candidate_order_positions = []
-            self._clear_safe_actor_candidate_snapshot()
-            result.update(
-                {
-                    "decision": comparison.decision,
-                    "median_distance_m": comparison.candidate_median_distance_m,
-                    "minimum_distance_m": comparison.candidate_minimum_distance_m,
-                    "reference_median_distance_m": (
-                        comparison.reference_median_distance_m
-                    ),
-                    "reference_minimum_distance_m": (
-                        comparison.reference_minimum_distance_m
-                    ),
-                    "aggregate_median_gain_m": (
-                        comparison.aggregate_median_gain_m
-                    ),
-                    "minimum_gain_m": comparison.minimum_gain_m,
-                    "paired_median_delta_m": comparison.paired_median_delta_m,
-                    "worst_paired_delta_m": comparison.worst_paired_delta_m,
-                    "paired_regressions": comparison.paired_regressions,
-                    "paired_deltas_m": list(comparison.paired_deltas_m),
-                    "raw_paired_regressions": (
-                        comparison.raw_paired_regressions
-                    ),
-                    "reference_seed_medians_m": list(
-                        comparison.reference_seed_medians_m
-                    ),
-                    "candidate_seed_medians_m": list(
-                        comparison.candidate_seed_medians_m
-                    ),
-                    "accepted_distance_m": (
-                        self._agent6_safe_actor_accepted_distance_m
-                    ),
-                    "accepted_minimum_distance_m": (
-                        self._agent6_safe_actor_accepted_minimum_distance_m
-                    ),
-                }
+            return self._resolve_safe_actor_comparison(
+                result,
+                comparison,
+                decision=comparison.decision,
             )
-            return result
 
         def finalize_safe_actor_candidate(self) -> dict[str, Any] | None:
             candidate_updates = int(
@@ -2994,18 +3606,7 @@ def make_phased_continuation_td3_class(TD3: Any):
                 return None
             candidate_id = self._agent6_safe_actor_candidate_id
             self._restore_safe_actor()
-            self._agent6_safe_actor_candidate_updates = 0
-            self._agent6_safe_actor_waiting_for_probe = False
-            self._agent6_safe_actor_probe_phase = "idle"
-            self._agent6_safe_actor_probe_seed_index = 0
-            self._agent6_safe_actor_probe_trial_index = 0
-            self._agent6_safe_actor_probe_order_position = 0
-            self._agent6_safe_actor_probe_seeds = ()
-            self._agent6_safe_actor_reference_distances_m = []
-            self._agent6_safe_actor_candidate_distances_m = []
-            self._agent6_safe_actor_reference_order_positions = []
-            self._agent6_safe_actor_candidate_order_positions = []
-            self._clear_safe_actor_candidate_snapshot()
+            self._reset_safe_actor_probe_runtime()
             self._agent6_safe_actor_rolled_back_blocks += 1
             self._agent6_safe_actor_last_decision = {
                 "candidate_id": candidate_id,
@@ -3075,6 +3676,7 @@ def make_phased_continuation_td3_class(TD3: Any):
             return self._safe_actor_action_delta(observations)
 
         def train(self, gradient_steps: int, batch_size: int = 100) -> None:
+            self._apply_training_budget_progress()
             actor_schedule = getattr(
                 self,
                 "_agent6_actor_learning_rate_schedule",
@@ -3085,10 +3687,11 @@ def make_phased_continuation_td3_class(TD3: Any):
                 return
 
             self.policy.set_training_mode(True)
+            budget_timestep = self._training_budget_timestep()
             critic_learning_rate = self.lr_schedule(
                 self._current_progress_remaining
             )
-            actor_learning_rate = float(actor_schedule(self.num_timesteps))
+            actor_learning_rate = float(actor_schedule(budget_timestep))
             update_learning_rate(self.critic.optimizer, critic_learning_rate)
             update_learning_rate(self.actor.optimizer, actor_learning_rate)
             self.logger.record("train/learning_rate", critic_learning_rate)
@@ -3096,7 +3699,7 @@ def make_phased_continuation_td3_class(TD3: Any):
             self.logger.record("train/actor_learning_rate", actor_learning_rate)
 
             actor_updates_enabled = (
-                self.num_timesteps
+                budget_timestep
                 > int(getattr(self, "_agent6_actor_updates_start_at", 0))
                 and actor_learning_rate > 0.0
                 and not self.safe_actor_probe_required()
@@ -3195,9 +3798,13 @@ def make_phased_continuation_td3_class(TD3: Any):
                             self._project_safe_actor(constraint_observations)
                         )
                         self._agent6_safe_actor_candidate_updates += 1
+                        updates_per_probe = (
+                            self._agent6_safe_actor_block_updates
+                            * self._agent6_safe_actor_blocks_per_probe
+                        )
                         if (
                             self._agent6_safe_actor_candidate_updates
-                            >= self._agent6_safe_actor_block_updates
+                            >= updates_per_probe
                         ):
                             self._agent6_safe_actor_waiting_for_probe = True
                             candidate_block_complete = True
@@ -3245,6 +3852,16 @@ def make_phased_continuation_td3_class(TD3: Any):
                 )
             if critic_losses:
                 self.logger.record("train/critic_loss", np.mean(critic_losses))
+            budget_state = getattr(self, "_agent6_training_budget_state", None)
+            if budget_state is not None:
+                self.logger.record(
+                    "time/training_budget_steps",
+                    budget_state.training_steps,
+                )
+                self.logger.record(
+                    "time/probe_overhead_steps",
+                    budget_state.probe_steps,
+                )
             if getattr(self, "_agent6_safe_actor_enabled", False):
                 status = self.safe_actor_status()
                 self.logger.record(
@@ -3260,8 +3877,20 @@ def make_phased_continuation_td3_class(TD3: Any):
                     status["rolled_back_blocks"],
                 )
                 self.logger.record(
+                    "train/safe_actor_screened_out_blocks",
+                    status["screened_out_blocks"],
+                )
+                self.logger.record(
+                    "train/safe_actor_early_rolled_back_blocks",
+                    status["early_rolled_back_blocks"],
+                )
+                self.logger.record(
                     "train/safe_actor_policy_equivalent_blocks",
                     status["policy_equivalent_blocks"],
+                )
+                self.logger.record(
+                    "train/safe_actor_probe_episodes_skipped",
+                    status["probe_episodes_skipped"],
                 )
 
     return PhasedContinuationTD3
@@ -3328,7 +3957,24 @@ def parse_args() -> argparse.Namespace:
             "checkpoint."
         ),
     )
-    parser.add_argument("--total-timesteps", type=int, default=100_000)
+    parser.add_argument(
+        "--total-timesteps",
+        type=int,
+        default=100_000,
+        help=(
+            "Non-probe environment interactions requested for training. "
+            "Evaluation overhead is counted separately."
+        ),
+    )
+    parser.add_argument(
+        "--max-probe-overhead-steps",
+        type=int,
+        default=None,
+        help=(
+            "Hard ceiling for evaluation interactions excluded from the "
+            "training-step target. Defaults to ten times --total-timesteps."
+        ),
+    )
     parser.add_argument("--track", default=DEFAULT_TRACK_NAME)
     parser.add_argument(
         "--resume-from",
@@ -3404,7 +4050,16 @@ def parse_args() -> argparse.Namespace:
         "--safe-actor-block-updates",
         type=int,
         default=DEFAULT_SAFE_ACTOR_BLOCK_UPDATES,
-        help="Actor optimizer updates allowed before an acceptance probe set.",
+        help="Actor optimizer updates in each bounded trust-region block.",
+    )
+    parser.add_argument(
+        "--safe-actor-blocks-per-probe",
+        type=int,
+        default=DEFAULT_SAFE_ACTOR_BLOCKS_PER_PROBE,
+        help=(
+            "Bounded actor-update blocks accumulated before an expensive "
+            "on-track robustness comparison."
+        ),
     )
     parser.add_argument(
         "--safe-actor-probe-repeats",
@@ -3417,8 +4072,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_SAFE_ACTOR_TRIALS_PER_SEED,
         help=(
-            "Trials per policy and challenge seed. Protocol v5 requires four "
+            "Trials per policy and challenge seed. Protocol v7 requires four "
             "so each policy runs twice in each order position."
+        ),
+    )
+    parser.add_argument(
+        "--safe-actor-screening-trials-per-seed",
+        type=int,
+        default=DEFAULT_SAFE_ACTOR_SCREENING_TRIALS_PER_SEED,
+        help=(
+            "Balanced trials per policy used for the inexpensive first-stage "
+            "candidate screen. Protocol v7 requires two."
         ),
     )
     parser.add_argument(
@@ -3444,6 +4108,21 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_SAFE_ACTOR_MAX_PAIRED_REGRESSION_M,
         help="Largest permitted candidate loss on any matched challenge seed.",
+    )
+    parser.add_argument(
+        "--safe-actor-screening-max-regression-m",
+        type=float,
+        default=DEFAULT_SAFE_ACTOR_SCREENING_MAX_REGRESSION_M,
+        help=(
+            "Relaxed seed or order-position loss that rejects a candidate "
+            "after the two-trial screen."
+        ),
+    )
+    parser.add_argument(
+        "--safe-actor-screening-max-episode-steps",
+        type=int,
+        default=DEFAULT_SAFE_ACTOR_SCREENING_MAX_EPISODE_STEPS,
+        help="Maximum TORCS steps for each first-stage screening rollout.",
     )
     parser.add_argument(
         "--safe-actor-anchor-batch-size",
@@ -3606,6 +4285,10 @@ def parse_args() -> argparse.Namespace:
         args.save_best_replay_buffer = args.continuation
     if args.safe_actor_improvement is None:
         args.safe_actor_improvement = args.continuation
+    if args.max_probe_overhead_steps is None:
+        args.max_probe_overhead_steps = (
+            args.total_timesteps * DEFAULT_PROBE_OVERHEAD_MULTIPLIER
+        )
 
     if not args.continuation and args.start_stage != "launch":
         parser.error("--start-stage requires --resume-from unless it is launch")
@@ -3636,6 +4319,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("continuation outputs must not overwrite --resume-from")
     if args.total_timesteps < 1:
         parser.error("--total-timesteps must be at least 1")
+    if args.max_probe_overhead_steps < 1:
+        parser.error("--max-probe-overhead-steps must be at least 1")
     if args.replay_refill_steps < 0:
         parser.error("--replay-refill-steps cannot be negative")
     if args.critic_warmup_steps < 0:
@@ -3660,6 +4345,8 @@ def parse_args() -> argparse.Namespace:
         )
     if args.safe_actor_block_updates < 1:
         parser.error("--safe-actor-block-updates must be at least 1")
+    if args.safe_actor_blocks_per_probe < 1:
+        parser.error("--safe-actor-blocks-per-probe must be at least 1")
     if args.safe_actor_probe_repeats < 3:
         parser.error("--safe-actor-probe-repeats must be at least 3")
     if args.safe_actor_probe_repeats % 2 == 0:
@@ -3668,6 +4355,15 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--safe-actor-trials-per-seed must be exactly "
             f"{AGENT6_ROBUSTNESS_TRIALS_PER_SEED} for the balanced protocol"
+        )
+    if (
+        args.safe_actor_screening_trials_per_seed
+        != DEFAULT_SAFE_ACTOR_SCREENING_TRIALS_PER_SEED
+    ):
+        parser.error(
+            "--safe-actor-screening-trials-per-seed must be exactly "
+            f"{DEFAULT_SAFE_ACTOR_SCREENING_TRIALS_PER_SEED} for the balanced "
+            "screening protocol"
         )
     if not 0 <= args.safe_actor_probe_base_seed <= MAX_REPRODUCIBLE_SEED:
         parser.error(
@@ -3692,6 +4388,19 @@ def parse_args() -> argparse.Namespace:
     ):
         parser.error(
             "--safe-actor-max-paired-regression-m must be finite and non-negative"
+        )
+    if (
+        not math.isfinite(args.safe_actor_screening_max_regression_m)
+        or args.safe_actor_screening_max_regression_m
+        < args.safe_actor_max_paired_regression_m
+    ):
+        parser.error(
+            "--safe-actor-screening-max-regression-m must be finite and no "
+            "smaller than --safe-actor-max-paired-regression-m"
+        )
+    if args.safe_actor_screening_max_episode_steps < 1:
+        parser.error(
+            "--safe-actor-screening-max-episode-steps must be at least 1"
         )
     if args.safe_actor_anchor_batch_size < 1:
         parser.error("--safe-actor-anchor-batch-size must be at least 1")
@@ -3769,6 +4478,10 @@ def main() -> None:
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     args.tensorboard_dir.mkdir(parents=True, exist_ok=True)
     args.replay_buffer_path.parent.mkdir(parents=True, exist_ok=True)
+    training_budget_state = TrainingBudgetState(
+        target_training_steps=args.total_timesteps,
+        maximum_probe_steps=args.max_probe_overhead_steps,
+    )
 
     env_class = make_training_env_class(gym, spaces)
     raw_env = env_class(
@@ -3789,6 +4502,10 @@ def main() -> None:
             "replay_refill" if args.continuation else "warmup"
         ),
         use_custom_warmup_action_space=not args.continuation,
+        training_budget_state=training_budget_state,
+        safe_actor_screening_max_episode_steps=(
+            args.safe_actor_screening_max_episode_steps
+        ),
     )
     raw_env.action_space.seed(args.seed)
     raw_env.observation_space.seed(args.seed)
@@ -3852,6 +4569,7 @@ def main() -> None:
         action_noise=action_noise,
         learning_rate_schedule=learning_rate_schedule,
     )
+    model.configure_training_budget(training_budget_state)
     if args.continuation:
         actor_learning_rate_schedule = gradual_actor_learning_rate_schedule(
             args.actor_learning_rate,
@@ -3867,11 +4585,18 @@ def main() -> None:
             safe_actor_max_action_delta=args.safe_actor_max_action_delta,
             safe_actor_gradient_norm=args.safe_actor_gradient_norm,
             safe_actor_block_updates=args.safe_actor_block_updates,
+            safe_actor_blocks_per_probe=args.safe_actor_blocks_per_probe,
             safe_actor_probe_repeats=args.safe_actor_probe_repeats,
             safe_actor_trials_per_seed=args.safe_actor_trials_per_seed,
+            safe_actor_screening_trials_per_seed=(
+                args.safe_actor_screening_trials_per_seed
+            ),
             safe_actor_min_improvement_m=args.safe_actor_min_improvement_m,
             safe_actor_max_paired_regression_m=(
                 args.safe_actor_max_paired_regression_m
+            ),
+            safe_actor_screening_max_regression_m=(
+                args.safe_actor_screening_max_regression_m
             ),
             safe_actor_anchor_batch_size=args.safe_actor_anchor_batch_size,
             safe_actor_probe_base_seed=args.safe_actor_probe_base_seed,
@@ -3888,9 +4613,14 @@ def main() -> None:
             f"critic warm-up={args.critic_warmup_steps:,}, "
             f"actor unfreeze={args.actor_unfreeze_steps:,} steps; "
             f"safe actor blocks={'on' if args.safe_actor_improvement else 'off'}; "
+            f"actor updates per robustness probe="
+            f"{args.safe_actor_block_updates * args.safe_actor_blocks_per_probe:,}; "
             f"robust probes={args.safe_actor_probe_repeats} seeds x "
             f"{args.safe_actor_trials_per_seed} trials x 2 policies "
-            "per candidate."
+            "per candidate, with a "
+            f"{args.safe_actor_screening_trials_per_seed}-trial staged screen; "
+            f"training budget={args.total_timesteps:,} non-probe steps, "
+            f"probe ceiling={args.max_probe_overhead_steps:,} steps."
         )
 
     progress_state = TrainingProgressState()
@@ -3916,8 +4646,14 @@ def main() -> None:
             actor_full_unfreeze=actor_full_unfreeze_timestep(args),
             safe_probe_noise_factory=make_safe_probe_noise,
             safe_probe_noise_std=args.safe_actor_probe_noise_std,
+            training_budget_state=training_budget_state,
         ),
-        make_checkpoint_callback(CheckpointCallback, args),
+        make_checkpoint_callback(
+            CheckpointCallback,
+            args,
+            BaseCallback=BaseCallback,
+            training_budget_state=training_budget_state,
+        ),
         EpisodeSummaryCallback(run_dir, progress_state),
         BestModelCallback(
             args.best_distance_model_path,
@@ -3926,25 +4662,37 @@ def main() -> None:
             progress_state,
             learning_starts=gradient_update_start_timestep(args),
             save_best_replay_buffer=args.save_best_replay_buffer,
+            training_budget_state=training_budget_state,
         ),
     ]
     if not args.no_progress_bar and not args.verbose_training:
         ConsoleProgressCallback = make_console_progress_callback_class(BaseCallback)
-        callbacks.append(ConsoleProgressCallback(args.total_timesteps, progress_state))
+        callbacks.append(
+            ConsoleProgressCallback(
+                args.total_timesteps,
+                progress_state,
+                training_budget_state=training_budget_state,
+            )
+        )
     callback = CallbackList(callbacks)
 
     try:
         model.learn(
-            total_timesteps=args.total_timesteps,
+            total_timesteps=training_budget_state.maximum_environment_steps,
             callback=callback,
             reset_num_timesteps=True,
             log_interval=10,
         )
-        end_summary = raw_env.write_end_of_run_summary("total_timesteps_reached")
+        end_summary = raw_env.write_end_of_run_summary(
+            training_budget_state.stop_reason or "environment_step_limit_reached"
+        )
         model.save(str(args.model_path))
         if args.save_replay_buffer:
             model.save_replay_buffer(str(args.replay_buffer_path))
         metadata["finished_at"] = datetime.now(timezone.utc).isoformat()
+        metadata["timestep_budget"]["run_state"] = (
+            training_budget_state.as_dict()
+        )
         safe_actor_status = getattr(model, "safe_actor_status", None)
         if callable(safe_actor_status):
             metadata["safe_actor_improvement"]["run_state"] = safe_actor_status()
@@ -3952,6 +4700,19 @@ def main() -> None:
             metadata["end_of_run_summary"] = end_summary
         write_json(run_dir / "training_metadata.json", metadata)
         write_json(metadata_path_for_policy(args.model_path), metadata)
+        if training_budget_state.stop_reason == "probe_overhead_limit_reached":
+            print(
+                "Warning: stopped at the probe-overhead safety ceiling before "
+                "the requested training budget was complete."
+            )
+        print(
+            "Budget result: "
+            f"training={training_budget_state.training_steps:,}/"
+            f"{training_budget_state.target_training_steps:,}, "
+            f"probes={training_budget_state.probe_steps:,}/"
+            f"{training_budget_state.maximum_probe_steps:,}, "
+            f"environment={training_budget_state.environment_steps:,}."
+        )
         print(f"Saved Agent 6 TD3 model to {args.model_path}")
         print(f"Saved training run logs to {run_dir}")
     finally:

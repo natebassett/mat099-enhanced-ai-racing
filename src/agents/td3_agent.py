@@ -409,6 +409,26 @@ def order_stratified_seed_aggregates(
     trials_per_seed: int,
 ) -> tuple[float, ...]:
     """Aggregate each order position first, then weight positions equally."""
+    position_medians = order_stratified_seed_position_medians(
+        values,
+        order_positions,
+        seed_count=seed_count,
+        trials_per_seed=trials_per_seed,
+    )
+    return tuple(
+        float(np.mean(tuple(seed_positions.values())))
+        for seed_positions in position_medians
+    )
+
+
+def order_stratified_seed_position_medians(
+    values: list[float] | tuple[float, ...],
+    order_positions: list[int] | tuple[int, ...],
+    *,
+    seed_count: int,
+    trials_per_seed: int,
+) -> tuple[dict[int, float], ...]:
+    """Return each seed's median metric keyed by execution-order position."""
     seeds = int(seed_count)
     trials = int(trials_per_seed)
     if seeds < 1 or trials < 1:
@@ -428,7 +448,7 @@ def order_stratified_seed_aggregates(
 
     value_rows = array.reshape(seeds, trials)
     position_rows = positions.reshape(seeds, trials)
-    aggregates: list[float] = []
+    aggregates: list[dict[int, float]] = []
     for seed_values, seed_positions in zip(value_rows, position_rows):
         unique_positions = sorted(set(int(value) for value in seed_positions))
         position_counts = [
@@ -439,11 +459,13 @@ def order_stratified_seed_aggregates(
             raise ValueError(
                 "each order position must occur equally often within every seed"
             )
-        position_medians = [
-            float(np.median(seed_values[seed_positions == position]))
+        position_medians = {
+            position: float(
+                np.median(seed_values[seed_positions == position])
+            )
             for position in unique_positions
-        ]
-        aggregates.append(float(np.mean(position_medians)))
+        }
+        aggregates.append(position_medians)
     return tuple(aggregates)
 
 

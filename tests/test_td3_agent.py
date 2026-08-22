@@ -522,6 +522,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(accepted.candidate_median_distance_m, 1440.0)
         self.assertEqual(accepted.candidate_minimum_distance_m, 1310.0)
         self.assertEqual(accepted.worst_paired_delta_m, 10.0)
+        self.assertEqual(accepted.worst_order_position_delta_m, 10.0)
 
         aggregate_improvement_with_seed_collapse = (
             train_td3_agent.safe_actor_probe_decision(
@@ -549,6 +550,22 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             aggregate_improvement_with_seed_collapse.worst_paired_delta_m,
             -200.0,
         )
+
+    def test_safe_actor_rejects_hidden_order_position_collapse(self):
+        comparison = train_td3_agent.safe_actor_probe_decision(
+            [1000.0, 1000.0, 1000.0, 1000.0],
+            [700.0, 1400.0, 700.0, 1400.0],
+            seed_count=1,
+            trials_per_seed=4,
+            minimum_improvement_m=5.0,
+            maximum_paired_regression_m=100.0,
+        )
+
+        self.assertEqual(comparison.candidate_median_distance_m, 1050.0)
+        self.assertEqual(comparison.worst_paired_delta_m, 50.0)
+        self.assertEqual(comparison.worst_order_position_delta_m, -300.0)
+        self.assertEqual(comparison.order_position_regressions, 1)
+        self.assertEqual(comparison.decision, "rolled_back")
 
     def test_balanced_pair_positions_split_each_policy_two_and_two(self):
         reference, candidate = balanced_pair_order_positions(
@@ -961,6 +978,62 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertTrue(summary["curriculum_eligible"])
         self.assertEqual(env.accepted, [1760.0])
 
+    def test_exploration_callback_stops_on_non_probe_training_budget(self):
+        class FakeBaseCallback:
+            def __init__(self, verbose=0):
+                self.locals = {}
+                self.num_timesteps = 1
+
+        class FakeModel:
+            action_noise = None
+            gradient_steps = 1
+
+        class FakeEnv:
+            def __init__(self):
+                self.modes = []
+
+            def set_policy_mode(self, **mode):
+                self.modes.append(mode)
+
+        budget = train_td3_agent.TrainingBudgetState(1, 10)
+        env = FakeEnv()
+        Callback = train_td3_agent.make_exploration_schedule_callback_class(
+            FakeBaseCallback
+        )
+        callback = Callback(
+            env,
+            lambda sigma: ("noise", sigma),
+            learning_starts=0,
+            initial_sigma=0.02,
+            final_sigma=0.006,
+            decay_steps=100_000,
+            probe_interval=10,
+            training_gradient_steps=1,
+            training_budget_state=budget,
+        )
+        callback.model = FakeModel()
+        summary = {
+            "policy_controlled": True,
+            "deterministic_probe": False,
+        }
+        callback.locals = {
+            "infos": [
+                {
+                    "deterministic_probe": False,
+                    "episode_summary": summary,
+                }
+            ]
+        }
+
+        keep_training = callback._on_step()
+
+        self.assertFalse(keep_training)
+        self.assertEqual(budget.training_steps, 1)
+        self.assertEqual(budget.probe_steps, 0)
+        self.assertEqual(summary["training_budget_timestep"], 1)
+        self.assertEqual(summary["probe_overhead_timestep"], 0)
+        self.assertTrue(env.modes[-1]["deterministic_probe"])
+
     def test_default_training_args_use_stable_td3_warmup(self):
         with mock.patch.object(sys, "argv", [str(SCRIPT_PATH)]):
             args = train_td3_agent.parse_args()
@@ -985,12 +1058,17 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(args.safe_actor_max_action_delta, 0.01)
         self.assertEqual(args.safe_actor_gradient_norm, 1.0)
         self.assertEqual(args.safe_actor_block_updates, 100)
+        self.assertEqual(args.safe_actor_blocks_per_probe, 10)
         self.assertEqual(args.safe_actor_probe_repeats, 5)
         self.assertEqual(args.safe_actor_trials_per_seed, 4)
+        self.assertEqual(args.safe_actor_screening_trials_per_seed, 2)
         self.assertEqual(args.safe_actor_probe_base_seed, 20260820)
         self.assertEqual(args.safe_actor_probe_noise_std, 0.006)
         self.assertEqual(args.safe_actor_min_improvement_m, 5.0)
         self.assertEqual(args.safe_actor_max_paired_regression_m, 100.0)
+        self.assertEqual(args.safe_actor_screening_max_regression_m, 250.0)
+        self.assertEqual(args.safe_actor_screening_max_episode_steps, 1_200)
+        self.assertEqual(args.max_probe_overhead_steps, 1_000_000)
         self.assertEqual(args.safe_actor_anchor_batch_size, 256)
         self.assertFalse(args.allow_non_champion_source)
         self.assertEqual(args.warmup_steer_std, 0.18)
@@ -1058,12 +1136,17 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(args.safe_actor_max_action_delta, 0.01)
         self.assertEqual(args.safe_actor_gradient_norm, 1.0)
         self.assertEqual(args.safe_actor_block_updates, 100)
+        self.assertEqual(args.safe_actor_blocks_per_probe, 10)
         self.assertEqual(args.safe_actor_probe_repeats, 5)
         self.assertEqual(args.safe_actor_trials_per_seed, 4)
+        self.assertEqual(args.safe_actor_screening_trials_per_seed, 2)
         self.assertEqual(args.safe_actor_probe_base_seed, 20260820)
         self.assertEqual(args.safe_actor_probe_noise_std, 0.006)
         self.assertEqual(args.safe_actor_min_improvement_m, 5.0)
         self.assertEqual(args.safe_actor_max_paired_regression_m, 100.0)
+        self.assertEqual(args.safe_actor_screening_max_regression_m, 250.0)
+        self.assertEqual(args.safe_actor_screening_max_episode_steps, 1_200)
+        self.assertEqual(args.max_probe_overhead_steps, 1_000_000)
         self.assertTrue(args.allow_non_champion_source)
         self.assertEqual(train_td3_agent.policy_action_start_timestep(args), 0)
         self.assertEqual(
@@ -1218,7 +1301,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(reference_two["order_position"], 2)
         self.assertEqual(
             model.record_safe_actor_probe({"distance_m": 100.0})["decision"],
-            "trial_complete",
+            "screening_passed",
         )
 
         reference_three = model.safe_actor_probe_context()
@@ -1242,6 +1325,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
         self.assertEqual(accepted["decision"], "accepted")
         self.assertEqual(accepted["paired_deltas_m"], [11.5])
+        self.assertEqual(accepted["worst_order_position_delta_m"], 11.0)
         self.assertEqual(accepted["candidate_seed_medians_m"], [111.5])
         self.assertFalse(model.safe_actor_probe_required())
         self.assertEqual(model.safe_actor_status()["accepted_blocks"], 1)
@@ -1256,6 +1340,117 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
         self.assertTrue(set(first_suite).isdisjoint(second_suite))
         model.finalize_safe_actor_candidate()
+
+    def test_safe_actor_staged_screening_and_exact_early_rejection(self):
+        import gymnasium as gym
+        import torch
+        from stable_baselines3 import TD3
+
+        class TinyEnv(gym.Env):
+            observation_space = gym.spaces.Box(
+                -1.0,
+                1.0,
+                shape=(4,),
+                dtype=np.float32,
+            )
+            action_space = gym.spaces.Box(
+                -1.0,
+                1.0,
+                shape=(3,),
+                dtype=np.float32,
+            )
+
+            def reset(self, *, seed=None, options=None):
+                super().reset(seed=seed)
+                return np.zeros(4, dtype=np.float32), {}
+
+            def step(self, action):
+                return np.zeros(4, dtype=np.float32), 0.0, False, False, {}
+
+        SafeTD3 = train_td3_agent.make_phased_continuation_td3_class(TD3)
+        model = SafeTD3(
+            "MlpPolicy",
+            TinyEnv(),
+            policy_kwargs={"net_arch": [8, 8]},
+            learning_starts=0,
+            buffer_size=32,
+            batch_size=4,
+            device="cpu",
+        )
+        model.configure_continuation_updates(
+            actor_learning_rate_schedule=lambda _: 1e-4,
+            actor_updates_start_at=0,
+            safe_actor_improvement=True,
+            safe_actor_probe_repeats=3,
+            safe_actor_trials_per_seed=4,
+            safe_actor_screening_trials_per_seed=2,
+            safe_actor_max_paired_regression_m=100.0,
+            safe_actor_screening_max_regression_m=250.0,
+            safe_actor_probe_base_seed=2468,
+        )
+
+        def begin_candidate(candidate_id: int) -> None:
+            with torch.no_grad():
+                next(model.actor.parameters()).add_(0.01)
+            model._agent6_safe_actor_candidate_id = candidate_id
+            model._agent6_safe_actor_candidate_updates = 1
+            model._agent6_safe_actor_waiting_for_probe = True
+
+        def record_pair(
+            reference_distance_m: float,
+            candidate_distance_m: float,
+        ):
+            result = None
+            for _ in range(2):
+                context = model.safe_actor_probe_context()
+                distance_m = (
+                    reference_distance_m
+                    if context["mode"] == "accepted_reference"
+                    else candidate_distance_m
+                )
+                result = model.record_safe_actor_probe(
+                    {"distance_m": distance_m}
+                )
+            return result
+
+        begin_candidate(1)
+        self.assertEqual(record_pair(1000.0, 600.0)["decision"], "trial_complete")
+        screened_out = record_pair(1000.0, 1400.0)
+
+        self.assertEqual(screened_out["decision"], "rolled_back_screening")
+        self.assertEqual(screened_out["paired_median_delta_m"], 0.0)
+        self.assertEqual(
+            screened_out["worst_order_position_delta_m"],
+            -400.0,
+        )
+        self.assertEqual(screened_out["probe_episodes_completed"], 4)
+        self.assertEqual(screened_out["probe_episodes_maximum"], 24)
+        self.assertEqual(screened_out["probe_episodes_skipped"], 20)
+        self.assertFalse(model.safe_actor_probe_required())
+
+        begin_candidate(2)
+        self.assertEqual(record_pair(1000.0, 1000.0)["decision"], "trial_complete")
+        self.assertEqual(
+            record_pair(1000.0, 1000.0)["decision"],
+            "screening_passed",
+        )
+        self.assertEqual(record_pair(1000.0, 700.0)["decision"], "trial_complete")
+        early_rejection = record_pair(1000.0, 1000.0)
+
+        self.assertEqual(early_rejection["decision"], "rolled_back_early")
+        self.assertEqual(early_rejection["worst_paired_delta_m"], -75.0)
+        self.assertEqual(
+            early_rejection["worst_order_position_delta_m"],
+            -150.0,
+        )
+        self.assertEqual(early_rejection["probe_episodes_completed"], 8)
+        self.assertEqual(early_rejection["probe_episodes_maximum"], 24)
+        status = model.safe_actor_status()
+        self.assertEqual(status["rolled_back_blocks"], 2)
+        self.assertEqual(status["screened_out_blocks"], 1)
+        self.assertEqual(status["early_rolled_back_blocks"], 1)
+        self.assertEqual(status["probe_episodes_skipped"], 36)
+        self.assertEqual(status["last_decision"]["probe_episodes_skipped"], 16)
 
     def test_safe_actor_skips_racing_policy_equivalent_candidate(self):
         import gymnasium as gym
@@ -1313,6 +1508,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             "policy_equivalent",
         )
         self.assertEqual(status["last_decision"]["probe_episodes_skipped"], 24)
+        self.assertEqual(status["probe_episodes_skipped"], 24)
 
     def test_safe_actor_model_rolls_back_degraded_candidate_exactly(self):
         import gymnasium as gym
@@ -1524,6 +1720,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             actor_updates_start_at=0,
             safe_actor_improvement=True,
             safe_actor_block_updates=2,
+            safe_actor_blocks_per_probe=1,
             safe_actor_probe_repeats=3,
         )
 
@@ -1585,6 +1782,18 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             "0.0001",
             "--learning-rate-final",
             "0.0003",
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            with self.assertRaises(SystemExit):
+                train_td3_agent.parse_args()
+
+    def test_screening_regression_limit_cannot_be_stricter_than_final_guard(self):
+        argv = [
+            str(SCRIPT_PATH),
+            "--safe-actor-max-paired-regression-m",
+            "100",
+            "--safe-actor-screening-max-regression-m",
+            "99",
         ]
         with mock.patch.object(sys, "argv", argv):
             with self.assertRaises(SystemExit):
@@ -1779,6 +1988,60 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
         self.assertIn("stage=First Corner Survival", line)
         self.assertIn("best_dist=340m", line)
+
+    def test_training_budget_excludes_probes_and_enforces_both_limits(self):
+        budget = train_td3_agent.TrainingBudgetState(
+            target_training_steps=3,
+            maximum_probe_steps=2,
+        )
+
+        budget.record_infos([{"deterministic_probe": False}])
+        budget.record_infos([{"deterministic_probe": True}])
+
+        self.assertEqual(budget.training_steps, 1)
+        self.assertEqual(budget.probe_steps, 1)
+        self.assertEqual(budget.environment_steps, 2)
+        self.assertAlmostEqual(budget.progress_remaining, 2.0 / 3.0)
+        self.assertFalse(budget.should_stop())
+
+        budget.record_infos([{"deterministic_probe": True}])
+
+        self.assertTrue(budget.should_stop())
+        self.assertEqual(budget.stop_reason, "probe_overhead_limit_reached")
+        self.assertEqual(budget.maximum_environment_steps, 5)
+
+        training_complete = train_td3_agent.TrainingBudgetState(2, 10)
+        training_complete.record_infos(
+            [
+                {"deterministic_probe": False},
+                {"deterministic_probe": False},
+            ]
+        )
+        self.assertEqual(
+            training_complete.stop_reason,
+            "training_budget_reached",
+        )
+
+    def test_safe_actor_screening_uses_short_matched_horizon(self):
+        stage = next(
+            stage
+            for stage in train_td3_agent.CURRICULUM
+            if stage.stage_id == "sector_progression"
+        )
+
+        screening_limit = train_td3_agent.safe_actor_probe_episode_step_limit(
+            stage,
+            probe_stage="screening",
+            screening_max_episode_steps=1_200,
+        )
+        confirmation_limit = train_td3_agent.safe_actor_probe_episode_step_limit(
+            stage,
+            probe_stage="confirmation",
+            screening_max_episode_steps=1_200,
+        )
+
+        self.assertEqual(screening_limit, 1_200)
+        self.assertEqual(confirmation_limit, stage.max_episode_steps)
 
     def test_launch_biased_warmup_action_space_samples_bounded_actions(self):
         action_space = train_td3_agent.make_scratch_action_space(
