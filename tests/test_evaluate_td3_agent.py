@@ -309,7 +309,7 @@ class Td3EvaluationTests(unittest.TestCase):
         self.assertEqual(first_actions, second_actions)
         self.assertNotEqual(first_actions, different_actions)
         self.assertTrue(
-            all(action[1:] == [0.0, 0.0] for action in first_actions)
+            all(action[1:] == [0.0] for action in first_actions)
         )
         first.reset()
         self.assertEqual(first_actions[0], first().tolist())

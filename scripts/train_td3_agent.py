@@ -27,6 +27,8 @@ if str(SRC_DIR) not in sys.path:
 ORIGINAL_COMMAND = " ".join(sys.argv)
 
 from agents.td3_agent import (  # noqa: E402
+    AGENT6_ACTION_SHAPE,
+    AGENT6_ACTION_SIZE,
     AGENT6_ACTION_VERSION,
     AGENT6_MODEL_FAMILY,
     AGENT6_OBSERVATION_VERSION,
@@ -55,6 +57,7 @@ from agents.td3_agent import (  # noqa: E402
     counterbalanced_pair_order,
     decode_td3_action,
     episode_metadata_is_deterministic_probe,
+    finite_clamp,
     evaluation_checkpoint_is_verified,
     finite_float,
     metadata_path_for_policy,
@@ -62,6 +65,7 @@ from agents.td3_agent import (  # noqa: E402
     order_stratified_seed_position_medians,
     parameter_state_dicts_are_identical,
     policy_contract_mismatches,
+    policy_uses_legacy_action_contract,
     rate_limit_td3_action,
     read_policy_metadata,
     shift_gears,
@@ -111,7 +115,7 @@ SAFE_ACTOR_ROBUSTNESS_PROTOCOL = (
     "agent6_budgeted_multifidelity_order_position_guard_v8"
 )
 
-REWARD_VERSION = "agent6_td3_reward_v1_raw_progress_curriculum"
+REWARD_VERSION = "agent6_td3_reward_v2_clear_track_anti_stall"
 OFF_TRACK_GRACE_STEPS = 4
 HARD_TRACK_BOUNDARY = 1.18
 SOFT_TRACK_BOUNDARY = 1.04
@@ -273,17 +277,40 @@ STEP_COLUMNS = [
     "front_sensor",
     "min_track_sensor",
     "raw_steer",
-    "raw_accel",
-    "raw_brake",
+    "raw_longitudinal",
+    "raw_accel_command",
+    "raw_brake_command",
+    "pedal_conflict",
     "steer",
     "accel",
     "brake",
     "gear",
     "reward",
+    "reward_progress",
+    "reward_aligned_speed",
+    "reward_new_distance",
+    "reward_stable_progress_bonus",
+    "reward_survival_cost",
+    "reward_lateral_position_penalty",
+    "reward_angle_penalty",
+    "reward_lateral_speed_penalty",
+    "reward_speed_steer_penalty",
+    "reward_spin_penalty",
+    "reward_closing_danger_penalty",
+    "reward_clear_track_anti_stall_penalty",
+    "reward_stalled_penalty",
+    "reward_off_track_penalty",
+    "reward_crash_penalty",
+    "reward_backwards_penalty",
+    "reward_stuck_penalty",
+    "reward_terminal_failure_penalty",
+    "reward_stage_success_bonus",
+    "reward_lap_completion_bonus",
     "terminated",
     "truncated",
     "termination_reason",
     "cur_lap_time",
+    *[f"track_sensor_{index}" for index in range(19)],
 ]
 
 
@@ -382,7 +409,10 @@ def continuation_source_errors(
     metadata = read_policy_metadata(path)
     errors = [
         f"continuation checkpoint contract mismatch: {key}"
-        for key in policy_contract_mismatches(metadata)
+        for key in policy_contract_mismatches(
+            metadata,
+            allow_legacy_action_contract=True,
+        )
     ]
     evaluation = metadata.get("best_evaluation")
     evaluation_repeats = (
@@ -818,7 +848,7 @@ def safe_actor_probe_decision(
     )
 
 
-def calculate_td3_reward(
+def calculate_td3_reward_components(
     telemetry: Mapping[str, Any],
     action: Mapping[str, Any],
     *,
@@ -831,7 +861,7 @@ def calculate_td3_reward(
     stage_success: bool = False,
     stuck: bool = False,
     terminal_failure: bool | None = None,
-) -> float:
+) -> dict[str, float]:
     stage = stage or CURRICULUM[0]
     sensors = track_sensors(telemetry)
     front_sensor = sensors[9] if len(sensors) > 9 else 200.0
@@ -851,31 +881,65 @@ def calculate_td3_reward(
     if terminal_failure is None:
         terminal_failure = off_track or crashed or backwards or stuck
 
-    reward = clamp(progress, -2.0, 10.0) * stage.progress_weight
-    reward += clamp(aligned_speed / 190.0, 0.0, 1.0) * 0.55
-    reward += clamp(new_distance, 0.0, 12.0) * stage.milestone_weight
+    components: dict[str, float] = {
+        "progress": clamp(progress, -2.0, 10.0) * stage.progress_weight,
+        "aligned_speed": clamp(aligned_speed / 190.0, 0.0, 1.0) * 0.55,
+        "new_distance": clamp(new_distance, 0.0, 12.0) * stage.milestone_weight,
+        "stable_progress_bonus": 0.0,
+        "survival_cost": -0.015,
+        "lateral_position_penalty": 0.0,
+        "angle_penalty": 0.0,
+        "lateral_speed_penalty": 0.0,
+        "speed_steer_penalty": 0.0,
+        "spin_penalty": 0.0,
+        "closing_danger_penalty": 0.0,
+        "clear_track_anti_stall_penalty": 0.0,
+        "stalled_penalty": 0.0,
+        "off_track_penalty": 0.0,
+        "crash_penalty": 0.0,
+        "backwards_penalty": 0.0,
+        "stuck_penalty": 0.0,
+        "terminal_failure_penalty": 0.0,
+        "stage_success_bonus": 0.0,
+        "lap_completion_bonus": 0.0,
+    }
     if progress > 0.18 and abs(track_position) < 0.85 and abs(angle) < 0.55:
-        reward += 0.45
-    if speed < 24.0 and progress > 0.08:
-        reward += 0.35
+        components["stable_progress_bonus"] = 0.45
 
-    reward -= 0.015
-    reward -= max(0.0, abs(track_position) - 0.45) * 1.6
-    reward -= max(0.0, abs(track_position) - 0.76) * 5.8
-    reward -= max(0.0, abs(track_position) - 0.92) * 12.0
-    reward -= max(0.0, abs(angle) - 0.10) * 1.1
-    reward -= max(0.0, abs(angle) - 0.45) * 4.5
-    reward -= max(0.0, abs(lateral_speed) - 4.0) * 0.10
-    reward -= max(0.0, abs(lateral_speed) - 12.0) * 0.24
+    components["lateral_position_penalty"] -= (
+        max(0.0, abs(track_position) - 0.45) * 1.6
+    )
+    components["lateral_position_penalty"] -= (
+        max(0.0, abs(track_position) - 0.76) * 5.8
+    )
+    components["lateral_position_penalty"] -= (
+        max(0.0, abs(track_position) - 0.92) * 12.0
+    )
+    components["angle_penalty"] -= max(0.0, abs(angle) - 0.10) * 1.1
+    components["angle_penalty"] -= max(0.0, abs(angle) - 0.45) * 4.5
+    components["lateral_speed_penalty"] -= (
+        max(0.0, abs(lateral_speed) - 4.0) * 0.10
+    )
+    components["lateral_speed_penalty"] -= (
+        max(0.0, abs(lateral_speed) - 12.0) * 0.24
+    )
 
     speed_pressure = clamp((speed - 40.0) / 115.0, 0.0, 1.0)
-    reward -= max(0.0, steer - 0.28) * speed_pressure * 5.5
-    reward -= max(0.0, steer - 0.55) * speed_pressure * 12.0
-    reward -= max(0.0, abs(angle) - 0.35) * speed_pressure * 7.0
-    reward -= max(0.0, abs(lateral_speed) - 7.0) * speed_pressure * 0.28
+    components["speed_steer_penalty"] -= (
+        max(0.0, steer - 0.28) * speed_pressure * 5.5
+    )
+    components["speed_steer_penalty"] -= (
+        max(0.0, steer - 0.55) * speed_pressure * 12.0
+    )
+    components["speed_steer_penalty"] -= (
+        max(0.0, abs(angle) - 0.35) * speed_pressure * 7.0
+    )
+    components["speed_steer_penalty"] -= (
+        max(0.0, abs(lateral_speed) - 7.0) * speed_pressure * 0.28
+    )
     if abs(angle) > 1.05 and speed > 18.0:
         spin_pressure = clamp((abs(angle) - 1.05) / 0.75, 0.0, 1.0)
-        reward -= 42.0 * spin_pressure
+        components["spin_penalty"] = -42.0 * spin_pressure
 
     closing_danger = front_sensor < 55.0 and speed > stage.safe_front_speed_kmh
     if closing_danger:
@@ -887,36 +951,105 @@ def calculate_td3_reward(
             1.0,
         )
         front_pressure = clamp((55.0 - front_sensor) / 55.0, 0.0, 1.0)
-        reward -= front_pressure * overspeed_pressure * 3.2
-        reward -= front_pressure * overspeed_pressure * max(0.0, 0.25 - brake) * 4.0
-        reward -= front_pressure * overspeed_pressure * accel * 2.4
+        components["closing_danger_penalty"] -= (
+            front_pressure * overspeed_pressure * 3.2
+        )
+        components["closing_danger_penalty"] -= (
+            front_pressure * overspeed_pressure * max(0.0, 0.25 - brake) * 4.0
+        )
+        components["closing_danger_penalty"] -= (
+            front_pressure * overspeed_pressure * accel * 2.4
+        )
+
+    clear_track = (
+        not off_track
+        and not backwards
+        and not crashed
+        and min_sensor >= 2.0
+        and front_sensor >= 24.0
+        and abs(angle) < 0.65
+        and episode_distance_m > 8.0
+    )
+    anti_stall_pressure = (
+        clamp((42.0 - speed) / 42.0, 0.0, 1.0)
+        * clamp((0.20 - progress) / 0.20, 0.0, 1.0)
+    )
+    if clear_track and anti_stall_pressure > 0.0:
+        accel = finite_float(action.get("accel"))
+        brake = finite_float(action.get("brake"))
+        throttle_gap = max(0.0, 0.35 - accel)
+        brake_drag = max(0.0, brake - 0.02)
+        components["clear_track_anti_stall_penalty"] = -anti_stall_pressure * (
+            2.2 + 2.4 * throttle_gap + 3.0 * brake_drag
+        )
 
     if progress < 0.03 and speed < 8.0:
-        reward -= 4.0
+        components["stalled_penalty"] = -4.0
     if min_sensor < 0.0:
-        reward -= 28.0
+        components["off_track_penalty"] -= 28.0
     if abs(track_position) > 1.0:
-        reward -= 42.0
+        components["off_track_penalty"] -= 42.0
     if crashed:
-        reward -= 65.0 + max(0.0, damage - previous_damage) * 0.15
+        components["crash_penalty"] = (
+            -65.0 - max(0.0, damage - previous_damage) * 0.15
+        )
     if backwards:
-        reward -= 145.0 + clamp(abs(speed) / 120.0, 0.0, 1.0) * 55.0
+        components["backwards_penalty"] = (
+            -145.0 - clamp(abs(speed) / 120.0, 0.0, 1.0) * 55.0
+        )
     if stuck:
-        reward -= 80.0
+        components["stuck_penalty"] = -80.0
     if terminal_failure and completed_lap is None and not stage_success:
         remaining = 1.0 - calculate_lap_completion_fraction(episode_distance_m)
-        reward -= stage.failure_penalty * (0.35 + 0.65 * remaining)
+        components["terminal_failure_penalty"] = (
+            -stage.failure_penalty * (0.35 + 0.65 * remaining)
+        )
     if stage_success:
-        reward += stage.success_reward
+        components["stage_success_bonus"] = stage.success_reward
     if completed_lap is not None:
-        reward += max(stage.success_reward, 850.0)
+        components["lap_completion_bonus"] = max(stage.success_reward, 850.0)
 
-    return float(clamp(reward, -450.0, 1000.0))
+    unclipped_total = float(sum(components.values()))
+    components["total_unclipped"] = unclipped_total
+    components["total"] = float(clamp(unclipped_total, -450.0, 1000.0))
+    return components
+
+
+def calculate_td3_reward(
+    telemetry: Mapping[str, Any],
+    action: Mapping[str, Any],
+    *,
+    previous_telemetry: Mapping[str, Any] | None = None,
+    previous_damage: float = 0.0,
+    stage: CurriculumStage | None = None,
+    episode_distance_m: float = 0.0,
+    previous_furthest_distance_m: float = 0.0,
+    completed_lap: float | None = None,
+    stage_success: bool = False,
+    stuck: bool = False,
+    terminal_failure: bool | None = None,
+) -> float:
+    return calculate_td3_reward_components(
+        telemetry,
+        action,
+        previous_telemetry=previous_telemetry,
+        previous_damage=previous_damage,
+        stage=stage,
+        episode_distance_m=episode_distance_m,
+        previous_furthest_distance_m=previous_furthest_distance_m,
+        completed_lap=completed_lap,
+        stage_success=stage_success,
+        stuck=stuck,
+        terminal_failure=terminal_failure,
+    )["total"]
 
 
 def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
     source_metadata = read_policy_metadata(args.resume_from)
     source_evaluation = source_metadata.get("best_evaluation")
+    source_uses_legacy_action_contract = policy_uses_legacy_action_contract(
+        source_metadata
+    )
     source_progress_m = (
         finite_float(source_evaluation.get("median_progress_m"))
         if isinstance(source_evaluation, Mapping)
@@ -933,7 +1066,7 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "action_version": AGENT6_ACTION_VERSION,
         "reward_version": REWARD_VERSION,
         "feature_names": FEATURE_NAMES,
-        "action_shape": [3],
+        "action_shape": AGENT6_ACTION_SHAPE,
         "algorithm": "TD3",
         "agent_name": "TD3 Scratch Racer",
         "agent_number": 6,
@@ -945,6 +1078,29 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "racing_line_imitation": False,
         "automatic_gear_shift": True,
         "actuator_rate_limited": True,
+        "action_contract": {
+            "outputs": ["steer", "signed_longitudinal"],
+            "signed_longitudinal": (
+                "positive values request throttle; negative values request brake"
+            ),
+            "exclusive_pedals_by_construction": True,
+        },
+        "reward_contract": {
+            "version": REWARD_VERSION,
+            "low_speed_creep_bonus": False,
+            "clear_track_anti_stall_penalty": True,
+            "logged_components": [
+                column.removeprefix("reward_")
+                for column in STEP_COLUMNS
+                if column.startswith("reward_")
+            ],
+        },
+        "telemetry_contract": {
+            "step_log": "steps.csv",
+            "all_track_sensors": [f"track_sensor_{index}" for index in range(19)],
+            "pedal_conflict_logged": True,
+            "reward_components_logged": True,
+        },
         "stage_success_requirements": dict(DEFAULT_STAGE_SUCCESS_REQUIREMENTS),
         "stage_success_window_size": DEFAULT_STAGE_SUCCESS_WINDOW_SIZE,
         "curriculum_promotion": "deterministic_probe_successes_within_rolling_window",
@@ -963,10 +1119,24 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "source_policy_path": (
                 str(args.resume_from) if args.resume_from is not None else None
             ),
+            "source_observation_version": source_metadata.get("observation_version"),
+            "source_action_version": source_metadata.get("action_version"),
+            "source_action_shape": source_metadata.get("action_shape"),
             "source_verified_evaluation_progress_m": source_progress_m,
             "source_verified_evaluation_minimum_progress_m": (
                 source_minimum_progress_m
             ),
+            "source_policy_contract_migration": {
+                "required": bool(source_uses_legacy_action_contract),
+                "reason": (
+                    "legacy_three_head_action_contract"
+                    if source_uses_legacy_action_contract
+                    else "current_contract_or_no_source"
+                ),
+                "target_observation_version": AGENT6_OBSERVATION_VERSION,
+                "target_action_version": AGENT6_ACTION_VERSION,
+                "target_action_shape": AGENT6_ACTION_SHAPE,
+            },
             "source_policy_guard": (
                 "not_applicable"
                 if not args.continuation
@@ -1159,7 +1329,7 @@ def make_scratch_action_space(
 ):
     class ScratchActionBox(spaces.Box):
         def __init__(self) -> None:
-            super().__init__(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
+            super().__init__(low=-1.0, high=1.0, shape=(AGENT6_ACTION_SIZE,), dtype=np.float32)
             self.warmup_action_mode = warmup_action_mode
             self.warmup_steer_std = max(0.0, float(warmup_steer_std))
             accel_min = clamp(float(warmup_accel_min), -1.0, 1.0)
@@ -1181,16 +1351,15 @@ def make_scratch_action_space(
 
             rng = getattr(self, "np_random", np.random.default_rng())
             steer = clamp(float(rng.normal(0.0, self.warmup_steer_std)), -1.0, 1.0)
-            accel = float(rng.uniform(self.warmup_accel_min, self.warmup_accel_max))
-            brake = 0.0
+            longitudinal = float(
+                rng.uniform(self.warmup_accel_min, self.warmup_accel_max)
+            )
             if float(rng.random()) < self.warmup_brake_probability:
-                accel = float(rng.uniform(-0.25, 0.20))
-                brake = float(rng.uniform(0.15, 0.85))
+                longitudinal = -float(rng.uniform(0.15, 0.85))
             return np.asarray(
                 [
                     steer,
-                    clamp(accel, -1.0, 1.0),
-                    clamp(brake, -1.0, 1.0),
+                    clamp(longitudinal, -1.0, 1.0),
                 ],
                 dtype=np.float32,
             )
@@ -1253,7 +1422,7 @@ def make_training_env_class(gym: Any, spaces: Any):
                 self.action_space = spaces.Box(
                     low=-1.0,
                     high=1.0,
-                    shape=(3,),
+                    shape=(AGENT6_ACTION_SIZE,),
                     dtype=np.float32,
                 )
             self.observation_space = spaces.Box(
@@ -1527,7 +1696,7 @@ def make_training_env_class(gym: Any, spaces: Any):
                 or backwards
                 or stuck
             )
-            reward = calculate_td3_reward(
+            reward_components = calculate_td3_reward_components(
                 telemetry,
                 action,
                 previous_telemetry=self.previous_telemetry,
@@ -1540,6 +1709,7 @@ def make_training_env_class(gym: Any, spaces: Any):
                 stuck=stuck,
                 terminal_failure=terminal_failure,
             )
+            reward = reward_components["total"]
 
             self.previous_damage = current_damage
             self.previous_telemetry = telemetry
@@ -1662,6 +1832,7 @@ def make_training_env_class(gym: Any, spaces: Any):
                 raw_values,
                 action,
                 reward,
+                reward_components,
                 terminated,
                 truncated,
                 reason,
@@ -1917,6 +2088,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             raw_action: np.ndarray,
             action: Mapping[str, Any],
             reward: float,
+            reward_components: Mapping[str, Any],
             terminated: bool,
             truncated: bool,
             reason: str,
@@ -1924,8 +2096,14 @@ def make_training_env_class(gym: Any, spaces: Any):
             if self._step_writer is None:
                 return
             sensors = track_sensors(telemetry)
-            padded = np.zeros(3, dtype=float)
-            padded[: min(3, len(raw_action))] = raw_action[:3]
+            padded = np.zeros(AGENT6_ACTION_SIZE, dtype=float)
+            padded[: min(AGENT6_ACTION_SIZE, len(raw_action))] = raw_action[
+                :AGENT6_ACTION_SIZE
+            ]
+            raw_longitudinal = finite_clamp(padded[1], -1.0, 1.0)
+            raw_accel = max(0.0, raw_longitudinal)
+            raw_brake = max(0.0, -raw_longitudinal)
+            pedal_conflict = False
             self._step_writer.writerow(
                 [
                     self.episodes_started,
@@ -1942,17 +2120,43 @@ def make_training_env_class(gym: Any, spaces: Any):
                     sensors[9] if len(sensors) > 9 else 0,
                     min(sensors) if sensors else 0,
                     padded[0],
-                    padded[1],
-                    padded[2],
+                    raw_longitudinal,
+                    raw_accel,
+                    raw_brake,
+                    pedal_conflict,
                     action["steer"],
                     action["accel"],
                     action["brake"],
                     action["gear"],
                     reward,
+                    reward_components.get("progress", 0.0),
+                    reward_components.get("aligned_speed", 0.0),
+                    reward_components.get("new_distance", 0.0),
+                    reward_components.get("stable_progress_bonus", 0.0),
+                    reward_components.get("survival_cost", 0.0),
+                    reward_components.get("lateral_position_penalty", 0.0),
+                    reward_components.get("angle_penalty", 0.0),
+                    reward_components.get("lateral_speed_penalty", 0.0),
+                    reward_components.get("speed_steer_penalty", 0.0),
+                    reward_components.get("spin_penalty", 0.0),
+                    reward_components.get("closing_danger_penalty", 0.0),
+                    reward_components.get("clear_track_anti_stall_penalty", 0.0),
+                    reward_components.get("stalled_penalty", 0.0),
+                    reward_components.get("off_track_penalty", 0.0),
+                    reward_components.get("crash_penalty", 0.0),
+                    reward_components.get("backwards_penalty", 0.0),
+                    reward_components.get("stuck_penalty", 0.0),
+                    reward_components.get("terminal_failure_penalty", 0.0),
+                    reward_components.get("stage_success_bonus", 0.0),
+                    reward_components.get("lap_completion_bonus", 0.0),
                     terminated,
                     truncated,
                     reason,
                     telemetry.get("curLapTime", 0),
+                    *[
+                        sensors[index] if len(sensors) > index else 0.0
+                        for index in range(19)
+                    ],
                 ]
             )
             self._step_file.flush()
@@ -3925,6 +4129,24 @@ def create_td3_model(
         "device": args.device,
     }
     if args.continuation:
+        if policy_uses_legacy_action_contract(read_policy_metadata(args.resume_from)):
+            legacy_model = TD3.load(str(args.resume_from), device=args.device)
+            model = TD3(
+                "MlpPolicy",
+                policy_kwargs={"net_arch": args.net_arch},
+                **model_kwargs,
+            )
+            migration = migrate_legacy_actor_to_signed_longitudinal(
+                legacy_model,
+                model,
+            )
+            migration["source_policy_path"] = str(args.resume_from)
+            migration["source_model_num_timesteps"] = int(
+                getattr(legacy_model, "num_timesteps", 0)
+            )
+            model.num_timesteps = int(getattr(legacy_model, "num_timesteps", 0))
+            setattr(model, "_agent6_contract_migration", migration)
+            return model
         model = TD3.load(str(args.resume_from), **model_kwargs)
         normalise_continuation_spaces(model, env)
         return model
@@ -3933,6 +4155,69 @@ def create_td3_model(
         policy_kwargs={"net_arch": args.net_arch},
         **model_kwargs,
     )
+
+
+def migrate_legacy_actor_to_signed_longitudinal(
+    legacy_model: Any,
+    model: Any,
+) -> dict[str, Any]:
+    """Transfer a v1 3-head actor into the v2 signed-longitudinal actor."""
+    legacy_actor = getattr(legacy_model, "actor", None)
+    actor = getattr(model, "actor", None)
+    actor_target = getattr(model, "actor_target", None)
+    if legacy_actor is None or actor is None:
+        raise RuntimeError("TD3 actor migration requires source and target actors")
+
+    legacy_state = legacy_actor.state_dict()
+    target_state = actor.state_dict()
+    copied_tensors = 0
+    adapted_tensors = 0
+    skipped_tensors: list[str] = []
+    for name, target_value in list(target_state.items()):
+        source_value = legacy_state.get(name)
+        if source_value is None:
+            skipped_tensors.append(name)
+            continue
+        if tuple(source_value.shape) == tuple(target_value.shape):
+            target_state[name] = source_value.detach().clone()
+            copied_tensors += 1
+            continue
+        source_shape = tuple(source_value.shape)
+        target_shape = tuple(target_value.shape)
+        if (
+            len(source_shape) == len(target_shape)
+            and len(source_shape) >= 1
+            and source_shape[0] >= 3
+            and target_shape[0] == AGENT6_ACTION_SIZE
+            and source_shape[1:] == target_shape[1:]
+        ):
+            migrated_value = target_value.detach().clone()
+            migrated_value[0].copy_(source_value[0])
+            migrated_value[1].copy_((source_value[1] - source_value[2]) * 0.5)
+            target_state[name] = migrated_value
+            adapted_tensors += 1
+            continue
+        skipped_tensors.append(name)
+
+    if adapted_tensors < 1:
+        raise RuntimeError(
+            "legacy TD3 actor migration found no 3-head output tensors to adapt"
+        )
+    actor.load_state_dict(target_state)
+    if actor_target is not None:
+        actor_target.load_state_dict(target_state)
+    normalise_continuation_spaces(model, model.env)
+    return {
+        "required": True,
+        "source_action_contract": "agent6_direct_steer_throttle_brake_v1",
+        "target_action_contract": AGENT6_ACTION_VERSION,
+        "method": "copy_shared_actor_layers_and_map_accel_minus_brake_to_signed_longitudinal",
+        "copied_actor_tensors": copied_tensors,
+        "adapted_actor_output_tensors": adapted_tensors,
+        "skipped_actor_tensors": skipped_tensors,
+        "critic_replay_source": "fresh_under_v2_contract",
+        "learning_source": "reward_only",
+    }
 
 
 def normalise_continuation_spaces(model: Any, env: Any) -> None:
@@ -4544,8 +4829,9 @@ def main() -> None:
     )
     def make_action_noise(sigma: float):
         return NormalActionNoise(
-            mean=np.zeros(3, dtype=np.float32),
-            sigma=np.ones(3, dtype=np.float32) * max(0.0, float(sigma)),
+            mean=np.zeros(AGENT6_ACTION_SIZE, dtype=np.float32),
+            sigma=np.ones(AGENT6_ACTION_SIZE, dtype=np.float32)
+            * max(0.0, float(sigma)),
         )
 
     def make_safe_probe_noise(seed: int, steering_noise_std: float):
@@ -4604,11 +4890,17 @@ def main() -> None:
         metadata["continuation"]["source_model_num_timesteps"] = int(
             getattr(model, "num_timesteps", 0)
         )
+        contract_migration = getattr(model, "_agent6_contract_migration", None)
+        if isinstance(contract_migration, Mapping):
+            metadata["continuation"][
+                "source_policy_contract_migration"
+            ] = dict(contract_migration)
         write_json(run_dir / "training_metadata.json", metadata)
         write_json(metadata_path_for_policy(args.model_path), metadata)
         print(
             "Continuing verified Agent 6 policy from "
             f"{args.resume_from} at stage={args.start_stage}; "
+            f"action contract={AGENT6_ACTION_VERSION}; "
             f"replay refill={args.replay_refill_steps:,}, "
             f"critic warm-up={args.critic_warmup_steps:,}, "
             f"actor unfreeze={args.actor_unfreeze_steps:,} steps; "

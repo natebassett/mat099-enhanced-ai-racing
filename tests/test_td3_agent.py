@@ -31,7 +31,11 @@ fake_gym_torcs.TorcsEnv = FakeTorcsEnv
 sys.modules.setdefault("gym_torcs", fake_gym_torcs)
 
 from agents.td3_agent import (  # noqa: E402
+    AGENT6_ACTION_SHAPE,
     AGENT6_ACTION_VERSION,
+    AGENT6_LEGACY_ACTION_SHAPE,
+    AGENT6_LEGACY_ACTION_VERSION,
+    AGENT6_LEGACY_OBSERVATION_VERSION,
     AGENT6_MODEL_FAMILY,
     AGENT6_OBSERVATION_VERSION,
     EXTERNAL_EVALUATION_SEED_MIN,
@@ -47,6 +51,7 @@ from agents.td3_agent import (  # noqa: E402
     metadata_path_for_policy,
     order_stratified_seed_aggregates,
     parameter_state_dicts_are_identical,
+    policy_uses_legacy_action_contract,
     policy_checkpoint_is_verified,
     policy_contract_mismatches,
     rate_limit_td3_action,
@@ -84,14 +89,14 @@ class Td3ScratchAgentTests(unittest.TestCase):
         self.assertNotIn("teacher", " ".join(FEATURE_NAMES).casefold())
         self.assertNotIn("racing_line", " ".join(FEATURE_NAMES).casefold())
 
-    def test_decode_action_maps_td3_outputs_to_exclusive_pedals(self):
-        action = decode_td3_action([2.0, 0.8, 0.4])
+    def test_decode_action_maps_signed_longitudinal_to_exclusive_pedals(self):
+        action = decode_td3_action([2.0, 0.8])
 
         self.assertEqual(action["steer"], 0.90)
         self.assertEqual(action["accel"], 0.8)
         self.assertEqual(action["brake"], 0.0)
 
-        braking = decode_td3_action([-2.0, 0.2, 0.7])
+        braking = decode_td3_action([-2.0, -0.7])
         self.assertEqual(braking["steer"], -0.90)
         self.assertEqual(braking["accel"], 0.0)
         self.assertEqual(braking["brake"], 0.7)
@@ -109,7 +114,7 @@ class Td3ScratchAgentTests(unittest.TestCase):
         self.assertFalse(agent.policy_loaded)
 
     def test_policy_prediction_drives_direct_controls(self):
-        policy = DummyPolicy([0.5, 0.7, -0.2])
+        policy = DummyPolicy([0.5, 0.7])
         agent = Td3ScratchAgent(policy=policy, deterministic=True)
 
         action = agent.act(None, _telemetry(speed=90.0))
@@ -127,13 +132,13 @@ class Td3ScratchAgentTests(unittest.TestCase):
             steering_noise = 0.09
 
             def __call__(self):
-                return np.asarray([0.1, 0.0, 0.0], dtype=np.float32)
+                return np.asarray([0.1, 0.0], dtype=np.float32)
 
             def reset(self):
                 return None
 
         agent = Td3ScratchAgent(
-            policy=DummyPolicy([0.0, 0.7, 0.0]),
+            policy=DummyPolicy([0.0, 0.7]),
             action_noise=FixedNoise(),
         )
 
@@ -179,6 +184,25 @@ class Td3ScratchAgentTests(unittest.TestCase):
         self.assertIn("model_family", mismatches)
         self.assertIn("observation_version", mismatches)
         self.assertIn("action_shape", mismatches)
+
+    def test_legacy_agent6_action_contract_is_explicitly_migratable(self):
+        metadata = {
+            "model_family": AGENT6_MODEL_FAMILY,
+            "observation_version": AGENT6_LEGACY_OBSERVATION_VERSION,
+            "action_version": AGENT6_LEGACY_ACTION_VERSION,
+            "feature_names": FEATURE_NAMES,
+            "action_shape": AGENT6_LEGACY_ACTION_SHAPE,
+        }
+
+        self.assertTrue(policy_uses_legacy_action_contract(metadata))
+        self.assertIn("action_version", policy_contract_mismatches(metadata))
+        self.assertEqual(
+            policy_contract_mismatches(
+                metadata,
+                allow_legacy_action_contract=True,
+            ),
+            [],
+        )
 
     def test_metadata_path_uses_sidecar_json(self):
         self.assertEqual(
@@ -318,6 +342,35 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         )
 
         self.assertLess(oversteer_reward, smooth_reward - 4.0)
+
+    def test_reward_components_penalise_clear_track_stalling_without_creep_bonus(self):
+        stage = train_td3_agent.CURRICULUM[2]
+        previous = _telemetry(distance=1400.0, raced=1400.0, speed=16.0)
+        slow = _telemetry(distance=1400.04, raced=1400.04, speed=12.0)
+        slow["track"] = [60.0] * 19
+
+        components = train_td3_agent.calculate_td3_reward_components(
+            slow,
+            {"accel": 0.0, "brake": 0.2},
+            previous_telemetry=previous,
+            stage=stage,
+            episode_distance_m=1400.04,
+            previous_furthest_distance_m=1400.0,
+        )
+
+        self.assertNotIn("low_speed_creep_bonus", components)
+        self.assertLess(components["clear_track_anti_stall_penalty"], 0.0)
+        self.assertAlmostEqual(
+            components["total"],
+            train_td3_agent.calculate_td3_reward(
+                slow,
+                {"accel": 0.0, "brake": 0.2},
+                previous_telemetry=previous,
+                stage=stage,
+                episode_distance_m=1400.04,
+                previous_furthest_distance_m=1400.0,
+            ),
+        )
 
     def test_curriculum_stages_progress_from_launch_to_full_lap(self):
         stages = train_td3_agent.CURRICULUM
@@ -1085,7 +1138,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                         "observation_version": AGENT6_OBSERVATION_VERSION,
                         "action_version": AGENT6_ACTION_VERSION,
                         "feature_names": FEATURE_NAMES,
-                        "action_shape": [3],
+                        "action_shape": AGENT6_ACTION_SHAPE,
                         "track": "g-track-3",
                         "best_evaluation": {
                             "deterministic": True,
@@ -1220,6 +1273,91 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(model.policy.action_space, "standard_action_space")
         self.assertEqual(model.replay_buffer.action_space, "standard_action_space")
 
+    def test_legacy_actor_migration_maps_accel_minus_brake_to_signed_longitudinal(self):
+        import gymnasium as gym
+        import torch
+        from stable_baselines3 import TD3
+
+        class LegacyEnv(gym.Env):
+            observation_space = gym.spaces.Box(
+                -1.0,
+                1.0,
+                shape=(4,),
+                dtype=np.float32,
+            )
+            action_space = gym.spaces.Box(
+                -1.0,
+                1.0,
+                shape=(3,),
+                dtype=np.float32,
+            )
+
+            def reset(self, *, seed=None, options=None):
+                super().reset(seed=seed)
+                return np.zeros(4, dtype=np.float32), {}
+
+            def step(self, action):
+                return np.zeros(4, dtype=np.float32), 0.0, False, False, {}
+
+        class CurrentEnv(LegacyEnv):
+            action_space = gym.spaces.Box(
+                -1.0,
+                1.0,
+                shape=(2,),
+                dtype=np.float32,
+            )
+
+        legacy = TD3(
+            "MlpPolicy",
+            LegacyEnv(),
+            policy_kwargs={"net_arch": [8, 8]},
+            learning_starts=0,
+            buffer_size=32,
+            batch_size=4,
+            device="cpu",
+        )
+        current = TD3(
+            "MlpPolicy",
+            CurrentEnv(),
+            policy_kwargs={"net_arch": [8, 8]},
+            learning_starts=0,
+            buffer_size=32,
+            batch_size=4,
+            device="cpu",
+        )
+        legacy_state = legacy.actor.state_dict()
+        output_names = [
+            name
+            for name, value in legacy_state.items()
+            if len(value.shape) >= 1 and value.shape[0] == 3
+        ]
+        with torch.no_grad():
+            for name in output_names:
+                legacy_state[name][0].fill_(0.25)
+                legacy_state[name][1].fill_(0.80)
+                legacy_state[name][2].fill_(0.20)
+        legacy.actor.load_state_dict(legacy_state)
+
+        migration = train_td3_agent.migrate_legacy_actor_to_signed_longitudinal(
+            legacy,
+            current,
+        )
+
+        migrated_state = current.actor.state_dict()
+        self.assertTrue(migration["required"])
+        self.assertGreaterEqual(migration["adapted_actor_output_tensors"], 1)
+        for name in output_names:
+            if name not in migrated_state:
+                continue
+            self.assertEqual(migrated_state[name].shape[0], 2)
+            self.assertTrue(torch.allclose(migrated_state[name][0], legacy_state[name][0]))
+            self.assertTrue(
+                torch.allclose(
+                    migrated_state[name][1],
+                    (legacy_state[name][1] - legacy_state[name][2]) * 0.5,
+                )
+            )
+
     def test_safe_actor_interleaves_matched_pairs_and_rotates_seed_suites(self):
         import gymnasium as gym
         import torch
@@ -1235,7 +1373,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             action_space = gym.spaces.Box(
                 -1.0,
                 1.0,
-                shape=(3,),
+                shape=(2,),
                 dtype=np.float32,
             )
 
@@ -1356,7 +1494,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             action_space = gym.spaces.Box(
                 -1.0,
                 1.0,
-                shape=(3,),
+                shape=(2,),
                 dtype=np.float32,
             )
 
@@ -1466,7 +1604,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             action_space = gym.spaces.Box(
                 -1.0,
                 1.0,
-                shape=(3,),
+                shape=(2,),
                 dtype=np.float32,
             )
 
@@ -1517,7 +1655,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
         class TinyEnv(gym.Env):
             observation_space = gym.spaces.Box(-1.0, 1.0, shape=(4,), dtype=np.float32)
-            action_space = gym.spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32)
+            action_space = gym.spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
 
             def reset(self, *, seed=None, options=None):
                 super().reset(seed=seed)
@@ -1653,7 +1791,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
         class TinyEnv(gym.Env):
             observation_space = gym.spaces.Box(-1.0, 1.0, shape=(4,), dtype=np.float32)
-            action_space = gym.spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32)
+            action_space = gym.spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
 
             def reset(self, *, seed=None, options=None):
                 super().reset(seed=seed)
@@ -1693,7 +1831,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
         class TinyEnv(gym.Env):
             observation_space = gym.spaces.Box(-1.0, 1.0, shape=(4,), dtype=np.float32)
-            action_space = gym.spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32)
+            action_space = gym.spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
 
             def reset(self, *, seed=None, options=None):
                 super().reset(seed=seed)
@@ -1743,7 +1881,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                         "observation_version": AGENT6_OBSERVATION_VERSION,
                         "action_version": AGENT6_ACTION_VERSION,
                         "feature_names": FEATURE_NAMES,
-                        "action_shape": [3],
+                        "action_shape": AGENT6_ACTION_SHAPE,
                         "best_evaluation": {
                             "deterministic": True,
                             "repeats": 3,
@@ -2043,6 +2181,15 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(screening_limit, 1_200)
         self.assertEqual(confirmation_limit, stage.max_episode_steps)
 
+    def test_step_telemetry_logs_reward_components_pedal_conflict_and_all_sensors(self):
+        self.assertIn("pedal_conflict", train_td3_agent.STEP_COLUMNS)
+        self.assertIn(
+            "reward_clear_track_anti_stall_penalty",
+            train_td3_agent.STEP_COLUMNS,
+        )
+        self.assertIn("track_sensor_0", train_td3_agent.STEP_COLUMNS)
+        self.assertIn("track_sensor_18", train_td3_agent.STEP_COLUMNS)
+
     def test_launch_biased_warmup_action_space_samples_bounded_actions(self):
         action_space = train_td3_agent.make_scratch_action_space(
             _FakeSpaces,
@@ -2053,11 +2200,11 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
         sample = action_space.sample()
 
-        self.assertEqual(sample.shape, (3,))
+        self.assertEqual(sample.shape, tuple(AGENT6_ACTION_SHAPE))
         self.assertTrue(np.all(sample >= -1.0))
         self.assertTrue(np.all(sample <= 1.0))
         self.assertGreaterEqual(float(sample[1]), 0.25)
-        self.assertEqual(float(sample[2]), 0.0)
+        self.assertGreaterEqual(float(sample[1]), 0.0)
 
 
 class _FakeBox:

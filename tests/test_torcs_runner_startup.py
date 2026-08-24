@@ -2,6 +2,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -17,10 +18,72 @@ class FakeTorcsEnv:
 fake_gym_torcs.TorcsEnv = FakeTorcsEnv
 sys.modules.setdefault("gym_torcs", fake_gym_torcs)
 
+from runner import torcs_runner as torcs_runner_module  # noqa: E402
 from runner.torcs_runner import TorcsRunner  # noqa: E402
 
 
 class TorcsRunnerStartupTests(unittest.TestCase):
+    def test_launch_retries_after_native_startup_crash(self):
+        runner = TorcsRunner()
+        runner.torcs_path = Path(__file__)
+        failed_process = mock.Mock()
+        failed_process.poll.return_value = 3221225477
+        healthy_process = mock.Mock()
+        healthy_process.poll.return_value = None
+
+        with (
+            mock.patch.object(
+                torcs_runner_module.subprocess,
+                "Popen",
+                side_effect=[failed_process, healthy_process],
+            ) as popen,
+            mock.patch.object(torcs_runner_module.time, "sleep") as sleep,
+            mock.patch.object(runner, "_start_practice_race") as start_race,
+        ):
+            runner.launch()
+
+        self.assertEqual(popen.call_count, 2)
+        self.assertEqual(sleep.call_args_list, [mock.call(8.0), mock.call(2.0), mock.call(8.0)])
+        self.assertIs(runner.torcs_process, healthy_process)
+        start_race.assert_called_once_with()
+
+    def test_launch_reports_exit_codes_after_all_attempts_fail(self):
+        runner = TorcsRunner()
+        runner.torcs_path = Path(__file__)
+        failed_processes = []
+        for return_code in (3221225477, 1, 3221225477):
+            process = mock.Mock()
+            process.poll.return_value = return_code
+            failed_processes.append(process)
+
+        with (
+            mock.patch.object(
+                torcs_runner_module.subprocess,
+                "Popen",
+                side_effect=failed_processes,
+            ),
+            mock.patch.object(torcs_runner_module.time, "sleep") as sleep,
+            mock.patch.object(runner, "_start_practice_race") as start_race,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "3221225477, 1, 3221225477",
+            ):
+                runner.launch()
+
+        self.assertEqual(
+            sleep.call_args_list,
+            [
+                mock.call(8.0),
+                mock.call(2.0),
+                mock.call(8.0),
+                mock.call(4.0),
+                mock.call(8.0),
+            ],
+        )
+        self.assertIsNone(runner.torcs_process)
+        start_race.assert_not_called()
+
     def test_netstat_parser_accepts_expected_torcs_udp_port(self):
         output = """
   UDP    0.0.0.0:3001           *:*                                    1234

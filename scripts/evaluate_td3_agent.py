@@ -19,6 +19,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from agents.td3_agent import (  # noqa: E402
+    AGENT6_ACTION_SHAPE,
     AGENT6_ACTION_VERSION,
     AGENT6_MODEL_FAMILY,
     AGENT6_OBSERVATION_VERSION,
@@ -41,6 +42,7 @@ from agents.td3_agent import (  # noqa: E402
     order_stratified_seed_aggregates,
     parameter_state_dicts_are_identical,
     policy_contract_mismatches,
+    policy_uses_legacy_action_contract,
     read_policy_metadata,
 )
 from gui.torcs_config import TorcsRaceSetup, TorcsRuntimeConfig  # noqa: E402
@@ -413,7 +415,10 @@ def include_verified_baseline(policies: list[Path], best_path: Path) -> list[Pat
 def load_policy_actor_state(policy_path: Path) -> dict[str, Any]:
     from stable_baselines3 import TD3  # noqa: PLC0415
 
-    mismatches = policy_contract_mismatches(read_policy_metadata(policy_path))
+    mismatches = policy_contract_mismatches(
+        read_policy_metadata(policy_path),
+        allow_legacy_action_contract=True,
+    )
     if mismatches:
         raise ValueError(
             f"TD3 policy contract mismatch for {policy_path}: "
@@ -761,13 +766,23 @@ def promote_best_evaluation(
     if candidate_path.resolve() != best_path.resolve():
         shutil.copy2(candidate_path, best_path)
     source_metadata = read_policy_metadata(candidate_path)
+    candidate_action_shape = source_metadata.get("action_shape", AGENT6_ACTION_SHAPE)
+    candidate_action_version = source_metadata.get(
+        "action_version",
+        AGENT6_ACTION_VERSION,
+    )
+    candidate_observation_version = source_metadata.get(
+        "observation_version",
+        AGENT6_OBSERVATION_VERSION,
+    )
     metadata = {
         **source_metadata,
         "model_family": AGENT6_MODEL_FAMILY,
-        "observation_version": AGENT6_OBSERVATION_VERSION,
-        "action_version": AGENT6_ACTION_VERSION,
+        "observation_version": candidate_observation_version,
+        "action_version": candidate_action_version,
         "feature_names": FEATURE_NAMES,
-        "action_shape": [3],
+        "action_shape": candidate_action_shape,
+        "legacy_action_adapter": policy_uses_legacy_action_contract(source_metadata),
         "checkpoint_type": "best_seeded_robustness_evaluation",
         "best_evaluation": {
             **asdict(summary),

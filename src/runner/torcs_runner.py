@@ -23,6 +23,8 @@ from runner.lap_tracker import LapTracker, practice_finish_is_plausible
 class TorcsRunner:
     OFF_TRACK_SHUTDOWN_DELAY = 3.0
     STARTUP_DELAY = 8.0
+    STARTUP_ATTEMPTS = 3
+    STARTUP_RETRY_DELAY = 2.0
     MENU_KEY_DELAY = 1.0
     MENU_ENTER_ATTEMPTS = 8
     SERVER_PORT = 3001
@@ -51,19 +53,37 @@ class TorcsRunner:
         # console visible. CREATE_NO_WINDOW hides that console without hiding
         # the separate TORCS OpenGL application window.
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        self.torcs_process = subprocess.Popen(
-            [str(self.torcs_path)],
-            cwd=str(self.torcs_path.parent),
-            creationflags=creation_flags,
-        )
+        startup_exit_codes = []
+        for attempt in range(1, self.STARTUP_ATTEMPTS + 1):
+            self.torcs_process = subprocess.Popen(
+                [str(self.torcs_path)],
+                cwd=str(self.torcs_path.parent),
+                creationflags=creation_flags,
+            )
 
-        # Give TORCS time to open its graphical window and UDP socket.
-        time.sleep(self.STARTUP_DELAY)
+            # Give TORCS time to open its graphical window and UDP socket.
+            time.sleep(self.STARTUP_DELAY)
 
-        return_code = self.torcs_process.poll()
-        if return_code is not None:
+            return_code = self.torcs_process.poll()
+            if return_code is None:
+                break
+
+            startup_exit_codes.append(return_code)
             self.torcs_process = None
-            raise RuntimeError(f"TORCS closed during startup (exit code {return_code})")
+            if attempt >= self.STARTUP_ATTEMPTS:
+                codes = ", ".join(str(code) for code in startup_exit_codes)
+                raise RuntimeError(
+                    "TORCS closed during all startup attempts "
+                    f"(exit codes: {codes})"
+                )
+            retry_delay = self.STARTUP_RETRY_DELAY * attempt
+            print(
+                "TORCS closed during startup "
+                f"(exit code {return_code}); retrying in "
+                f"{retry_delay:g} seconds "
+                f"[{attempt + 1}/{self.STARTUP_ATTEMPTS}]..."
+            )
+            time.sleep(retry_delay)
 
         try:
             self._start_practice_race()
