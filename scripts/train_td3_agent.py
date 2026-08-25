@@ -38,9 +38,7 @@ from agents.td3_agent import (  # noqa: E402
     AGENT6_OBSERVATION_VERSION,
     AGENT6_ROBUSTNESS_PROTOCOL,
     AGENT6_ROBUSTNESS_MAX_PAIRED_REGRESSION_M,
-    AGENT6_ROBUSTNESS_REPEATS,
     AGENT6_ROBUSTNESS_STEERING_NOISE_STD,
-    AGENT6_ROBUSTNESS_TRIALS_PER_SEED,
     AGENT6_TRAINING_CHALLENGE_BASE_SEED,
     DEFAULT_BEST_EVALUATION_MODEL_PATH,
     DEFAULT_BEST_DISTANCE_MODEL_PATH,
@@ -103,9 +101,9 @@ DEFAULT_CONTINUATION_FINAL_ACTION_NOISE_SIGMA = 0.006
 DEFAULT_SAFE_ACTOR_MAX_ACTION_DELTA = 0.01
 DEFAULT_SAFE_ACTOR_GRADIENT_NORM = 1.0
 DEFAULT_SAFE_ACTOR_BLOCK_UPDATES = 100
-DEFAULT_SAFE_ACTOR_BLOCKS_PER_PROBE = 10
-DEFAULT_SAFE_ACTOR_PROBE_REPEATS = AGENT6_ROBUSTNESS_REPEATS
-DEFAULT_SAFE_ACTOR_TRIALS_PER_SEED = AGENT6_ROBUSTNESS_TRIALS_PER_SEED
+DEFAULT_SAFE_ACTOR_BLOCKS_PER_PROBE = 25
+DEFAULT_SAFE_ACTOR_PROBE_REPEATS = 3
+DEFAULT_SAFE_ACTOR_TRIALS_PER_SEED = 2
 DEFAULT_SAFE_ACTOR_SCREENING_TRIALS_PER_SEED = 2
 DEFAULT_SAFE_ACTOR_SCREENING_MAX_EPISODE_STEPS = 1_200
 DEFAULT_SAFE_ACTOR_PROBE_BASE_SEED = AGENT6_TRAINING_CHALLENGE_BASE_SEED
@@ -116,9 +114,12 @@ DEFAULT_SAFE_ACTOR_MAX_PAIRED_REGRESSION_M = (
 )
 DEFAULT_SAFE_ACTOR_SCREENING_MAX_REGRESSION_M = 250.0
 DEFAULT_SAFE_ACTOR_ANCHOR_BATCH_SIZE = 256
-DEFAULT_PROBE_OVERHEAD_MULTIPLIER = 10
+DEFAULT_MAX_PROBE_FRACTION = 0.20
+DEFAULT_PROBE_EVIDENCE_WINDOW = 8
+DEFAULT_PROBE_MIN_EVIDENCE_EPISODES = 3
+DEFAULT_PROBE_EVIDENCE_MAX_REGRESSION_M = 150.0
 SAFE_ACTOR_ROBUSTNESS_PROTOCOL = (
-    "agent6_budgeted_multifidelity_order_position_guard_v8"
+    "agent6_ratio_budgeted_evidence_gated_internal_probe_v9"
 )
 
 REWARD_VERSION = "agent6_td3_reward_v2_clear_track_anti_stall"
@@ -208,6 +209,8 @@ EPISODE_COLUMNS = [
     "global_timestep",
     "training_budget_timestep",
     "probe_overhead_timestep",
+    "probe_budget_available_steps",
+    "probe_deferred_requests",
     "policy_controlled",
     "deterministic_probe",
     "safe_actor_candidate_probe",
@@ -220,6 +223,7 @@ EPISODE_COLUMNS = [
     "safe_actor_probe_stage",
     "safe_actor_probe_order_position",
     "safe_actor_decision",
+    "safe_actor_training_evidence_decision",
     "safe_actor_probe_episodes_completed",
     "safe_actor_probe_episodes_maximum",
     "safe_actor_probe_episodes_skipped",
@@ -1274,7 +1278,22 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "challenge_seed_rotation": "unique_suite_per_candidate_block",
             "policy_equivalence_check": "exact_actor_parameter_equality",
             "policy_equivalent_action": "skip_matched_robustness_probes",
-            "probe_pairing": "staged_ab_ba_screen_then_ab_ba_confirmation",
+            "offline_screening": [
+                "exact_actor_parameter_equivalence",
+                "finite_actor_loss",
+                "finite_clipped_actor_gradient_norm",
+                "action_space_trust_region",
+                "recent_training_progress_evidence",
+            ],
+            "evidence_window_episodes": args.probe_evidence_window,
+            "minimum_evidence_episodes": args.probe_min_evidence_episodes,
+            "evidence_maximum_median_regression_m": (
+                args.probe_evidence_max_regression_m
+            ),
+            "probe_pairing": (
+                "first_seed_short_ab_ba_collapse_screen_then_"
+                "three_seed_balanced_confirmation"
+            ),
             "early_rejection": (
                 "relaxed_screen_then_irreversible_guard_after_each_seed"
             ),
@@ -1309,6 +1328,7 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
                 args.safe_actor_max_paired_regression_m
             ),
             "external_evaluation_remains_final_authority": True,
+            "external_evaluation_during_candidate_blocks": False,
             "anchor_batch_size": args.safe_actor_anchor_batch_size,
             "rejected_candidate_restores": [
                 "actor",
@@ -1325,8 +1345,33 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "training_steps_requested": args.total_timesteps,
             "probe_steps_excluded_from_training_budget": True,
             "maximum_probe_overhead_steps": args.max_probe_overhead_steps,
+            "maximum_probe_fraction": args.max_probe_fraction,
+            "minimum_training_fraction": 1.0 - args.max_probe_fraction,
+            "effective_maximum_probe_steps": min(
+                args.max_probe_overhead_steps,
+                int(
+                    math.floor(
+                        args.total_timesteps
+                        * args.max_probe_fraction
+                        / (1.0 - args.max_probe_fraction)
+                    )
+                ),
+            ),
             "maximum_environment_steps": (
-                args.total_timesteps + args.max_probe_overhead_steps
+                args.total_timesteps
+                + min(
+                    args.max_probe_overhead_steps,
+                    int(
+                        math.floor(
+                            args.total_timesteps
+                            * args.max_probe_fraction
+                            / (1.0 - args.max_probe_fraction)
+                        )
+                    ),
+                )
+            ),
+            "probe_exhaustion_action": (
+                "defer_probe_freeze_actor_continue_critic_and_replay"
             ),
             "learning_rate_and_noise_schedules_use_training_steps": True,
             "checkpoints_use_training_steps": True,
@@ -2293,23 +2338,77 @@ class TrainingProgressState:
 
 
 @dataclass
-class TrainingBudgetState:
-    """Track optimization-eligible interactions separately from probes."""
+class ProbeBudgetController:
+    """Admit probes without allowing them to displace training interactions."""
 
     target_training_steps: int
     maximum_probe_steps: int
+    maximum_probe_fraction: float = DEFAULT_MAX_PROBE_FRACTION
     training_steps: int = 0
     probe_steps: int = 0
     environment_steps: int = 0
+    deferred_probe_requests: int = 0
     stop_reason: str | None = None
 
     def __post_init__(self) -> None:
         self.target_training_steps = max(1, int(self.target_training_steps))
-        self.maximum_probe_steps = max(1, int(self.maximum_probe_steps))
+        self.maximum_probe_steps = max(0, int(self.maximum_probe_steps))
+        self.maximum_probe_fraction = float(self.maximum_probe_fraction)
+        if not 0.0 < self.maximum_probe_fraction <= DEFAULT_MAX_PROBE_FRACTION:
+            raise ValueError(
+                "maximum_probe_fraction must preserve at least 80% training "
+                f"interactions: expected (0, {DEFAULT_MAX_PROBE_FRACTION:.2f}]"
+            )
+
+    @property
+    def ratio_limited_probe_steps(self) -> int:
+        training_fraction = 1.0 - self.maximum_probe_fraction
+        return max(
+            0,
+            int(
+                math.floor(
+                    self.target_training_steps
+                    * self.maximum_probe_fraction
+                    / training_fraction
+                )
+            ),
+        )
+
+    @property
+    def effective_maximum_probe_steps(self) -> int:
+        return min(self.maximum_probe_steps, self.ratio_limited_probe_steps)
 
     @property
     def maximum_environment_steps(self) -> int:
-        return self.target_training_steps + self.maximum_probe_steps
+        return self.target_training_steps + self.effective_maximum_probe_steps
+
+    @property
+    def available_probe_steps(self) -> int:
+        training_fraction = 1.0 - self.maximum_probe_fraction
+        earned_capacity = int(
+            math.floor(
+                self.training_steps
+                * self.maximum_probe_fraction
+                / training_fraction
+            )
+        )
+        admitted_capacity = min(
+            self.effective_maximum_probe_steps,
+            earned_capacity,
+        )
+        return max(0, admitted_capacity - self.probe_steps)
+
+    def can_start_probe(
+        self,
+        estimated_steps: int,
+        *,
+        record_deferral: bool = True,
+    ) -> bool:
+        required = max(1, int(estimated_steps))
+        admitted = required <= self.available_probe_steps
+        if not admitted and record_deferral:
+            self.deferred_probe_requests += 1
+        return admitted
 
     @property
     def progress_remaining(self) -> float:
@@ -2331,8 +2430,8 @@ class TrainingBudgetState:
     def _update_stop_reason(self) -> None:
         if self.training_steps >= self.target_training_steps:
             self.stop_reason = "training_budget_reached"
-        elif self.probe_steps >= self.maximum_probe_steps:
-            self.stop_reason = "probe_overhead_limit_reached"
+        else:
+            self.stop_reason = None
 
     def should_stop(self) -> bool:
         return self.stop_reason is not None
@@ -2342,13 +2441,56 @@ class TrainingBudgetState:
         return {
             "target_training_steps": self.target_training_steps,
             "maximum_probe_steps": self.maximum_probe_steps,
+            "ratio_limited_probe_steps": self.ratio_limited_probe_steps,
+            "effective_maximum_probe_steps": (
+                self.effective_maximum_probe_steps
+            ),
+            "maximum_probe_fraction": self.maximum_probe_fraction,
+            "minimum_training_fraction": 1.0 - self.maximum_probe_fraction,
             "maximum_environment_steps": self.maximum_environment_steps,
             "training_steps": self.training_steps,
             "probe_steps": self.probe_steps,
             "environment_steps": self.environment_steps,
             "probe_fraction": self.probe_steps / total,
+            "training_fraction": self.training_steps / total,
+            "available_probe_steps": self.available_probe_steps,
+            "deferred_probe_requests": self.deferred_probe_requests,
             "stop_reason": self.stop_reason,
         }
+
+
+# Kept as an API alias for existing analysis scripts and saved run tooling.
+TrainingBudgetState = ProbeBudgetController
+
+
+def training_progress_is_credible(
+    distances_m: list[float] | tuple[float, ...],
+    *,
+    reference_distance_m: float,
+    minimum_episodes: int,
+    maximum_regression_m: float,
+    minimum_improvement_m: float = 0.0,
+    completed_lap: bool = False,
+) -> bool:
+    """Return whether noisy training rollouts justify an on-track comparison."""
+    if completed_lap:
+        return True
+    values = [
+        max(0.0, finite_float(value))
+        for value in distances_m
+        if math.isfinite(finite_float(value))
+    ]
+    if len(values) < max(1, int(minimum_episodes)):
+        return False
+    reference = max(0.0, finite_float(reference_distance_m))
+    if reference <= 0.0:
+        return max(values) > 0.0
+    regression_limit = max(0.0, finite_float(maximum_regression_m))
+    improvement = max(0.0, finite_float(minimum_improvement_m))
+    return bool(
+        max(values) >= reference + improvement
+        and float(np.median(values)) >= reference - regression_limit
+    )
 
 
 def continuation_compatibility_minimum_distance_m(
@@ -2383,6 +2525,20 @@ def run_continuation_compatibility_probe(
         observation, _reset_info = raw_env.reset(seed=seed)
         final_info: Mapping[str, Any] | None = None
         maximum_steps = max(1, int(raw_env.current_stage.max_episode_steps)) + 1
+        budget_limited = False
+        if training_budget_state is not None:
+            remaining_allowance = max(
+                0,
+                training_budget_state.effective_maximum_probe_steps
+                - training_budget_state.probe_steps,
+            )
+            if remaining_allowance < 1:
+                raise RuntimeError(
+                    "continuation compatibility probe has no probe-budget "
+                    "allowance; increase --total-timesteps"
+                )
+            budget_limited = remaining_allowance < maximum_steps
+            maximum_steps = min(maximum_steps, remaining_allowance)
         for _step in range(maximum_steps):
             prediction = model.predict(observation, deterministic=True)
             raw_action = prediction[0] if isinstance(prediction, tuple) else prediction
@@ -2395,6 +2551,12 @@ def run_continuation_compatibility_probe(
                 final_info = info if isinstance(info, Mapping) else {}
                 break
         if final_info is None:
+            if budget_limited:
+                raise RuntimeError(
+                    "continuation compatibility probe exhausted its bounded "
+                    "interaction allowance before the episode ended; increase "
+                    "--total-timesteps"
+                )
             raise RuntimeError(
                 "continuation compatibility probe exceeded the curriculum episode limit"
             )
@@ -2484,7 +2646,7 @@ def format_training_progress_line(
     best_text = f" | {' '.join(best_parts)}" if best_parts else ""
     probe_text = f" | probes={max(0, int(probe_steps)):,}"
     if maximum_probe_steps is not None:
-        probe_text += f"/{max(1, int(maximum_probe_steps)):,}"
+        probe_text += f"/{max(0, int(maximum_probe_steps)):,}"
     return (
         f"Training [{bar}] {percent:5.1f}% | "
         f"{completed_steps:,}/{total_steps:,} steps | {rate} | "
@@ -2559,6 +2721,14 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             safe_probe_noise_factory: Any = None,
             safe_probe_noise_std: float = DEFAULT_SAFE_ACTOR_PROBE_NOISE_STD,
             training_budget_state: TrainingBudgetState | None = None,
+            probe_reference_distance_m: float = 0.0,
+            probe_evidence_window: int = DEFAULT_PROBE_EVIDENCE_WINDOW,
+            probe_min_evidence_episodes: int = (
+                DEFAULT_PROBE_MIN_EVIDENCE_EPISODES
+            ),
+            probe_evidence_max_regression_m: float = (
+                DEFAULT_PROBE_EVIDENCE_MAX_REGRESSION_M
+            ),
         ) -> None:
             super().__init__(verbose=0)
             self.raw_env = raw_env
@@ -2583,6 +2753,21 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             self.safe_probe_noise_factory = safe_probe_noise_factory
             self.safe_probe_noise_std = max(0.0, float(safe_probe_noise_std))
             self.training_budget_state = training_budget_state
+            self.probe_reference_distance_m = max(
+                0.0,
+                finite_float(probe_reference_distance_m),
+            )
+            self.probe_evidence_window = max(1, int(probe_evidence_window))
+            self.probe_min_evidence_episodes = max(
+                1,
+                int(probe_min_evidence_episodes),
+            )
+            self.probe_evidence_max_regression_m = max(
+                0.0,
+                finite_float(probe_evidence_max_regression_m),
+            )
+            self.recent_training_distances_m: list[float] = []
+            self.recent_training_completed_lap = False
             self.probe_episodes_completed = 0
             self.policy_episodes_since_probe = 0
             self.current_episode_is_probe = False
@@ -2607,28 +2792,28 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                     summary["probe_overhead_timestep"] = (
                         self.training_budget_state.probe_steps
                     )
+                    summary["probe_budget_available_steps"] = (
+                        self.training_budget_state.available_probe_steps
+                    )
+                    summary["probe_deferred_requests"] = (
+                        self.training_budget_state.deferred_probe_requests
+                    )
                 completed_episode = True
                 if bool(summary.get("policy_controlled")):
                     if bool(summary.get("deterministic_probe")):
                         safe_result = self._record_safe_actor_probe(summary)
                         if safe_result is not None:
                             self._annotate_safe_actor_probe(summary, safe_result)
+                        else:
+                            self._record_regular_probe_result(summary)
                         self.probe_episodes_completed += 1
                         self.policy_episodes_since_probe = 0
                     else:
                         self.policy_episodes_since_probe += 1
+                        self._record_training_evidence(summary)
 
             if completed_episode:
-                next_episode_is_probe = (
-                    self._safe_actor_probe_required()
-                    or should_schedule_policy_probe(
-                        timestep=self._budget_timestep(),
-                        learning_starts=self.learning_starts,
-                        probe_episodes_completed=self.probe_episodes_completed,
-                        policy_episodes_since_probe=self.policy_episodes_since_probe,
-                        probe_interval=self.probe_interval,
-                    )
-                )
+                next_episode_is_probe = self._next_episode_should_probe()
                 self._apply_policy_mode(
                     deterministic_probe=next_episode_is_probe,
                     force=True,
@@ -2686,9 +2871,14 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                 final_sigma=self.final_sigma,
                 decay_steps=self.decay_steps,
             )
+            safe_probe_requested = bool(
+                deterministic_probe and self._safe_actor_probe_required()
+            )
             safe_context = (
                 self._safe_actor_probe_context() if deterministic_probe else None
             )
+            if safe_probe_requested and safe_context is None:
+                deterministic_probe = False
             safe_actor_probe = safe_context is not None
             mode_changed = deterministic_probe != self.current_episode_is_probe
             if force or mode_changed or not deterministic_probe:
@@ -2762,10 +2952,124 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             required = getattr(self.model, "safe_actor_probe_required", None)
             return bool(callable(required) and required())
 
+        def _safe_actor_probe_eligible(self) -> bool:
+            eligible = getattr(self.model, "safe_actor_probe_eligible", None)
+            return bool(eligible()) if callable(eligible) else True
+
+        def _safe_actor_next_probe_stage(self) -> str:
+            stage = getattr(self.model, "safe_actor_next_probe_stage", None)
+            return str(stage()) if callable(stage) else "screening"
+
+        def _pause_safe_actor_probe(self) -> None:
+            pause = getattr(self.model, "pause_safe_actor_probe", None)
+            if callable(pause):
+                pause()
+
         def _safe_actor_probe_context(self) -> dict[str, Any] | None:
             context = getattr(self.model, "safe_actor_probe_context", None)
             value = context() if callable(context) else None
             return dict(value) if isinstance(value, Mapping) else None
+
+        def _record_training_evidence(self, summary: Mapping[str, Any]) -> None:
+            distance_m = max(
+                finite_float(summary.get("distance_m")),
+                finite_float(summary.get("furthest_distance_m")),
+            )
+            self.recent_training_distances_m.append(max(0.0, distance_m))
+            self.recent_training_distances_m = self.recent_training_distances_m[
+                -self.probe_evidence_window :
+            ]
+            self.recent_training_completed_lap = bool(
+                self.recent_training_completed_lap
+                or int(finite_float(summary.get("laps_completed"))) > 0
+            )
+            record = getattr(self.model, "record_safe_actor_training_episode", None)
+            result = record(summary) if callable(record) else None
+            if not isinstance(result, Mapping):
+                return
+            decision = str(result.get("decision") or "")
+            if isinstance(summary, dict):
+                summary["safe_actor_training_evidence_decision"] = decision
+            if decision == "rolled_back_no_evidence":
+                self.recent_training_distances_m = []
+                self.recent_training_completed_lap = False
+                print(
+                    "\nSafe actor candidate "
+                    f"{result['candidate_id']} rolled back before on-track probes: "
+                    "recent training episodes showed no credible progress signal."
+                )
+
+        def _record_regular_probe_result(self, summary: Mapping[str, Any]) -> None:
+            distance_m = max(
+                finite_float(summary.get("distance_m")),
+                finite_float(summary.get("furthest_distance_m")),
+            )
+            self.probe_reference_distance_m = max(
+                self.probe_reference_distance_m,
+                distance_m,
+            )
+            self.recent_training_distances_m = []
+            self.recent_training_completed_lap = False
+
+        def _regular_probe_signal_is_credible(self) -> bool:
+            return training_progress_is_credible(
+                self.recent_training_distances_m,
+                reference_distance_m=self.probe_reference_distance_m,
+                minimum_episodes=self.probe_min_evidence_episodes,
+                maximum_regression_m=self.probe_evidence_max_regression_m,
+                completed_lap=self.recent_training_completed_lap,
+            )
+
+        def _probe_step_estimate(self, *, safe_actor_probe: bool) -> int:
+            stage = getattr(self.raw_env, "current_stage", None)
+            if stage is None:
+                return 1
+            probe_stage = (
+                self._safe_actor_next_probe_stage()
+                if safe_actor_probe
+                else "confirmation"
+            )
+            screening_limit = int(
+                getattr(
+                    self.raw_env,
+                    "safe_actor_screening_max_episode_steps",
+                    DEFAULT_SAFE_ACTOR_SCREENING_MAX_EPISODE_STEPS,
+                )
+            )
+            return safe_actor_probe_episode_step_limit(
+                stage,
+                probe_stage=probe_stage,
+                screening_max_episode_steps=screening_limit,
+            )
+
+        def _probe_budget_allows(self, *, safe_actor_probe: bool) -> bool:
+            if self.training_budget_state is None:
+                return True
+            allowed = self.training_budget_state.can_start_probe(
+                self._probe_step_estimate(safe_actor_probe=safe_actor_probe)
+            )
+            if not allowed and safe_actor_probe:
+                self._pause_safe_actor_probe()
+            return allowed
+
+        def _next_episode_should_probe(self) -> bool:
+            if self._safe_actor_probe_required():
+                return bool(
+                    self._safe_actor_probe_eligible()
+                    and self._probe_budget_allows(safe_actor_probe=True)
+                )
+            scheduled = should_schedule_policy_probe(
+                timestep=self._budget_timestep(),
+                learning_starts=self.learning_starts,
+                probe_episodes_completed=self.probe_episodes_completed,
+                policy_episodes_since_probe=self.policy_episodes_since_probe,
+                probe_interval=self.probe_interval,
+            )
+            return bool(
+                scheduled
+                and self._regular_probe_signal_is_credible()
+                and self._probe_budget_allows(safe_actor_probe=False)
+            )
 
         def _record_safe_actor_probe(
             self,
@@ -2866,6 +3170,13 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                 "rolled_back_screening",
             }
             if decision in terminal_decisions:
+                self.recent_training_distances_m = []
+                self.recent_training_completed_lap = False
+                if decision == "accepted":
+                    self.probe_reference_distance_m = max(
+                        self.probe_reference_distance_m,
+                        finite_float(result.get("accepted_distance_m")),
+                    )
                 worst_position_delta = result.get(
                     "worst_order_position_delta_m"
                 )
@@ -3107,7 +3418,7 @@ def make_console_progress_callback_class(BaseCallback: Any):
                     else 0
                 ),
                 maximum_probe_steps=(
-                    self.training_budget_state.maximum_probe_steps
+                    self.training_budget_state.effective_maximum_probe_steps
                     if self.training_budget_state is not None
                     else None
                 ),
@@ -3288,6 +3599,13 @@ def make_phased_continuation_td3_class(TD3: Any):
                 DEFAULT_SAFE_ACTOR_ANCHOR_BATCH_SIZE
             ),
             safe_actor_probe_base_seed: int = DEFAULT_SAFE_ACTOR_PROBE_BASE_SEED,
+            safe_actor_evidence_window: int = DEFAULT_PROBE_EVIDENCE_WINDOW,
+            safe_actor_min_evidence_episodes: int = 0,
+            safe_actor_evidence_max_regression_m: float = (
+                DEFAULT_PROBE_EVIDENCE_MAX_REGRESSION_M
+            ),
+            source_verified_distance_m: float = 0.0,
+            source_verified_minimum_distance_m: float = 0.0,
         ) -> None:
             self._agent6_actor_learning_rate_schedule = actor_learning_rate_schedule
             self._agent6_actor_updates_start_at = max(
@@ -3318,27 +3636,26 @@ def make_phased_continuation_td3_class(TD3: Any):
             self._agent6_safe_actor_trials_per_seed = int(
                 safe_actor_trials_per_seed
             )
-            if (
-                self._agent6_safe_actor_enabled
-                and self._agent6_safe_actor_trials_per_seed
-                != AGENT6_ROBUSTNESS_TRIALS_PER_SEED
+            if self._agent6_safe_actor_enabled and (
+                self._agent6_safe_actor_trials_per_seed < 2
+                or self._agent6_safe_actor_trials_per_seed % 2 != 0
             ):
                 raise ValueError(
-                    "safe actor robustness probes require exactly "
-                    f"{AGENT6_ROBUSTNESS_TRIALS_PER_SEED} trials per seed"
+                    "safe actor robustness probes require an even number of "
+                    "trials per seed, with at least two"
                 )
             self._agent6_safe_actor_screening_trials_per_seed = int(
                 safe_actor_screening_trials_per_seed
             )
-            if (
-                self._agent6_safe_actor_enabled
-                and self._agent6_safe_actor_screening_trials_per_seed
-                != DEFAULT_SAFE_ACTOR_SCREENING_TRIALS_PER_SEED
+            if self._agent6_safe_actor_enabled and (
+                self._agent6_safe_actor_screening_trials_per_seed < 2
+                or self._agent6_safe_actor_screening_trials_per_seed % 2 != 0
+                or self._agent6_safe_actor_screening_trials_per_seed
+                > self._agent6_safe_actor_trials_per_seed
             ):
                 raise ValueError(
-                    "safe actor screening requires exactly "
-                    f"{DEFAULT_SAFE_ACTOR_SCREENING_TRIALS_PER_SEED} trials "
-                    "per seed"
+                    "safe actor screening requires an even number of trials "
+                    "between two and the full trials-per-seed count"
                 )
             self._agent6_safe_actor_min_improvement_m = max(
                 0.0,
@@ -3371,8 +3688,26 @@ def make_phased_continuation_td3_class(TD3: Any):
                     "safe_actor_probe_base_seed must use the 32-bit unsigned range"
                 )
             self._agent6_safe_actor_probe_base_seed = probe_base_seed
-            self._agent6_safe_actor_accepted_distance_m = 0.0
-            self._agent6_safe_actor_accepted_minimum_distance_m = 0.0
+            self._agent6_safe_actor_evidence_window = max(
+                1,
+                int(safe_actor_evidence_window),
+            )
+            self._agent6_safe_actor_min_evidence_episodes = max(
+                0,
+                int(safe_actor_min_evidence_episodes),
+            )
+            self._agent6_safe_actor_evidence_max_regression_m = max(
+                0.0,
+                finite_float(safe_actor_evidence_max_regression_m),
+            )
+            self._agent6_safe_actor_accepted_distance_m = max(
+                0.0,
+                finite_float(source_verified_distance_m),
+            )
+            self._agent6_safe_actor_accepted_minimum_distance_m = max(
+                0.0,
+                finite_float(source_verified_minimum_distance_m),
+            )
             self._agent6_safe_actor_candidate_id = 0
             self._agent6_safe_actor_candidate_updates = 0
             self._agent6_safe_actor_waiting_for_probe = False
@@ -3390,7 +3725,15 @@ def make_phased_continuation_td3_class(TD3: Any):
             self._agent6_safe_actor_screened_out_blocks = 0
             self._agent6_safe_actor_early_rolled_back_blocks = 0
             self._agent6_safe_actor_equivalent_blocks = 0
+            self._agent6_safe_actor_no_evidence_blocks = 0
+            self._agent6_safe_actor_invalid_updates = 0
             self._agent6_safe_actor_probe_episodes_skipped = 0
+            self._agent6_safe_actor_evidence_candidate_id = 0
+            self._agent6_safe_actor_evidence_distances_m: list[float] = []
+            self._agent6_safe_actor_evidence_completed_lap = False
+            self._agent6_safe_actor_evidence_eligible = bool(
+                self._agent6_safe_actor_min_evidence_episodes == 0
+            )
             self._agent6_safe_actor_last_decision: dict[str, Any] | None = None
             self._agent6_safe_actor_anchor_observations = None
             self._clear_safe_actor_candidate_snapshot()
@@ -3536,12 +3879,140 @@ def make_phased_continuation_td3_class(TD3: Any):
                 )
             )
 
+        def safe_actor_probe_eligible(self) -> bool:
+            return bool(
+                self.safe_actor_probe_required()
+                and getattr(
+                    self,
+                    "_agent6_safe_actor_evidence_eligible",
+                    True,
+                )
+            )
+
+        def safe_actor_next_probe_stage(self) -> str:
+            first_seed = self._agent6_safe_actor_probe_seed_index == 0
+            within_screen = (
+                self._agent6_safe_actor_probe_trial_index
+                < self._agent6_safe_actor_screening_trials_per_seed
+            )
+            return "screening" if first_seed and within_screen else "confirmation"
+
+        def pause_safe_actor_probe(self) -> None:
+            if (
+                self.safe_actor_probe_required()
+                and self._agent6_safe_actor_candidate_state is not None
+            ):
+                self._restore_safe_actor_candidate()
+
+        def record_safe_actor_training_episode(
+            self,
+            summary: Mapping[str, Any],
+        ) -> dict[str, Any] | None:
+            if (
+                not getattr(self, "_agent6_safe_actor_enabled", False)
+                or self._agent6_safe_actor_candidate_updates <= 0
+                or bool(summary.get("deterministic_probe"))
+            ):
+                return None
+            candidate_id = self._agent6_safe_actor_candidate_id
+            if self._agent6_safe_actor_evidence_candidate_id != candidate_id:
+                self._agent6_safe_actor_evidence_candidate_id = candidate_id
+                self._agent6_safe_actor_evidence_distances_m = []
+                self._agent6_safe_actor_evidence_completed_lap = False
+                self._agent6_safe_actor_evidence_eligible = bool(
+                    self._agent6_safe_actor_min_evidence_episodes == 0
+                )
+
+            distance_m = max(
+                finite_float(summary.get("distance_m")),
+                finite_float(summary.get("furthest_distance_m")),
+            )
+            self._agent6_safe_actor_evidence_distances_m.append(
+                max(0.0, distance_m)
+            )
+            self._agent6_safe_actor_evidence_distances_m = (
+                self._agent6_safe_actor_evidence_distances_m[
+                    -self._agent6_safe_actor_evidence_window :
+                ]
+            )
+            self._agent6_safe_actor_evidence_completed_lap = bool(
+                self._agent6_safe_actor_evidence_completed_lap
+                or int(finite_float(summary.get("laps_completed"))) > 0
+            )
+            credible = training_progress_is_credible(
+                self._agent6_safe_actor_evidence_distances_m,
+                reference_distance_m=(
+                    self._agent6_safe_actor_accepted_distance_m
+                ),
+                minimum_episodes=max(
+                    1,
+                    self._agent6_safe_actor_min_evidence_episodes,
+                ),
+                maximum_regression_m=(
+                    self._agent6_safe_actor_evidence_max_regression_m
+                ),
+                minimum_improvement_m=(
+                    self._agent6_safe_actor_min_improvement_m
+                ),
+                completed_lap=(
+                    self._agent6_safe_actor_evidence_completed_lap
+                ),
+            )
+            self._agent6_safe_actor_evidence_eligible = bool(
+                credible or self._agent6_safe_actor_min_evidence_episodes == 0
+            )
+            if self._agent6_safe_actor_evidence_eligible:
+                return {
+                    "candidate_id": candidate_id,
+                    "decision": "probe_eligible",
+                    "evidence_episodes": len(
+                        self._agent6_safe_actor_evidence_distances_m
+                    ),
+                }
+
+            evidence_complete = (
+                len(self._agent6_safe_actor_evidence_distances_m)
+                >= self._agent6_safe_actor_evidence_window
+            )
+            if not (self.safe_actor_probe_required() and evidence_complete):
+                return {
+                    "candidate_id": candidate_id,
+                    "decision": "evidence_pending",
+                    "evidence_episodes": len(
+                        self._agent6_safe_actor_evidence_distances_m
+                    ),
+                }
+
+            skipped_episodes = (
+                2
+                * self._agent6_safe_actor_probe_repeats
+                * self._agent6_safe_actor_trials_per_seed
+            )
+            self._restore_safe_actor()
+            self._agent6_safe_actor_rolled_back_blocks += 1
+            self._agent6_safe_actor_no_evidence_blocks += 1
+            self._agent6_safe_actor_probe_episodes_skipped += skipped_episodes
+            self._agent6_safe_actor_last_decision = {
+                "candidate_id": candidate_id,
+                "decision": "rolled_back_no_evidence",
+                "probe_episodes_skipped": skipped_episodes,
+            }
+            self._reset_safe_actor_probe_runtime()
+            return {
+                "candidate_id": candidate_id,
+                "decision": "rolled_back_no_evidence",
+                "probe_episodes_skipped": skipped_episodes,
+            }
+
         def safe_actor_probe_context(self) -> dict[str, Any] | None:
-            if not self.safe_actor_probe_required():
+            if not self.safe_actor_probe_eligible():
                 return None
             if self._resolve_policy_equivalent_candidate():
                 return None
             self._begin_safe_actor_comparison()
+            self._activate_safe_actor_probe_mode(
+                self._agent6_safe_actor_probe_phase
+            )
             probe_index = self._agent6_safe_actor_probe_seed_index + 1
             trial_index = self._agent6_safe_actor_probe_trial_index + 1
             return {
@@ -3551,12 +4022,7 @@ def make_phased_continuation_td3_class(TD3: Any):
                 "probe_repeats": self._agent6_safe_actor_probe_repeats,
                 "trial_index": trial_index,
                 "trials_per_seed": self._agent6_safe_actor_trials_per_seed,
-                "probe_stage": (
-                    "screening"
-                    if trial_index
-                    <= self._agent6_safe_actor_screening_trials_per_seed
-                    else "confirmation"
-                ),
+                "probe_stage": self.safe_actor_next_probe_stage(),
                 "order_position": (
                     self._agent6_safe_actor_probe_order_position + 1
                 ),
@@ -3597,6 +4063,12 @@ def make_phased_continuation_td3_class(TD3: Any):
                 "policy_equivalent_blocks": int(
                     getattr(self, "_agent6_safe_actor_equivalent_blocks", 0)
                 ),
+                "no_evidence_blocks": int(
+                    getattr(self, "_agent6_safe_actor_no_evidence_blocks", 0)
+                ),
+                "invalid_actor_updates": int(
+                    getattr(self, "_agent6_safe_actor_invalid_updates", 0)
+                ),
                 "probe_episodes_skipped": int(
                     getattr(
                         self,
@@ -3625,6 +4097,20 @@ def make_phased_continuation_td3_class(TD3: Any):
                     * getattr(self, "_agent6_safe_actor_blocks_per_probe", 1)
                 ),
                 "waiting_for_probe": self.safe_actor_probe_required(),
+                "probe_eligible": bool(
+                    getattr(
+                        self,
+                        "_agent6_safe_actor_evidence_eligible",
+                        True,
+                    )
+                ),
+                "evidence_distances_m": list(
+                    getattr(
+                        self,
+                        "_agent6_safe_actor_evidence_distances_m",
+                        [],
+                    )
+                ),
                 "probe_phase": str(
                     getattr(self, "_agent6_safe_actor_probe_phase", "idle")
                 ),
@@ -3745,6 +4231,12 @@ def make_phased_continuation_td3_class(TD3: Any):
             self._agent6_safe_actor_candidate_distances_m = []
             self._agent6_safe_actor_reference_order_positions = []
             self._agent6_safe_actor_candidate_order_positions = []
+            self._agent6_safe_actor_evidence_candidate_id = 0
+            self._agent6_safe_actor_evidence_distances_m = []
+            self._agent6_safe_actor_evidence_completed_lap = False
+            self._agent6_safe_actor_evidence_eligible = bool(
+                self._agent6_safe_actor_min_evidence_episodes == 0
+            )
             self._clear_safe_actor_candidate_snapshot()
 
         def _resolve_safe_actor_comparison(
@@ -3893,7 +4385,8 @@ def make_phased_continuation_td3_class(TD3: Any):
             completed_trial = self._agent6_safe_actor_probe_trial_index + 1
 
             if (
-                completed_trial
+                self._agent6_safe_actor_probe_seed_index == 0
+                and completed_trial
                 == self._agent6_safe_actor_screening_trials_per_seed
             ):
                 seed_start = (
@@ -3931,7 +4424,21 @@ def make_phased_continuation_td3_class(TD3: Any):
                     )
                 result.update(self._safe_actor_comparison_metrics(screening))
                 result["decision"] = "screening_passed"
-                self._agent6_safe_actor_probe_trial_index += 1
+                if final_trial and final_seed:
+                    comparison = self._compare_safe_actor_probes(
+                        seed_count=1,
+                        trials_per_seed=self._agent6_safe_actor_trials_per_seed,
+                    )
+                    return self._resolve_safe_actor_comparison(
+                        result,
+                        comparison,
+                        decision=comparison.decision,
+                    )
+                if final_trial:
+                    self._agent6_safe_actor_probe_seed_index += 1
+                    self._agent6_safe_actor_probe_trial_index = 0
+                else:
+                    self._agent6_safe_actor_probe_trial_index += 1
                 self._agent6_safe_actor_probe_order_position = 0
                 self._activate_safe_actor_probe_mode(
                     self._current_safe_actor_probe_order()[0]
@@ -4168,19 +4675,44 @@ def make_phased_continuation_td3_class(TD3: Any):
                         replay_data.observations,
                         self.actor(replay_data.observations),
                     ).mean()
-                    actor_losses.append(float(actor_loss.item()))
-                    self.actor.optimizer.zero_grad()
-                    actor_loss.backward()
-                    if getattr(self, "_agent6_safe_actor_enabled", False):
+                    actor_loss_value = float(actor_loss.item())
+                    actor_update_valid = math.isfinite(actor_loss_value)
+                    if actor_update_valid:
+                        actor_losses.append(actor_loss_value)
+                        self.actor.optimizer.zero_grad()
+                        actor_loss.backward()
+                    if (
+                        actor_update_valid
+                        and getattr(self, "_agent6_safe_actor_enabled", False)
+                    ):
                         gradient_norm = th.nn.utils.clip_grad_norm_(
                             self.actor.parameters(),
                             self._agent6_safe_actor_gradient_norm,
                         )
-                        actor_gradient_norms.append(float(gradient_norm.item()))
-                    self.actor.optimizer.step()
-                    if getattr(self, "_agent6_safe_actor_enabled", False):
+                        gradient_norm_value = float(gradient_norm.item())
+                        actor_update_valid = math.isfinite(gradient_norm_value)
+                        if actor_update_valid:
+                            actor_gradient_norms.append(gradient_norm_value)
+                    if not actor_update_valid:
+                        self.actor.optimizer.zero_grad()
+                        if getattr(self, "_agent6_safe_actor_enabled", False):
+                            self._agent6_safe_actor_invalid_updates += 1
+                    else:
+                        self.actor.optimizer.step()
+                    if (
+                        actor_update_valid
+                        and getattr(self, "_agent6_safe_actor_enabled", False)
+                    ):
                         if self._agent6_safe_actor_candidate_updates == 0:
                             self._agent6_safe_actor_candidate_id += 1
+                            self._agent6_safe_actor_evidence_candidate_id = (
+                                self._agent6_safe_actor_candidate_id
+                            )
+                            self._agent6_safe_actor_evidence_distances_m = []
+                            self._agent6_safe_actor_evidence_completed_lap = False
+                            self._agent6_safe_actor_evidence_eligible = bool(
+                                self._agent6_safe_actor_min_evidence_episodes == 0
+                            )
                         constraint_observations = (
                             self._safe_actor_constraint_observations(
                                 replay_data.observations
@@ -4200,16 +4732,17 @@ def make_phased_continuation_td3_class(TD3: Any):
                         ):
                             self._agent6_safe_actor_waiting_for_probe = True
                             candidate_block_complete = True
-                    polyak_update(
-                        self.actor.parameters(),
-                        self.actor_target.parameters(),
-                        self.tau,
-                    )
-                    polyak_update(
-                        self.actor_batch_norm_stats,
-                        self.actor_batch_norm_stats_target,
-                        1.0,
-                    )
+                    if actor_update_valid:
+                        polyak_update(
+                            self.actor.parameters(),
+                            self.actor_target.parameters(),
+                            self.tau,
+                        )
+                        polyak_update(
+                            self.actor_batch_norm_stats,
+                            self.actor_batch_norm_stats_target,
+                            1.0,
+                        )
                     if candidate_block_complete:
                         self._resolve_policy_equivalent_candidate()
 
@@ -4254,6 +4787,18 @@ def make_phased_continuation_td3_class(TD3: Any):
                     "time/probe_overhead_steps",
                     budget_state.probe_steps,
                 )
+                self.logger.record(
+                    "time/probe_available_steps",
+                    budget_state.available_probe_steps,
+                )
+                self.logger.record(
+                    "time/probe_fraction",
+                    budget_state.as_dict()["probe_fraction"],
+                )
+                self.logger.record(
+                    "time/probe_deferred_requests",
+                    budget_state.deferred_probe_requests,
+                )
             if getattr(self, "_agent6_safe_actor_enabled", False):
                 status = self.safe_actor_status()
                 self.logger.record(
@@ -4279,6 +4824,18 @@ def make_phased_continuation_td3_class(TD3: Any):
                 self.logger.record(
                     "train/safe_actor_policy_equivalent_blocks",
                     status["policy_equivalent_blocks"],
+                )
+                self.logger.record(
+                    "train/safe_actor_no_evidence_blocks",
+                    status["no_evidence_blocks"],
+                )
+                self.logger.record(
+                    "train/safe_actor_invalid_updates",
+                    status["invalid_actor_updates"],
+                )
+                self.logger.record(
+                    "train/safe_actor_probe_eligible",
+                    int(status["probe_eligible"]),
                 )
                 self.logger.record(
                     "train/safe_actor_probe_episodes_skipped",
@@ -4447,8 +5004,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Hard ceiling for evaluation interactions excluded from the "
-            "training-step target. Defaults to ten times --total-timesteps."
+            "Absolute ceiling for probe interactions excluded from the "
+            "training-step target. The ratio ceiling can make this lower."
+        ),
+    )
+    parser.add_argument(
+        "--max-probe-fraction",
+        type=float,
+        default=DEFAULT_MAX_PROBE_FRACTION,
+        help=(
+            "Maximum fraction of total interactions spent probing. Values above "
+            "0.20 are rejected so at least 80%% remains training data."
         ),
     )
     parser.add_argument("--track", default=DEFAULT_TRACK_NAME)
@@ -4582,8 +5148,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_SAFE_ACTOR_TRIALS_PER_SEED,
         help=(
-            "Trials per policy and challenge seed. Protocol v7 requires four "
-            "so each policy runs twice in each order position."
+            "Balanced trials per policy and challenge seed. The internal "
+            "protocol defaults to one run in each order position."
         ),
     )
     parser.add_argument(
@@ -4591,8 +5157,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_SAFE_ACTOR_SCREENING_TRIALS_PER_SEED,
         help=(
-            "Balanced trials per policy used for the inexpensive first-stage "
-            "candidate screen. Protocol v7 requires two."
+            "Balanced trials per policy used for the short collapse screen on "
+            "the first challenge seed."
         ),
     )
     parser.add_argument(
@@ -4639,6 +5205,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_SAFE_ACTOR_ANCHOR_BATCH_SIZE,
         help="Replay observations retained for action-space trust-region checks.",
+    )
+    parser.add_argument(
+        "--probe-evidence-window",
+        type=int,
+        default=DEFAULT_PROBE_EVIDENCE_WINDOW,
+        help="Recent candidate-controlled episodes used before admitting probes.",
+    )
+    parser.add_argument(
+        "--probe-min-evidence-episodes",
+        type=int,
+        default=DEFAULT_PROBE_MIN_EVIDENCE_EPISODES,
+        help="Minimum recent training episodes required for a progress signal.",
+    )
+    parser.add_argument(
+        "--probe-evidence-max-regression-m",
+        type=float,
+        default=DEFAULT_PROBE_EVIDENCE_MAX_REGRESSION_M,
+        help="Largest median training regression allowed by the evidence gate.",
     )
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument(
@@ -4799,9 +5383,24 @@ def parse_args() -> argparse.Namespace:
         args.save_best_replay_buffer = args.continuation
     if args.safe_actor_improvement is None:
         args.safe_actor_improvement = args.continuation
+    if (
+        not math.isfinite(args.max_probe_fraction)
+        or not 0.0 < args.max_probe_fraction <= DEFAULT_MAX_PROBE_FRACTION
+    ):
+        parser.error(
+            "--max-probe-fraction must be in (0, "
+            f"{DEFAULT_MAX_PROBE_FRACTION:.2f}]"
+        )
     if args.max_probe_overhead_steps is None:
-        args.max_probe_overhead_steps = (
-            args.total_timesteps * DEFAULT_PROBE_OVERHEAD_MULTIPLIER
+        args.max_probe_overhead_steps = max(
+            1,
+            int(
+                math.floor(
+                    max(1, args.total_timesteps)
+                    * args.max_probe_fraction
+                    / (1.0 - args.max_probe_fraction)
+                )
+            ),
         )
 
     if not args.continuation and args.start_stage != "launch":
@@ -4887,19 +5486,22 @@ def parse_args() -> argparse.Namespace:
         parser.error("--safe-actor-probe-repeats must be at least 3")
     if args.safe_actor_probe_repeats % 2 == 0:
         parser.error("--safe-actor-probe-repeats must be odd")
-    if args.safe_actor_trials_per_seed != AGENT6_ROBUSTNESS_TRIALS_PER_SEED:
-        parser.error(
-            "--safe-actor-trials-per-seed must be exactly "
-            f"{AGENT6_ROBUSTNESS_TRIALS_PER_SEED} for the balanced protocol"
-        )
     if (
-        args.safe_actor_screening_trials_per_seed
-        != DEFAULT_SAFE_ACTOR_SCREENING_TRIALS_PER_SEED
+        args.safe_actor_trials_per_seed < 2
+        or args.safe_actor_trials_per_seed % 2 != 0
     ):
         parser.error(
-            "--safe-actor-screening-trials-per-seed must be exactly "
-            f"{DEFAULT_SAFE_ACTOR_SCREENING_TRIALS_PER_SEED} for the balanced "
-            "screening protocol"
+            "--safe-actor-trials-per-seed must be even and at least 2"
+        )
+    if (
+        args.safe_actor_screening_trials_per_seed < 2
+        or args.safe_actor_screening_trials_per_seed % 2 != 0
+        or args.safe_actor_screening_trials_per_seed
+        > args.safe_actor_trials_per_seed
+    ):
+        parser.error(
+            "--safe-actor-screening-trials-per-seed must be even and between "
+            "2 and --safe-actor-trials-per-seed"
         )
     if not 0 <= args.safe_actor_probe_base_seed <= MAX_REPRODUCIBLE_SEED:
         parser.error(
@@ -4940,6 +5542,20 @@ def parse_args() -> argparse.Namespace:
         )
     if args.safe_actor_anchor_batch_size < 1:
         parser.error("--safe-actor-anchor-batch-size must be at least 1")
+    if args.probe_evidence_window < 1:
+        parser.error("--probe-evidence-window must be at least 1")
+    if not 1 <= args.probe_min_evidence_episodes <= args.probe_evidence_window:
+        parser.error(
+            "--probe-min-evidence-episodes must be between 1 and "
+            "--probe-evidence-window"
+        )
+    if (
+        not math.isfinite(args.probe_evidence_max_regression_m)
+        or args.probe_evidence_max_regression_m < 0.0
+    ):
+        parser.error(
+            "--probe-evidence-max-regression-m must be finite and non-negative"
+        )
     if args.continuation and actor_update_start_timestep(args) >= args.total_timesteps:
         parser.error(
             "replay refill plus critic warm-up must be less than --total-timesteps"
@@ -5014,9 +5630,10 @@ def main() -> None:
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     args.tensorboard_dir.mkdir(parents=True, exist_ok=True)
     args.replay_buffer_path.parent.mkdir(parents=True, exist_ok=True)
-    training_budget_state = TrainingBudgetState(
+    training_budget_state = ProbeBudgetController(
         target_training_steps=args.total_timesteps,
         maximum_probe_steps=args.max_probe_overhead_steps,
+        maximum_probe_fraction=args.max_probe_fraction,
     )
 
     env_class = make_training_env_class(gym, spaces)
@@ -5140,6 +5757,23 @@ def main() -> None:
             ),
             safe_actor_anchor_batch_size=args.safe_actor_anchor_batch_size,
             safe_actor_probe_base_seed=args.safe_actor_probe_base_seed,
+            safe_actor_evidence_window=args.probe_evidence_window,
+            safe_actor_min_evidence_episodes=(
+                args.probe_min_evidence_episodes
+            ),
+            safe_actor_evidence_max_regression_m=(
+                args.probe_evidence_max_regression_m
+            ),
+            source_verified_distance_m=finite_float(
+                metadata["continuation"].get(
+                    "source_verified_evaluation_progress_m"
+                )
+            ),
+            source_verified_minimum_distance_m=finite_float(
+                metadata["continuation"].get(
+                    "source_verified_evaluation_minimum_progress_m"
+                )
+            ),
         )
         metadata["continuation"]["source_model_num_timesteps"] = int(
             getattr(model, "num_timesteps", 0)
@@ -5202,7 +5836,10 @@ def main() -> None:
             "per candidate, with a "
             f"{args.safe_actor_screening_trials_per_seed}-trial staged screen; "
             f"training budget={args.total_timesteps:,} non-probe steps, "
-            f"probe ceiling={args.max_probe_overhead_steps:,} steps."
+            "effective probe ceiling="
+            f"{training_budget_state.effective_maximum_probe_steps:,} steps "
+            f"({args.max_probe_fraction:.0%} of all interactions); "
+            "probe exhaustion defers comparisons while critic learning continues."
         )
 
     progress_state = TrainingProgressState()
@@ -5229,6 +5866,16 @@ def main() -> None:
             safe_probe_noise_factory=make_safe_probe_noise,
             safe_probe_noise_std=args.safe_actor_probe_noise_std,
             training_budget_state=training_budget_state,
+            probe_reference_distance_m=finite_float(
+                metadata["continuation"].get(
+                    "source_verified_evaluation_progress_m"
+                )
+            ),
+            probe_evidence_window=args.probe_evidence_window,
+            probe_min_evidence_episodes=args.probe_min_evidence_episodes,
+            probe_evidence_max_regression_m=(
+                args.probe_evidence_max_regression_m
+            ),
         ),
         make_checkpoint_callback(
             CheckpointCallback,
@@ -5282,18 +5929,15 @@ def main() -> None:
             metadata["end_of_run_summary"] = end_summary
         write_json(run_dir / "training_metadata.json", metadata)
         write_json(metadata_path_for_policy(args.model_path), metadata)
-        if training_budget_state.stop_reason == "probe_overhead_limit_reached":
-            print(
-                "Warning: stopped at the probe-overhead safety ceiling before "
-                "the requested training budget was complete."
-            )
         print(
             "Budget result: "
             f"training={training_budget_state.training_steps:,}/"
             f"{training_budget_state.target_training_steps:,}, "
             f"probes={training_budget_state.probe_steps:,}/"
-            f"{training_budget_state.maximum_probe_steps:,}, "
-            f"environment={training_budget_state.environment_steps:,}."
+            f"{training_budget_state.effective_maximum_probe_steps:,}, "
+            f"environment={training_budget_state.environment_steps:,}, "
+            "deferred probe requests="
+            f"{training_budget_state.deferred_probe_requests:,}."
         )
         print(f"Saved Agent 6 TD3 model to {args.model_path}")
         print(f"Saved training run logs to {run_dir}")
