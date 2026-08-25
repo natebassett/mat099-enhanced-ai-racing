@@ -30,6 +30,10 @@ from agents.td3_agent import (  # noqa: E402
     AGENT6_ACTION_SHAPE,
     AGENT6_ACTION_SIZE,
     AGENT6_ACTION_VERSION,
+    AGENT6_LEGACY_ACTION_SHAPE,
+    AGENT6_LEGACY_ACTION_SIZE,
+    AGENT6_LEGACY_ACTION_VERSION,
+    AGENT6_LEGACY_OBSERVATION_VERSION,
     AGENT6_MODEL_FAMILY,
     AGENT6_OBSERVATION_VERSION,
     AGENT6_ROBUSTNESS_PROTOCOL,
@@ -47,6 +51,7 @@ from agents.td3_agent import (  # noqa: E402
     FEATURE_NAMES,
     G_TRACK_3_LENGTH_METRES,
     MAX_REPRODUCIBLE_SEED,
+    PEDAL_DEADZONE,
     SeededSteeringActionNoise,
     TRAINING_CHALLENGE_SEED_MAX,
     TRAINING_CHALLENGE_SEED_MIN,
@@ -55,6 +60,7 @@ from agents.td3_agent import (  # noqa: E402
     build_td3_observation,
     clamp,
     counterbalanced_pair_order,
+    decode_legacy_td3_action,
     decode_td3_action,
     episode_metadata_is_deterministic_probe,
     finite_clamp,
@@ -449,6 +455,32 @@ def continuation_source_errors(
             f"stage {start_stage} requires {required_progress_m:.1f}m"
         )
     return errors
+
+
+def continuation_source_uses_legacy_action_contract(
+    args: argparse.Namespace,
+) -> bool:
+    if not bool(getattr(args, "continuation", False)):
+        return False
+    return policy_uses_legacy_action_contract(
+        read_policy_metadata(getattr(args, "resume_from", None))
+    )
+
+
+def training_uses_legacy_action_contract(args: argparse.Namespace) -> bool:
+    """Preserve v1 end to end unless its lossy migration is explicitly requested."""
+    return (
+        continuation_source_uses_legacy_action_contract(args)
+        and not bool(getattr(args, "allow_legacy_action_migration", False))
+    )
+
+
+def training_action_size(args: argparse.Namespace) -> int:
+    return (
+        AGENT6_LEGACY_ACTION_SIZE
+        if training_uses_legacy_action_contract(args)
+        else AGENT6_ACTION_SIZE
+    )
 
 
 def policy_action_start_timestep(args: argparse.Namespace) -> int:
@@ -1050,6 +1082,25 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
     source_uses_legacy_action_contract = policy_uses_legacy_action_contract(
         source_metadata
     )
+    uses_legacy_action_contract = training_uses_legacy_action_contract(args)
+    action_contract_migration_required = bool(
+        source_uses_legacy_action_contract and not uses_legacy_action_contract
+    )
+    observation_version = (
+        AGENT6_LEGACY_OBSERVATION_VERSION
+        if uses_legacy_action_contract
+        else AGENT6_OBSERVATION_VERSION
+    )
+    action_version = (
+        AGENT6_LEGACY_ACTION_VERSION
+        if uses_legacy_action_contract
+        else AGENT6_ACTION_VERSION
+    )
+    action_shape = (
+        AGENT6_LEGACY_ACTION_SHAPE
+        if uses_legacy_action_contract
+        else AGENT6_ACTION_SHAPE
+    )
     source_progress_m = (
         finite_float(source_evaluation.get("median_progress_m"))
         if isinstance(source_evaluation, Mapping)
@@ -1062,11 +1113,11 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
     )
     return {
         "model_family": AGENT6_MODEL_FAMILY,
-        "observation_version": AGENT6_OBSERVATION_VERSION,
-        "action_version": AGENT6_ACTION_VERSION,
+        "observation_version": observation_version,
+        "action_version": action_version,
         "reward_version": REWARD_VERSION,
         "feature_names": FEATURE_NAMES,
-        "action_shape": AGENT6_ACTION_SHAPE,
+        "action_shape": action_shape,
         "algorithm": "TD3",
         "agent_name": "TD3 Scratch Racer",
         "agent_number": 6,
@@ -1078,13 +1129,25 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "racing_line_imitation": False,
         "automatic_gear_shift": True,
         "actuator_rate_limited": True,
-        "action_contract": {
-            "outputs": ["steer", "signed_longitudinal"],
-            "signed_longitudinal": (
-                "positive values request throttle; negative values request brake"
-            ),
-            "exclusive_pedals_by_construction": True,
-        },
+        "action_contract": (
+            {
+                "outputs": ["steer", "throttle", "brake"],
+                "pedal_resolution": (
+                    "apply deadzones, then execute the stronger positive pedal"
+                ),
+                "exclusive_pedals_at_actuator": True,
+                "legacy_contract_preserved": True,
+            }
+            if uses_legacy_action_contract
+            else {
+                "outputs": ["steer", "signed_longitudinal"],
+                "signed_longitudinal": (
+                    "positive values request throttle; negative values request brake"
+                ),
+                "exclusive_pedals_by_construction": True,
+                "legacy_contract_preserved": False,
+            }
+        ),
         "reward_contract": {
             "version": REWARD_VERSION,
             "low_speed_creep_bonus": False,
@@ -1127,15 +1190,30 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
                 source_minimum_progress_m
             ),
             "source_policy_contract_migration": {
-                "required": bool(source_uses_legacy_action_contract),
+                "required": action_contract_migration_required,
                 "reason": (
-                    "legacy_three_head_action_contract"
-                    if source_uses_legacy_action_contract
-                    else "current_contract_or_no_source"
+                    "explicit_legacy_to_signed_longitudinal_experiment"
+                    if action_contract_migration_required
+                    else (
+                        "legacy_contract_preserved_end_to_end"
+                        if uses_legacy_action_contract
+                        else "current_contract_or_no_source"
+                    )
                 ),
-                "target_observation_version": AGENT6_OBSERVATION_VERSION,
-                "target_action_version": AGENT6_ACTION_VERSION,
-                "target_action_shape": AGENT6_ACTION_SHAPE,
+                "explicit_opt_in": bool(
+                    getattr(args, "allow_legacy_action_migration", False)
+                ),
+                "target_observation_version": observation_version,
+                "target_action_version": action_version,
+                "target_action_shape": action_shape,
+            },
+            "compatibility_probe": {
+                "enabled": bool(args.continuation_compatibility_probe),
+                "minimum_source_median_fraction": (
+                    args.continuation_compatibility_min_fraction
+                ),
+                "runs_before_replay_collection": True,
+                "probe_only": bool(args.continuation_compatibility_probe_only),
             },
             "source_policy_guard": (
                 "not_applicable"
@@ -1321,6 +1399,7 @@ def maybe_suppress_stdout(enabled: bool):
 def make_scratch_action_space(
     spaces: Any,
     *,
+    action_size: int = AGENT6_ACTION_SIZE,
     warmup_action_mode: str = "launch-biased",
     warmup_steer_std: float = 0.30,
     warmup_accel_min: float = 0.25,
@@ -1329,7 +1408,16 @@ def make_scratch_action_space(
 ):
     class ScratchActionBox(spaces.Box):
         def __init__(self) -> None:
-            super().__init__(low=-1.0, high=1.0, shape=(AGENT6_ACTION_SIZE,), dtype=np.float32)
+            if int(action_size) != AGENT6_ACTION_SIZE:
+                raise ValueError(
+                    "custom scratch warm-up supports the current two-head contract only"
+                )
+            super().__init__(
+                low=-1.0,
+                high=1.0,
+                shape=(int(action_size),),
+                dtype=np.float32,
+            )
             self.warmup_action_mode = warmup_action_mode
             self.warmup_steer_std = max(0.0, float(warmup_steer_std))
             accel_min = clamp(float(warmup_accel_min), -1.0, 1.0)
@@ -1390,6 +1478,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             initial_stage_id: str = "launch",
             pre_update_training_phase: str = "warmup",
             use_custom_warmup_action_space: bool = True,
+            use_legacy_action_contract: bool = False,
             training_budget_state: TrainingBudgetState | None = None,
             safe_actor_screening_max_episode_steps: int = (
                 DEFAULT_SAFE_ACTOR_SCREENING_MAX_EPISODE_STEPS
@@ -1403,6 +1492,12 @@ def make_training_env_class(gym: Any, spaces: Any):
             self.quiet_reset_log = quiet_reset_log
             self.run_dir = Path(run_dir) if run_dir is not None else None
             self.learning_starts = max(0, int(learning_starts))
+            self.use_legacy_action_contract = bool(use_legacy_action_contract)
+            self.action_size = (
+                AGENT6_LEGACY_ACTION_SIZE
+                if self.use_legacy_action_contract
+                else AGENT6_ACTION_SIZE
+            )
             self.training_budget_state = training_budget_state
             self.safe_actor_screening_max_episode_steps = max(
                 1,
@@ -1412,6 +1507,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             if use_custom_warmup_action_space:
                 self.action_space = make_scratch_action_space(
                     spaces,
+                    action_size=self.action_size,
                     warmup_action_mode=warmup_action_mode,
                     warmup_steer_std=warmup_steer_std,
                     warmup_accel_min=warmup_accel_min,
@@ -1422,7 +1518,7 @@ def make_training_env_class(gym: Any, spaces: Any):
                 self.action_space = spaces.Box(
                     low=-1.0,
                     high=1.0,
-                    shape=(AGENT6_ACTION_SIZE,),
+                    shape=(self.action_size,),
                     dtype=np.float32,
                 )
             self.observation_space = spaces.Box(
@@ -1622,7 +1718,11 @@ def make_training_env_class(gym: Any, spaces: Any):
             assert self.runner.env is not None
             assert self.lap_tracker is not None
             raw_values = np.asarray(raw_action, dtype=np.float32).reshape(-1)
-            action = decode_td3_action(raw_values)
+            action = (
+                decode_legacy_td3_action(raw_values)
+                if self.use_legacy_action_contract
+                else decode_td3_action(raw_values)
+            )
             current_speed = finite_float(self.current_telemetry.get("speedX"))
             action = rate_limit_td3_action(
                 action,
@@ -2096,14 +2196,22 @@ def make_training_env_class(gym: Any, spaces: Any):
             if self._step_writer is None:
                 return
             sensors = track_sensors(telemetry)
-            padded = np.zeros(AGENT6_ACTION_SIZE, dtype=float)
-            padded[: min(AGENT6_ACTION_SIZE, len(raw_action))] = raw_action[
-                :AGENT6_ACTION_SIZE
+            padded = np.zeros(self.action_size, dtype=float)
+            padded[: min(self.action_size, len(raw_action))] = raw_action[
+                : self.action_size
             ]
-            raw_longitudinal = finite_clamp(padded[1], -1.0, 1.0)
-            raw_accel = max(0.0, raw_longitudinal)
-            raw_brake = max(0.0, -raw_longitudinal)
-            pedal_conflict = False
+            if self.use_legacy_action_contract:
+                raw_accel = max(0.0, finite_clamp(padded[1], -1.0, 1.0))
+                raw_brake = max(0.0, finite_clamp(padded[2], -1.0, 1.0))
+                raw_longitudinal = clamp(raw_accel - raw_brake, -1.0, 1.0)
+                pedal_conflict = (
+                    raw_accel >= PEDAL_DEADZONE and raw_brake >= PEDAL_DEADZONE
+                )
+            else:
+                raw_longitudinal = finite_clamp(padded[1], -1.0, 1.0)
+                raw_accel = max(0.0, raw_longitudinal)
+                raw_brake = max(0.0, -raw_longitudinal)
+                pedal_conflict = False
             self._step_writer.writerow(
                 [
                     self.episodes_started,
@@ -2241,6 +2349,86 @@ class TrainingBudgetState:
             "probe_fraction": self.probe_steps / total,
             "stop_reason": self.stop_reason,
         }
+
+
+def continuation_compatibility_minimum_distance_m(
+    args: argparse.Namespace,
+) -> float:
+    metadata = read_policy_metadata(args.resume_from)
+    evaluation = metadata.get("best_evaluation")
+    source_median = (
+        finite_float(evaluation.get("median_progress_m"))
+        if isinstance(evaluation, Mapping)
+        else 0.0
+    )
+    return source_median * float(args.continuation_compatibility_min_fraction)
+
+
+def run_continuation_compatibility_probe(
+    model: Any,
+    raw_env: Any,
+    *,
+    minimum_distance_m: float,
+    training_budget_state: TrainingBudgetState | None = None,
+    seed: int | None = None,
+) -> dict[str, Any]:
+    """Verify the loaded policy in TORCS before replay collection or updates."""
+    minimum_distance = max(0.0, finite_float(minimum_distance_m))
+    raw_env.set_policy_mode(
+        deterministic_probe=True,
+        action_noise_sigma=0.0,
+        training_phase="continuation_compatibility_probe",
+    )
+    try:
+        observation, _reset_info = raw_env.reset(seed=seed)
+        final_info: Mapping[str, Any] | None = None
+        maximum_steps = max(1, int(raw_env.current_stage.max_episode_steps)) + 1
+        for _step in range(maximum_steps):
+            prediction = model.predict(observation, deterministic=True)
+            raw_action = prediction[0] if isinstance(prediction, tuple) else prediction
+            observation, _reward, terminated, truncated, info = raw_env.step(
+                raw_action
+            )
+            if training_budget_state is not None:
+                training_budget_state.record_infos([info])
+            if terminated or truncated:
+                final_info = info if isinstance(info, Mapping) else {}
+                break
+        if final_info is None:
+            raise RuntimeError(
+                "continuation compatibility probe exceeded the curriculum episode limit"
+            )
+        summary = final_info.get("episode_summary")
+        if not isinstance(summary, Mapping):
+            raise RuntimeError(
+                "continuation compatibility probe produced no episode summary"
+            )
+        distance_m = max(
+            finite_float(summary.get("distance_m")),
+            finite_float(summary.get("furthest_distance_m")),
+        )
+        result = {
+            "passed": distance_m >= minimum_distance,
+            "minimum_distance_m": minimum_distance,
+            "distance_m": distance_m,
+            "steps": int(finite_float(summary.get("steps"))),
+            "termination_reason": str(summary.get("termination_reason") or ""),
+            "deterministic": True,
+            "seed": seed,
+        }
+        if not result["passed"]:
+            raise RuntimeError(
+                "continuation compatibility probe failed before training: "
+                f"reached {distance_m:.1f}m, required {minimum_distance:.1f}m. "
+                "The source policy/action contract was not preserved."
+            )
+        return result
+    finally:
+        raw_env.set_policy_mode(
+            deterministic_probe=False,
+            action_noise_sigma=0.0,
+            training_phase="replay_refill",
+        )
 
 
 def format_duration(seconds: float | None) -> str:
@@ -4129,7 +4317,10 @@ def create_td3_model(
         "device": args.device,
     }
     if args.continuation:
-        if policy_uses_legacy_action_contract(read_policy_metadata(args.resume_from)):
+        if (
+            continuation_source_uses_legacy_action_contract(args)
+            and args.allow_legacy_action_migration
+        ):
             legacy_model = TD3.load(str(args.resume_from), device=args.device)
             model = TD3(
                 "MlpPolicy",
@@ -4273,6 +4464,40 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Permit continuation from a verified policy other than the "
             "canonical best-evaluation champion."
+        ),
+    )
+    parser.add_argument(
+        "--allow-legacy-action-migration",
+        action="store_true",
+        help=(
+            "Experimentally migrate a verified v1 three-head actor into the v2 "
+            "signed-longitudinal contract. By default, v1 is preserved exactly."
+        ),
+    )
+    parser.add_argument(
+        "--continuation-compatibility-probe",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Run one deterministic source-policy rollout before collecting replay. "
+            "Enabled by default for continuation."
+        ),
+    )
+    parser.add_argument(
+        "--continuation-compatibility-min-fraction",
+        type=float,
+        default=0.90,
+        help=(
+            "Minimum fraction of the source checkpoint's verified median distance "
+            "required by the pre-training compatibility rollout."
+        ),
+    )
+    parser.add_argument(
+        "--continuation-compatibility-probe-only",
+        action="store_true",
+        help=(
+            "Run the pre-training compatibility rollout and exit without "
+            "collecting replay, updating weights, or saving a model."
         ),
     )
     parser.add_argument(
@@ -4512,6 +4737,10 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     args.continuation = args.resume_from is not None
+    if args.continuation_compatibility_probe_only:
+        args.continuation_compatibility_probe = True
+    if args.continuation_compatibility_probe is None:
+        args.continuation_compatibility_probe = args.continuation
     if args.start_stage is None:
         args.start_stage = "sector_progression" if args.continuation else "launch"
     if args.replay_refill_steps is None:
@@ -4577,6 +4806,14 @@ def parse_args() -> argparse.Namespace:
 
     if not args.continuation and args.start_stage != "launch":
         parser.error("--start-stage requires --resume-from unless it is launch")
+    if args.continuation_compatibility_probe and not args.continuation:
+        parser.error("--continuation-compatibility-probe requires --resume-from")
+    if args.continuation_compatibility_probe_only and not args.continuation:
+        parser.error(
+            "--continuation-compatibility-probe-only requires --resume-from"
+        )
+    if args.allow_legacy_action_migration and not args.continuation:
+        parser.error("--allow-legacy-action-migration requires --resume-from")
     if args.continuation:
         source_errors = continuation_source_errors(
             args.resume_from,
@@ -4585,6 +4822,13 @@ def parse_args() -> argparse.Namespace:
         )
         if source_errors:
             parser.error(source_errors[0])
+        if (
+            args.allow_legacy_action_migration
+            and not continuation_source_uses_legacy_action_contract(args)
+        ):
+            parser.error(
+                "--allow-legacy-action-migration requires a verified legacy v1 source"
+            )
         source_path = args.resume_from.resolve()
         if (
             not args.allow_non_champion_source
@@ -4604,6 +4848,13 @@ def parse_args() -> argparse.Namespace:
             parser.error("continuation outputs must not overwrite --resume-from")
     if args.total_timesteps < 1:
         parser.error("--total-timesteps must be at least 1")
+    if (
+        not math.isfinite(args.continuation_compatibility_min_fraction)
+        or not 0.0 < args.continuation_compatibility_min_fraction <= 1.0
+    ):
+        parser.error(
+            "--continuation-compatibility-min-fraction must be in (0, 1]"
+        )
     if args.max_probe_overhead_steps < 1:
         parser.error("--max-probe-overhead-steps must be at least 1")
     if args.replay_refill_steps < 0:
@@ -4787,6 +5038,7 @@ def main() -> None:
             "replay_refill" if args.continuation else "warmup"
         ),
         use_custom_warmup_action_space=not args.continuation,
+        use_legacy_action_contract=training_uses_legacy_action_contract(args),
         training_budget_state=training_budget_state,
         safe_actor_screening_max_episode_steps=(
             args.safe_actor_screening_max_episode_steps
@@ -4821,16 +5073,17 @@ def main() -> None:
 
     metadata = make_training_metadata(args)
     write_json(run_dir / "training_metadata.json", metadata)
-    write_json(metadata_path_for_policy(args.model_path), metadata)
 
     tensorboard_log = resolve_tensorboard_log_dir(
         args.tensorboard_dir,
         disable_tensorboard=args.no_tensorboard,
     )
+    action_size = training_action_size(args)
+
     def make_action_noise(sigma: float):
         return NormalActionNoise(
-            mean=np.zeros(AGENT6_ACTION_SIZE, dtype=np.float32),
-            sigma=np.ones(AGENT6_ACTION_SIZE, dtype=np.float32)
+            mean=np.zeros(action_size, dtype=np.float32),
+            sigma=np.ones(action_size, dtype=np.float32)
             * max(0.0, float(sigma)),
         )
 
@@ -4838,6 +5091,7 @@ def main() -> None:
         return SeededSteeringActionNoise(
             seed=seed,
             steering_noise_std=steering_noise_std,
+            action_size=action_size,
         )
 
     action_noise = make_action_noise(args.action_noise_sigma)
@@ -4895,12 +5149,48 @@ def main() -> None:
             metadata["continuation"][
                 "source_policy_contract_migration"
             ] = dict(contract_migration)
+        if args.continuation_compatibility_probe:
+            minimum_distance_m = continuation_compatibility_minimum_distance_m(
+                args
+            )
+            print(
+                "Running pre-training continuation compatibility probe; "
+                f"minimum distance={minimum_distance_m:.1f}m."
+            )
+            try:
+                compatibility_result = run_continuation_compatibility_probe(
+                    model,
+                    raw_env,
+                    minimum_distance_m=minimum_distance_m,
+                    training_budget_state=training_budget_state,
+                    seed=args.seed,
+                )
+            except Exception:
+                env.close()
+                raise
+            metadata["continuation"]["compatibility_probe"][
+                "result"
+            ] = compatibility_result
+            write_json(
+                run_dir / "continuation_compatibility_probe.json",
+                compatibility_result,
+            )
+            print(
+                "Continuation compatibility probe passed: "
+                f"{compatibility_result['distance_m']:.1f}m."
+            )
         write_json(run_dir / "training_metadata.json", metadata)
-        write_json(metadata_path_for_policy(args.model_path), metadata)
+        if args.continuation_compatibility_probe_only:
+            print(
+                "Compatibility probe-only run complete; no replay was collected, "
+                "no weights were updated, and no model was saved."
+            )
+            env.close()
+            return
         print(
             "Continuing verified Agent 6 policy from "
             f"{args.resume_from} at stage={args.start_stage}; "
-            f"action contract={AGENT6_ACTION_VERSION}; "
+            f"action contract={metadata['action_version']}; "
             f"replay refill={args.replay_refill_steps:,}, "
             f"critic warm-up={args.critic_warmup_steps:,}, "
             f"actor unfreeze={args.actor_unfreeze_steps:,} steps; "

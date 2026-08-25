@@ -782,7 +782,8 @@ def promote_best_evaluation(
         "action_version": candidate_action_version,
         "feature_names": FEATURE_NAMES,
         "action_shape": candidate_action_shape,
-        "legacy_action_adapter": policy_uses_legacy_action_contract(source_metadata),
+        "legacy_action_adapter": False,
+        "legacy_action_decoder": policy_uses_legacy_action_contract(source_metadata),
         "checkpoint_type": "best_seeded_robustness_evaluation",
         "best_evaluation": {
             **asdict(summary),

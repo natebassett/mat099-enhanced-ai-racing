@@ -739,7 +739,7 @@ def _template_for(agent_type: str) -> dict[str, Any]:
             "badge": "Reward-only neural reinforcement learner",
             "headline": (
                 "This driver is a from-scratch TD3 continuous-control agent: a neural "
-                "policy directly outputs steering and signed throttle/brake intent from TORCS telemetry."
+                "policy directly controls steering and longitudinal intent from TORCS telemetry."
             ),
             "overview": (
                 "It does not load Agent 3, copy a teacher, use behaviour cloning, or imitate a racing line.",
@@ -759,8 +759,8 @@ def _template_for(agent_type: str) -> dict[str, Any]:
             "decision_steps": (
                 "Read speed, side speed, angle, track position, distance, damage, wheel spin, and road sensors.",
                 "Normalise those raw values into the TD3 observation vector.",
-                "Ask the actor network for steering plus one signed longitudinal command.",
-                "Decode the commands into TORCS controls and apply automatic gear shifting.",
+                "Ask the actor network for continuous steering and longitudinal controls.",
+                "Decode its versioned action contract into TORCS controls and apply automatic gear shifting.",
                 "During training, score the next telemetry frame with progress, stability, safety, and milestone rewards.",
                 "Store transitions in replay memory and update twin critics plus the delayed actor policy.",
                 "Save best-distance checkpoints separately from best-reward checkpoints.",
@@ -788,7 +788,7 @@ def _template_for(agent_type: str) -> dict[str, Any]:
                 "Start with random actor and critic network weights.",
                 "Reset TORCS into the current curriculum stage.",
                 "Observe raw telemetry and build the normalised feature vector.",
-                "Actor outputs steer and signed longitudinal intent; exploration noise is added during training.",
+                "Actor outputs continuous controls; exploration noise is added during training.",
                 "Send controls to TORCS with automatic gear selection.",
                 "Reward forward progress, clean alignment, new furthest distance, and stage completion.",
                 "Penalise off-track, late braking, sliding, reversing, stuck behaviour, and damage.",
@@ -851,13 +851,14 @@ def _template_for(agent_type: str) -> dict[str, Any]:
                     source="src/agents/td3_agent.py - decode_td3_action",
                     explanation=(
                         "TD3 owns steering and the throttle-versus-brake decision. The only engineered "
-                        "control left outside the learning problem is automatic gear selection."
+                        "control left outside the learning problem is automatic gear selection. Legacy "
+                        "champions retain their original three-head decoder during continuation."
                     ),
                     code=(
-                        "steer = clip(raw[0], -1, 1) * MAX_STEER\n"
-                        "longitudinal = clip(raw[1], -1, 1)\n"
-                        "accel = max(0.0, longitudinal)\n"
-                        "brake = max(0.0, -longitudinal)\n"
+                        "if legacy_contract:\n"
+                        "    controls = decode_legacy_td3_action(raw)\n"
+                        "else:\n"
+                        "    controls = decode_td3_action(raw)\n"
                         "gear = shift_gears(speed_kmh)"
                     ),
                 ),
@@ -883,7 +884,7 @@ def _template_for(agent_type: str) -> dict[str, Any]:
                 "Replay buffer samples break the tight correlation between consecutive TORCS frames.",
                 "Best-distance checkpointing matters because shaped reward can improve before full laps appear.",
                 "Distance phase is map position information, not a racing-line target or imitation signal.",
-                "Automatic gear shifting narrows the learning problem to steering and signed longitudinal control.",
+                "Automatic gear shifting narrows the learning problem to steering and longitudinal control.",
             ),
             "key_takeaways": (
                 "This is the clean neural DRL showcase agent.",

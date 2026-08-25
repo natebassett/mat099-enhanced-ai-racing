@@ -45,6 +45,7 @@ from agents.td3_agent import (  # noqa: E402
     balanced_pair_order_positions,
     build_rotating_training_seed_suite,
     build_td3_observation,
+    decode_legacy_td3_action,
     decode_td3_action,
     episode_metadata_is_deterministic_probe,
     episode_metadata_is_policy_controlled,
@@ -100,6 +101,47 @@ class Td3ScratchAgentTests(unittest.TestCase):
         self.assertEqual(braking["steer"], -0.90)
         self.assertEqual(braking["accel"], 0.0)
         self.assertEqual(braking["brake"], 0.7)
+
+    def test_legacy_decoder_preserves_original_winner_takes_pedal_contract(self):
+        braking = decode_legacy_td3_action([0.25, 0.4, 0.7])
+
+        self.assertAlmostEqual(braking["steer"], 0.225)
+        self.assertEqual(braking["accel"], 0.0)
+        self.assertEqual(braking["brake"], 0.7)
+
+        accelerating = decode_legacy_td3_action([-0.5, 0.8, 0.2])
+        self.assertEqual(accelerating["accel"], 0.8)
+        self.assertEqual(accelerating["brake"], 0.0)
+
+    def test_legacy_policy_uses_exact_three_head_runtime_without_adapter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "legacy.zip"
+            metadata_path_for_policy(policy_path).write_text(
+                json.dumps(
+                    {
+                        "model_family": AGENT6_MODEL_FAMILY,
+                        "observation_version": AGENT6_LEGACY_OBSERVATION_VERSION,
+                        "action_version": AGENT6_LEGACY_ACTION_VERSION,
+                        "feature_names": FEATURE_NAMES,
+                        "action_shape": AGENT6_LEGACY_ACTION_SHAPE,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            agent = Td3ScratchAgent(
+                policy_path=policy_path,
+                policy=DummyPolicy([0.0, 0.4, 0.7]),
+                deterministic=True,
+            )
+
+            action = agent.act(None, _telemetry(speed=90.0))
+
+        self.assertEqual(len(agent.last_policy_action), 3)
+        self.assertEqual(action["accel"], 0.0)
+        self.assertEqual(action["brake"], 0.4)
+        self.assertTrue(agent.config["legacy_action_decoder"])
+        self.assertFalse(agent.config["legacy_action_adapter"])
+        self.assertEqual(agent.config["action_shape"], AGENT6_LEGACY_ACTION_SHAPE)
 
     def test_agent_config_declares_reward_only_learning(self):
         agent = Td3ScratchAgent(policy_path=Path("missing.zip"))
@@ -1124,6 +1166,10 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(args.max_probe_overhead_steps, 1_000_000)
         self.assertEqual(args.safe_actor_anchor_batch_size, 256)
         self.assertFalse(args.allow_non_champion_source)
+        self.assertFalse(args.allow_legacy_action_migration)
+        self.assertFalse(args.continuation_compatibility_probe)
+        self.assertFalse(args.continuation_compatibility_probe_only)
+        self.assertEqual(args.continuation_compatibility_min_fraction, 0.90)
         self.assertEqual(args.warmup_steer_std, 0.18)
         self.assertFalse(args.save_best_replay_buffer)
 
@@ -1201,6 +1247,9 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(args.safe_actor_screening_max_episode_steps, 1_200)
         self.assertEqual(args.max_probe_overhead_steps, 1_000_000)
         self.assertTrue(args.allow_non_champion_source)
+        self.assertFalse(args.allow_legacy_action_migration)
+        self.assertTrue(args.continuation_compatibility_probe)
+        self.assertFalse(args.continuation_compatibility_probe_only)
         self.assertEqual(train_td3_agent.policy_action_start_timestep(args), 0)
         self.assertEqual(
             train_td3_agent.gradient_update_start_timestep(args),
@@ -1210,6 +1259,85 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(
             train_td3_agent.actor_full_unfreeze_timestep(args),
             80_000,
+        )
+
+    def test_legacy_continuation_preserves_contract_unless_migration_is_opted_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "legacy.zip"
+            checkpoint.write_bytes(b"checkpoint")
+            metadata_path_for_policy(checkpoint).write_text(
+                json.dumps(
+                    {
+                        "model_family": AGENT6_MODEL_FAMILY,
+                        "observation_version": AGENT6_LEGACY_OBSERVATION_VERSION,
+                        "action_version": AGENT6_LEGACY_ACTION_VERSION,
+                        "feature_names": FEATURE_NAMES,
+                        "action_shape": AGENT6_LEGACY_ACTION_SHAPE,
+                        "track": "g-track-3",
+                        "best_evaluation": {
+                            "deterministic": True,
+                            "repeats": 5,
+                            "track": "g-track-3",
+                            "median_progress_m": 1430.05,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            base_argv = [
+                str(SCRIPT_PATH),
+                "--resume-from",
+                str(checkpoint),
+                "--allow-non-champion-source",
+            ]
+            with mock.patch.object(sys, "argv", base_argv):
+                preserved_args = train_td3_agent.parse_args()
+            with mock.patch.object(
+                sys,
+                "argv",
+                [*base_argv, "--allow-legacy-action-migration"],
+            ):
+                migrated_args = train_td3_agent.parse_args()
+            preserved_legacy = (
+                train_td3_agent.training_uses_legacy_action_contract(
+                    preserved_args
+                )
+            )
+            preserved_action_size = train_td3_agent.training_action_size(
+                preserved_args
+            )
+            migrated_legacy = (
+                train_td3_agent.training_uses_legacy_action_contract(
+                    migrated_args
+                )
+            )
+            migrated_action_size = train_td3_agent.training_action_size(
+                migrated_args
+            )
+            preserved_metadata = train_td3_agent.make_training_metadata(
+                preserved_args
+            )
+
+        self.assertTrue(preserved_legacy)
+        self.assertEqual(preserved_action_size, 3)
+        self.assertFalse(migrated_legacy)
+        self.assertEqual(migrated_action_size, 2)
+        self.assertEqual(
+            preserved_metadata["observation_version"],
+            AGENT6_LEGACY_OBSERVATION_VERSION,
+        )
+        self.assertEqual(
+            preserved_metadata["action_version"],
+            AGENT6_LEGACY_ACTION_VERSION,
+        )
+        self.assertEqual(
+            preserved_metadata["action_shape"],
+            AGENT6_LEGACY_ACTION_SHAPE,
+        )
+        self.assertFalse(
+            preserved_metadata["continuation"][
+                "source_policy_contract_migration"
+            ]["required"]
         )
 
     def test_continuation_model_loads_verified_weights_with_fresh_replay(self):
@@ -1272,6 +1400,74 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(model.action_space, "standard_action_space")
         self.assertEqual(model.policy.action_space, "standard_action_space")
         self.assertEqual(model.replay_buffer.action_space, "standard_action_space")
+
+    def test_legacy_continuation_loads_original_model_without_migration(self):
+        class FakeTD3:
+            load_call = None
+
+            @classmethod
+            def load(cls, path, **kwargs):
+                cls.load_call = (path, kwargs)
+                return types.SimpleNamespace(
+                    num_timesteps=91_000,
+                    policy=types.SimpleNamespace(),
+                    replay_buffer=types.SimpleNamespace(),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "legacy.zip"
+            metadata_path_for_policy(checkpoint).write_text(
+                json.dumps(
+                    {
+                        "model_family": AGENT6_MODEL_FAMILY,
+                        "observation_version": AGENT6_LEGACY_OBSERVATION_VERSION,
+                        "action_version": AGENT6_LEGACY_ACTION_VERSION,
+                        "feature_names": FEATURE_NAMES,
+                        "action_shape": AGENT6_LEGACY_ACTION_SHAPE,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = types.SimpleNamespace(
+                continuation=True,
+                resume_from=checkpoint,
+                allow_legacy_action_migration=False,
+                verbose_training=False,
+                buffer_size=300_000,
+                learning_starts=20_000,
+                replay_refill_steps=20_000,
+                batch_size=256,
+                gamma=0.995,
+                tau=0.005,
+                train_freq=1,
+                gradient_steps=1,
+                policy_delay=2,
+                target_policy_noise=0.2,
+                target_noise_clip=0.5,
+                seed=42,
+                device="cpu",
+            )
+            env = types.SimpleNamespace(
+                action_space="legacy_three_head_action_space",
+                observation_space="observation_space",
+            )
+
+            model = train_td3_agent.create_td3_model(
+                FakeTD3,
+                args=args,
+                env=env,
+                tensorboard_log=None,
+                action_noise="noise",
+                learning_rate_schedule=lambda _: 1e-5,
+            )
+
+        self.assertEqual(FakeTD3.load_call[0], str(checkpoint))
+        self.assertEqual(model.action_space, "legacy_three_head_action_space")
+        self.assertEqual(model.policy.action_space, "legacy_three_head_action_space")
+        self.assertEqual(
+            model.replay_buffer.action_space,
+            "legacy_three_head_action_space",
+        )
 
     def test_legacy_actor_migration_maps_accel_minus_brake_to_signed_longitudinal(self):
         import gymnasium as gym
@@ -1901,6 +2097,68 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
         self.assertTrue(any("requires 520.0m" in error for error in errors))
 
+    def test_continuation_compatibility_probe_runs_before_training_and_counts_overhead(self):
+        class FakeModel:
+            def predict(self, observation, deterministic=True):
+                self.deterministic = deterministic
+                return np.asarray([0.0, 0.6, 0.0], dtype=np.float32), None
+
+        class FakeEnv:
+            current_stage = types.SimpleNamespace(max_episode_steps=4)
+
+            def __init__(self, distance_m):
+                self.distance_m = distance_m
+                self.steps = 0
+                self.modes = []
+
+            def set_policy_mode(self, **kwargs):
+                self.modes.append(kwargs)
+
+            def reset(self, *, seed=None):
+                self.seed = seed
+                return np.zeros(4, dtype=np.float32), {}
+
+            def step(self, action):
+                self.steps += 1
+                terminated = self.steps == 2
+                info = {"deterministic_probe": True}
+                if terminated:
+                    info["episode_summary"] = {
+                        "distance_m": self.distance_m,
+                        "furthest_distance_m": self.distance_m,
+                        "steps": self.steps,
+                        "termination_reason": "stuck",
+                    }
+                return np.zeros(4, dtype=np.float32), 0.0, terminated, False, info
+
+        budget = train_td3_agent.TrainingBudgetState(100, 100)
+        env = FakeEnv(1_360.0)
+
+        result = train_td3_agent.run_continuation_compatibility_probe(
+            FakeModel(),
+            env,
+            minimum_distance_m=1_287.0,
+            training_budget_state=budget,
+            seed=42,
+        )
+
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["distance_m"], 1_360.0)
+        self.assertEqual(budget.probe_steps, 2)
+        self.assertEqual(budget.training_steps, 0)
+        self.assertEqual(env.modes[0]["training_phase"], "continuation_compatibility_probe")
+        self.assertFalse(env.modes[-1]["deterministic_probe"])
+
+        failing_env = FakeEnv(360.0)
+        with self.assertRaisesRegex(RuntimeError, "required 1287.0m"):
+            train_td3_agent.run_continuation_compatibility_probe(
+                FakeModel(),
+                failing_env,
+                minimum_distance_m=1_287.0,
+                seed=42,
+            )
+        self.assertFalse(failing_env.modes[-1]["deterministic_probe"])
+
     def test_replay_snapshot_failure_is_reported_without_partial_temp_file(self):
         model = mock.Mock()
         model.save_replay_buffer.side_effect = RuntimeError("disk unavailable")
@@ -2205,6 +2463,25 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertTrue(np.all(sample <= 1.0))
         self.assertGreaterEqual(float(sample[1]), 0.25)
         self.assertGreaterEqual(float(sample[1]), 0.0)
+
+    def test_legacy_continuation_environment_uses_three_head_action_space(self):
+        fake_gym = types.SimpleNamespace(Env=object)
+        with mock.patch.object(
+            train_td3_agent,
+            "make_torcs_runner",
+            return_value=types.SimpleNamespace(),
+        ):
+            Env = train_td3_agent.make_training_env_class(
+                fake_gym,
+                _FakeSpaces,
+            )
+            env = Env(
+                use_custom_warmup_action_space=False,
+                use_legacy_action_contract=True,
+            )
+
+        self.assertEqual(env.action_space.shape, (3,))
+        self.assertTrue(env.use_legacy_action_contract)
 
 
 class _FakeBox:

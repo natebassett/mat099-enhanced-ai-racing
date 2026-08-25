@@ -222,6 +222,37 @@ def decode_td3_action(raw_action: Any) -> dict[str, float]:
     }
 
 
+def decode_legacy_td3_action(raw_action: Any) -> dict[str, float]:
+    """Decode the original Agent 6 steer/throttle/brake action contract exactly."""
+    try:
+        values = np.asarray(raw_action, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        values = np.asarray([], dtype=float)
+
+    padded = np.zeros(AGENT6_LEGACY_ACTION_SIZE, dtype=float)
+    padded[: min(AGENT6_LEGACY_ACTION_SIZE, len(values))] = values[
+        :AGENT6_LEGACY_ACTION_SIZE
+    ]
+    steer = finite_clamp(padded[0], -1.0, 1.0) * MAX_STEER
+    accel = max(0.0, finite_clamp(padded[1], -1.0, 1.0))
+    brake = max(0.0, finite_clamp(padded[2], -1.0, 1.0))
+
+    if accel < PEDAL_DEADZONE:
+        accel = 0.0
+    if brake < PEDAL_DEADZONE:
+        brake = 0.0
+    if brake > 0.0 and brake >= accel:
+        accel = 0.0
+    elif accel > 0.0:
+        brake = 0.0
+
+    return {
+        "steer": clamp(steer, -MAX_STEER, MAX_STEER),
+        "accel": clamp(accel, 0.0, 1.0),
+        "brake": clamp(brake, 0.0, 1.0),
+    }
+
+
 def steering_delta_limit(speed_kmh: Any) -> float:
     speed = abs(finite_float(speed_kmh))
     if speed >= 150.0:
@@ -500,7 +531,7 @@ def parameter_state_dicts_are_identical(
 
 
 def signed_longitudinal_from_legacy_outputs(raw_action: Any) -> float:
-    """Convert the retired accel/brake actor heads into one pedal command."""
+    """Map legacy pedal heads for an explicitly requested experimental migration."""
     try:
         values = np.asarray(raw_action, dtype=float).reshape(-1)
     except (TypeError, ValueError):
@@ -550,6 +581,7 @@ class SeededSteeringActionNoise:
         seed: int,
         steering_noise_std: float,
         correlation: float = STEERING_ACTION_NOISE_CORRELATION,
+        action_size: int = AGENT6_ACTION_SIZE,
     ) -> None:
         if not 0 <= int(seed) <= MAX_REPRODUCIBLE_SEED:
             raise ValueError(
@@ -559,9 +591,12 @@ class SeededSteeringActionNoise:
             raise ValueError("steering_noise_std must be finite and non-negative")
         if not math.isfinite(correlation) or not 0.0 <= correlation < 1.0:
             raise ValueError("correlation must be finite and in [0, 1)")
+        if int(action_size) < 1:
+            raise ValueError("action_size must be at least 1")
         self.seed = int(seed)
         self.steering_noise_std = float(steering_noise_std)
         self.correlation = float(correlation)
+        self.action_size = int(action_size)
         self._random = random.Random(self.seed)
         self._steering_noise = 0.0
 
@@ -577,10 +612,9 @@ class SeededSteeringActionNoise:
             self.correlation * self._steering_noise
             + self._random.gauss(0.0, innovation_scale)
         )
-        return np.asarray(
-            [self._steering_noise / MAX_STEER, 0.0],
-            dtype=np.float32,
-        )
+        noise = np.zeros(self.action_size, dtype=np.float32)
+        noise[0] = self._steering_noise / MAX_STEER
+        return noise
 
     def reset(self) -> None:
         self._random.seed(self.seed)
@@ -715,6 +749,11 @@ class Td3ScratchAgent:
         self.uses_legacy_action_contract = policy_uses_legacy_action_contract(
             self.policy_metadata
         )
+        self.action_size = (
+            AGENT6_LEGACY_ACTION_SIZE
+            if self.uses_legacy_action_contract
+            else AGENT6_ACTION_SIZE
+        )
         mismatches = _policy_contract_mismatches(
             self.policy_metadata,
             allow_legacy_action_contract=True,
@@ -736,14 +775,30 @@ class Td3ScratchAgent:
             policy_path = str(self.policy_path.relative_to(PROJECT_ROOT))
         except ValueError:
             policy_path = str(self.policy_path)
+        observation_version = (
+            AGENT6_LEGACY_OBSERVATION_VERSION
+            if self.uses_legacy_action_contract
+            else AGENT6_OBSERVATION_VERSION
+        )
+        action_version = (
+            AGENT6_LEGACY_ACTION_VERSION
+            if self.uses_legacy_action_contract
+            else AGENT6_ACTION_VERSION
+        )
+        action_shape = (
+            AGENT6_LEGACY_ACTION_SHAPE
+            if self.uses_legacy_action_contract
+            else AGENT6_ACTION_SHAPE
+        )
         return {
             "algorithm": "TD3",
             "model_family": AGENT6_MODEL_FAMILY,
-            "observation_version": AGENT6_OBSERVATION_VERSION,
-            "action_version": AGENT6_ACTION_VERSION,
+            "observation_version": observation_version,
+            "action_version": action_version,
             "feature_names": FEATURE_NAMES,
-            "action_shape": AGENT6_ACTION_SHAPE,
-            "legacy_action_adapter": self.uses_legacy_action_contract,
+            "action_shape": action_shape,
+            "legacy_action_adapter": False,
+            "legacy_action_decoder": self.uses_legacy_action_contract,
             "policy_path": policy_path,
             "policy_loaded": self.policy_loaded,
             "learning_source": "reward_only",
@@ -763,8 +818,8 @@ class Td3ScratchAgent:
         self.previous_action = {"steer": 0.0, "accel": 0.0, "brake": 0.0}
         self.previous_gear = 1
         self.stuck_counter = 0
-        self.last_raw_action = [0.0, 0.0]
-        self.last_policy_action = [0.0, 0.0]
+        self.last_raw_action = [0.0] * self.action_size
+        self.last_policy_action = [0.0] * self.action_size
 
     def act(
         self,
@@ -794,28 +849,22 @@ class Td3ScratchAgent:
             self._predict_action(features),
             dtype=np.float32,
         ).reshape(-1)
-        policy_action = np.zeros(AGENT6_ACTION_SIZE, dtype=np.float32)
-        if self.uses_legacy_action_contract:
-            policy_action[0] = finite_clamp(
-                predicted_action[0] if len(predicted_action) else 0.0,
-                -1.0,
-                1.0,
-            )
-            policy_action[1] = signed_longitudinal_from_legacy_outputs(
-                predicted_action
-            )
-        else:
-            policy_action[: min(AGENT6_ACTION_SIZE, len(predicted_action))] = (
-                predicted_action[:AGENT6_ACTION_SIZE]
-            )
+        policy_action = np.zeros(self.action_size, dtype=np.float32)
+        policy_action[: min(self.action_size, len(predicted_action))] = (
+            predicted_action[: self.action_size]
+        )
         raw_action = policy_action.copy()
         if self.action_noise is not None:
             noise = np.asarray(self.action_noise(), dtype=np.float32).reshape(-1)
-            raw_action[: min(AGENT6_ACTION_SIZE, len(noise))] += noise[
-                :AGENT6_ACTION_SIZE
+            raw_action[: min(self.action_size, len(noise))] += noise[
+                : self.action_size
             ]
         raw_action = np.clip(raw_action, -1.0, 1.0)
-        action = decode_td3_action(raw_action)
+        action = (
+            decode_legacy_td3_action(raw_action)
+            if self.uses_legacy_action_contract
+            else decode_td3_action(raw_action)
+        )
         speed = finite_float(telemetry.get("speedX", 0.0))
         action = rate_limit_td3_action(
             action,
@@ -861,15 +910,28 @@ class Td3ScratchAgent:
         return False, ""
 
     def telemetry_debug(self) -> dict[str, Any]:
+        if self.uses_legacy_action_contract:
+            raw_accel = max(0.0, finite_float(self.last_raw_action[1]))
+            raw_brake = max(0.0, finite_float(self.last_raw_action[2]))
+            raw_longitudinal = clamp(raw_accel - raw_brake, -1.0, 1.0)
+            policy_longitudinal = signed_longitudinal_from_legacy_outputs(
+                self.last_policy_action
+            )
+        else:
+            raw_longitudinal = finite_float(self.last_raw_action[1])
+            raw_accel = max(0.0, raw_longitudinal)
+            raw_brake = max(0.0, -raw_longitudinal)
+            policy_longitudinal = finite_float(self.last_policy_action[1])
         return {
             "td3_policy_loaded": self.policy_loaded,
             "td3_raw_steer": self.last_raw_action[0],
-            "td3_raw_longitudinal": self.last_raw_action[1],
-            "td3_raw_accel": max(0.0, self.last_raw_action[1]),
-            "td3_raw_brake": max(0.0, -self.last_raw_action[1]),
+            "td3_raw_longitudinal": raw_longitudinal,
+            "td3_raw_accel": raw_accel,
+            "td3_raw_brake": raw_brake,
             "td3_policy_raw_steer": self.last_policy_action[0],
-            "td3_policy_raw_longitudinal": self.last_policy_action[1],
-            "td3_legacy_action_adapter": self.uses_legacy_action_contract,
+            "td3_policy_raw_longitudinal": policy_longitudinal,
+            "td3_legacy_action_adapter": False,
+            "td3_legacy_action_decoder": self.uses_legacy_action_contract,
             "td3_action_steering_noise": finite_float(
                 getattr(self.action_noise, "steering_noise", 0.0)
             ),
