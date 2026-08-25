@@ -662,6 +662,87 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(comparison.order_position_regressions, 1)
         self.assertEqual(comparison.decision, "rolled_back")
 
+    def test_safe_actor_accepts_bounded_regression_with_frontier_progress(self):
+        comparison = train_td3_agent.safe_actor_probe_decision(
+            [1000.0] * 2 + [1200.0] * 2 + [1400.0] * 2,
+            [980.0] * 2 + [1190.0] * 2 + [1450.0] * 2,
+            seed_count=3,
+            trials_per_seed=2,
+            minimum_improvement_m=5.0,
+            maximum_paired_regression_m=200.0,
+        )
+
+        self.assertEqual(comparison.decision, "accepted")
+        self.assertEqual(comparison.aggregate_median_gain_m, -10.0)
+        self.assertEqual(comparison.minimum_gain_m, -20.0)
+        self.assertEqual(comparison.upper_quartile_gain_m, 20.0)
+        self.assertEqual(comparison.maximum_gain_m, 50.0)
+        self.assertIn("upper_quartile_distance", comparison.acceptance_reasons)
+        self.assertIn("furthest_distance", comparison.acceptance_reasons)
+        self.assertEqual(comparison.safety_failures, ())
+
+    def test_safe_actor_rejects_catastrophic_matched_seed_loss(self):
+        comparison = train_td3_agent.safe_actor_probe_decision(
+            [1000.0] * 2 + [1200.0] * 2 + [1400.0] * 2,
+            [790.0] * 2 + [1190.0] * 2 + [1700.0] * 2,
+            seed_count=3,
+            trials_per_seed=2,
+            minimum_improvement_m=5.0,
+            maximum_paired_regression_m=200.0,
+            minimum_regression_tolerance_m=300.0,
+        )
+
+        self.assertEqual(comparison.maximum_gain_m, 300.0)
+        self.assertEqual(comparison.worst_paired_delta_m, -210.0)
+        self.assertEqual(comparison.decision, "rolled_back")
+        self.assertIn("paired_seed_regression", comparison.safety_failures)
+        self.assertIn("order_position_regression", comparison.safety_failures)
+
+    def test_safe_actor_accepts_new_milestone_or_lap_completion(self):
+        milestone = train_td3_agent.safe_actor_probe_decision(
+            [1747.0] * 2,
+            [1751.0] * 2,
+            seed_count=1,
+            trials_per_seed=2,
+            minimum_improvement_m=5.0,
+            maximum_paired_regression_m=200.0,
+            progress_milestones_m=(1750.0,),
+        )
+        lap = train_td3_agent.safe_actor_probe_decision(
+            [1400.0] * 2,
+            [1380.0] * 2,
+            seed_count=1,
+            trials_per_seed=2,
+            reference_laps_completed=[0, 0],
+            candidate_laps_completed=[1, 0],
+            minimum_improvement_m=5.0,
+            maximum_paired_regression_m=200.0,
+            progress_milestones_m=(),
+        )
+
+        self.assertEqual(milestone.decision, "accepted")
+        self.assertEqual(milestone.maximum_gain_m, 4.0)
+        self.assertEqual(milestone.new_progress_milestones_m, (1750.0,))
+        self.assertEqual(milestone.acceptance_reasons, ("new_sector_milestone",))
+        self.assertEqual(lap.decision, "accepted")
+        self.assertEqual(lap.candidate_lap_completions, 1)
+        self.assertIn("lap_completion", lap.acceptance_reasons)
+
+    def test_safe_actor_rejects_safe_candidate_without_progress(self):
+        comparison = train_td3_agent.safe_actor_probe_decision(
+            [1400.0] * 2,
+            [1390.0] * 2,
+            seed_count=1,
+            trials_per_seed=2,
+            minimum_improvement_m=5.0,
+            maximum_paired_regression_m=200.0,
+            progress_milestones_m=(),
+        )
+
+        self.assertEqual(comparison.decision, "rolled_back")
+        self.assertEqual(comparison.acceptance_reasons, ())
+        self.assertEqual(comparison.safety_failures, ())
+
     def test_balanced_pair_positions_split_each_policy_two_and_two(self):
         reference, candidate = balanced_pair_order_positions(
             seed_count=2,
@@ -1028,6 +1109,9 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                     "paired_median_delta_m": 20.0,
                     "worst_paired_delta_m": 10.0,
                     "paired_regressions": 0,
+                    "candidate_lap_completions": 1,
+                    "acceptance_reasons": ["lap_completion"],
+                    "safety_failures": [],
                     "accepted_distance_m": 1760.0,
                     "accepted_minimum_distance_m": 1500.0,
                 }
@@ -1072,6 +1156,8 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         callback._on_step()
 
         self.assertEqual(summary["safe_actor_decision"], "accepted")
+        self.assertEqual(summary["safe_actor_candidate_lap_completions"], 1)
+        self.assertEqual(summary["safe_actor_acceptance_reasons"], ["lap_completion"])
         self.assertTrue(summary["curriculum_eligible"])
         self.assertEqual(env.accepted, [1760.0])
 
@@ -1236,7 +1322,9 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(args.safe_actor_probe_base_seed, 20260820)
         self.assertEqual(args.safe_actor_probe_noise_std, 0.006)
         self.assertEqual(args.safe_actor_min_improvement_m, 5.0)
-        self.assertEqual(args.safe_actor_max_paired_regression_m, 100.0)
+        self.assertEqual(args.safe_actor_median_regression_tolerance_m, 25.0)
+        self.assertEqual(args.safe_actor_minimum_regression_tolerance_m, 150.0)
+        self.assertEqual(args.safe_actor_max_paired_regression_m, 200.0)
         self.assertEqual(args.safe_actor_screening_max_regression_m, 250.0)
         self.assertEqual(args.safe_actor_screening_max_episode_steps, 1_200)
         self.assertEqual(args.max_probe_overhead_steps, 25_000)
@@ -1322,7 +1410,9 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(args.safe_actor_probe_base_seed, 20260820)
         self.assertEqual(args.safe_actor_probe_noise_std, 0.006)
         self.assertEqual(args.safe_actor_min_improvement_m, 5.0)
-        self.assertEqual(args.safe_actor_max_paired_regression_m, 100.0)
+        self.assertEqual(args.safe_actor_median_regression_tolerance_m, 25.0)
+        self.assertEqual(args.safe_actor_minimum_regression_tolerance_m, 150.0)
+        self.assertEqual(args.safe_actor_max_paired_regression_m, 200.0)
         self.assertEqual(args.safe_actor_screening_max_regression_m, 250.0)
         self.assertEqual(args.safe_actor_screening_max_episode_steps, 1_200)
         self.assertEqual(args.max_probe_overhead_steps, 25_000)
@@ -1997,6 +2087,10 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             name: value.detach().clone()
             for name, value in model.actor.state_dict().items()
         }
+        robust_actor = {
+            name: value.detach().clone()
+            for name, value in model._agent6_safe_actor_robust_state.items()
+        }
         accepted_target = {
             name: value.detach().clone()
             for name, value in model.actor_target.state_dict().items()
@@ -2073,6 +2167,13 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
         self.assertEqual(accepted["decision"], "accepted")
         self.assertEqual(accepted["median_distance_m"], 111.5)
+        self.assertTrue(
+            model.safe_actor_status()[
+                "working_policy_differs_from_robust_champion"
+            ]
+        )
+        for name, value in model._agent6_safe_actor_robust_state.items():
+            self.assertTrue(torch.equal(value, robust_actor[name]))
         with torch.no_grad():
             next(model.actor.parameters()).add_(0.5)
         model._agent6_safe_actor_candidate_id = 3

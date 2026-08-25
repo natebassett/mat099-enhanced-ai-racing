@@ -37,7 +37,6 @@ from agents.td3_agent import (  # noqa: E402
     AGENT6_MODEL_FAMILY,
     AGENT6_OBSERVATION_VERSION,
     AGENT6_ROBUSTNESS_PROTOCOL,
-    AGENT6_ROBUSTNESS_MAX_PAIRED_REGRESSION_M,
     AGENT6_ROBUSTNESS_STEERING_NOISE_STD,
     AGENT6_TRAINING_CHALLENGE_BASE_SEED,
     DEFAULT_BEST_EVALUATION_MODEL_PATH,
@@ -109,9 +108,9 @@ DEFAULT_SAFE_ACTOR_SCREENING_MAX_EPISODE_STEPS = 1_200
 DEFAULT_SAFE_ACTOR_PROBE_BASE_SEED = AGENT6_TRAINING_CHALLENGE_BASE_SEED
 DEFAULT_SAFE_ACTOR_PROBE_NOISE_STD = AGENT6_ROBUSTNESS_STEERING_NOISE_STD
 DEFAULT_SAFE_ACTOR_MIN_IMPROVEMENT_M = 5.0
-DEFAULT_SAFE_ACTOR_MAX_PAIRED_REGRESSION_M = (
-    AGENT6_ROBUSTNESS_MAX_PAIRED_REGRESSION_M
-)
+DEFAULT_SAFE_ACTOR_MEDIAN_REGRESSION_TOLERANCE_M = 25.0
+DEFAULT_SAFE_ACTOR_MINIMUM_REGRESSION_TOLERANCE_M = 150.0
+DEFAULT_SAFE_ACTOR_MAX_PAIRED_REGRESSION_M = 200.0
 DEFAULT_SAFE_ACTOR_SCREENING_MAX_REGRESSION_M = 250.0
 DEFAULT_SAFE_ACTOR_ANCHOR_BATCH_SIZE = 256
 DEFAULT_MAX_PROBE_FRACTION = 0.20
@@ -119,7 +118,7 @@ DEFAULT_PROBE_EVIDENCE_WINDOW = 8
 DEFAULT_PROBE_MIN_EVIDENCE_EPISODES = 3
 DEFAULT_PROBE_EVIDENCE_MAX_REGRESSION_M = 150.0
 SAFE_ACTOR_ROBUSTNESS_PROTOCOL = (
-    "agent6_ratio_budgeted_evidence_gated_internal_probe_v9"
+    "agent6_progress_aware_working_policy_internal_probe_v10"
 )
 
 REWARD_VERSION = "agent6_td3_reward_v2_clear_track_anti_stall"
@@ -203,6 +202,9 @@ CURRICULUM: tuple[CurriculumStage, ...] = (
     ),
 )
 CURRICULUM_STAGE_IDS = tuple(stage.stage_id for stage in CURRICULUM)
+SAFE_ACTOR_PROGRESS_MILESTONES_M = tuple(
+    sorted({stage.distance_target_m for stage in CURRICULUM})
+)
 
 EPISODE_COLUMNS = [
     "episodes_seen",
@@ -229,8 +231,16 @@ EPISODE_COLUMNS = [
     "safe_actor_probe_episodes_skipped",
     "safe_actor_probe_median_distance_m",
     "safe_actor_probe_minimum_distance_m",
+    "safe_actor_probe_upper_quartile_distance_m",
+    "safe_actor_probe_maximum_distance_m",
     "safe_actor_reference_median_distance_m",
     "safe_actor_reference_minimum_distance_m",
+    "safe_actor_reference_upper_quartile_distance_m",
+    "safe_actor_reference_maximum_distance_m",
+    "safe_actor_aggregate_median_gain_m",
+    "safe_actor_minimum_gain_m",
+    "safe_actor_upper_quartile_gain_m",
+    "safe_actor_maximum_gain_m",
     "safe_actor_paired_median_delta_m",
     "safe_actor_worst_paired_delta_m",
     "safe_actor_paired_regressions",
@@ -240,6 +250,11 @@ EPISODE_COLUMNS = [
     "safe_actor_raw_paired_regressions",
     "safe_actor_reference_seed_medians_m",
     "safe_actor_candidate_seed_medians_m",
+    "safe_actor_reference_lap_completions",
+    "safe_actor_candidate_lap_completions",
+    "safe_actor_new_progress_milestones_m",
+    "safe_actor_acceptance_reasons",
+    "safe_actor_safety_failures",
     "safe_actor_accepted_distance_m",
     "safe_actor_accepted_minimum_distance_m",
     "curriculum_eligible",
@@ -732,10 +747,16 @@ class SafeActorProbeComparison:
     decision: str
     reference_median_distance_m: float
     reference_minimum_distance_m: float
+    reference_upper_quartile_distance_m: float
+    reference_maximum_distance_m: float
     candidate_median_distance_m: float
     candidate_minimum_distance_m: float
+    candidate_upper_quartile_distance_m: float
+    candidate_maximum_distance_m: float
     aggregate_median_gain_m: float
     minimum_gain_m: float
+    upper_quartile_gain_m: float
+    maximum_gain_m: float
     paired_median_delta_m: float
     worst_paired_delta_m: float
     paired_regressions: int
@@ -746,6 +767,11 @@ class SafeActorProbeComparison:
     raw_paired_regressions: int
     reference_seed_medians_m: tuple[float, ...]
     candidate_seed_medians_m: tuple[float, ...]
+    reference_lap_completions: int
+    candidate_lap_completions: int
+    new_progress_milestones_m: tuple[float, ...]
+    acceptance_reasons: tuple[str, ...]
+    safety_failures: tuple[str, ...]
 
 
 def safe_actor_probe_decision(
@@ -756,10 +782,21 @@ def safe_actor_probe_decision(
     trials_per_seed: int,
     reference_order_positions: list[int] | tuple[int, ...] | None = None,
     candidate_order_positions: list[int] | tuple[int, ...] | None = None,
+    reference_laps_completed: list[int] | tuple[int, ...] | None = None,
+    candidate_laps_completed: list[int] | tuple[int, ...] | None = None,
     minimum_improvement_m: float,
     maximum_paired_regression_m: float,
+    median_regression_tolerance_m: float = (
+        DEFAULT_SAFE_ACTOR_MEDIAN_REGRESSION_TOLERANCE_M
+    ),
+    minimum_regression_tolerance_m: float = (
+        DEFAULT_SAFE_ACTOR_MINIMUM_REGRESSION_TOLERANCE_M
+    ),
+    progress_milestones_m: tuple[float, ...] = (
+        SAFE_ACTOR_PROGRESS_MILESTONES_M
+    ),
 ) -> SafeActorProbeComparison:
-    """Compare policies using order-stratified seed metrics and safeguards."""
+    """Compare working-policy candidates using progress and safety guards."""
     if not reference_distances_m or len(reference_distances_m) != len(
         candidate_distances_m
     ):
@@ -776,10 +813,19 @@ def safe_actor_probe_decision(
 
     required_gain = float(minimum_improvement_m)
     regression_limit = float(maximum_paired_regression_m)
+    median_tolerance = float(median_regression_tolerance_m)
+    minimum_tolerance = float(minimum_regression_tolerance_m)
     if not math.isfinite(required_gain) or required_gain < 0.0:
         raise ValueError("minimum improvement must be finite and non-negative")
     if not math.isfinite(regression_limit) or regression_limit < 0.0:
         raise ValueError("paired regression limit must be finite and non-negative")
+    if not math.isfinite(median_tolerance) or median_tolerance < 0.0:
+        raise ValueError("median regression tolerance must be finite and non-negative")
+    if not math.isfinite(minimum_tolerance) or minimum_tolerance < 0.0:
+        raise ValueError("minimum regression tolerance must be finite and non-negative")
+    milestones = tuple(sorted({float(value) for value in progress_milestones_m}))
+    if any(not math.isfinite(value) or value < 0.0 for value in milestones):
+        raise ValueError("progress milestones must be finite and non-negative")
     if (reference_order_positions is None) != (
         candidate_order_positions is None
     ):
@@ -791,6 +837,25 @@ def safe_actor_probe_decision(
                 trials_per_seed=trials_per_seed,
             )
         )
+    expected_trials = len(reference_distances_m)
+    if reference_laps_completed is None:
+        reference_laps_completed = (0,) * expected_trials
+    if candidate_laps_completed is None:
+        candidate_laps_completed = (0,) * expected_trials
+    if (
+        len(reference_laps_completed) != expected_trials
+        or len(candidate_laps_completed) != expected_trials
+    ):
+        raise ValueError("lap-completion sets must match the probe distances")
+    reference_laps = np.asarray(reference_laps_completed, dtype=float)
+    candidate_laps = np.asarray(candidate_laps_completed, dtype=float)
+    if (
+        not np.all(np.isfinite(reference_laps))
+        or not np.all(np.isfinite(candidate_laps))
+        or np.any(reference_laps < 0.0)
+        or np.any(candidate_laps < 0.0)
+    ):
+        raise ValueError("lap completions must be finite and non-negative")
     reference_seed_medians = np.asarray(
         order_stratified_seed_aggregates(
             reference_distances_m,
@@ -841,8 +906,18 @@ def safe_actor_probe_decision(
     candidate_median = float(np.median(candidate_seed_medians))
     reference_minimum = float(np.min(reference_seed_medians))
     candidate_minimum = float(np.min(candidate_seed_medians))
+    reference_upper_quartile = float(
+        np.percentile(reference_seed_medians, 75.0)
+    )
+    candidate_upper_quartile = float(
+        np.percentile(candidate_seed_medians, 75.0)
+    )
+    reference_maximum = float(np.max(reference))
+    candidate_maximum = float(np.max(candidate))
     aggregate_median_gain = candidate_median - reference_median
     minimum_gain = candidate_minimum - reference_minimum
+    upper_quartile_gain = candidate_upper_quartile - reference_upper_quartile
+    maximum_gain = candidate_maximum - reference_maximum
     paired_median_delta = float(np.median(paired_deltas))
     worst_paired_delta = float(np.min(paired_deltas))
     paired_regressions = int(np.count_nonzero(paired_deltas < 0.0))
@@ -850,21 +925,49 @@ def safe_actor_probe_decision(
     order_position_regressions = int(
         np.count_nonzero(position_deltas < 0.0)
     )
-    accepted = (
-        aggregate_median_gain >= required_gain
-        and minimum_gain >= 0.0
-        and paired_median_delta >= required_gain
-        and worst_paired_delta >= -regression_limit
-        and worst_order_position_delta >= -regression_limit
+    reference_lap_completions = int(np.sum(reference_laps))
+    candidate_lap_completions = int(np.sum(candidate_laps))
+    new_milestones = tuple(
+        milestone
+        for milestone in milestones
+        if reference_maximum < milestone <= candidate_maximum
     )
+    progress_reasons: list[str] = []
+    if aggregate_median_gain >= required_gain:
+        progress_reasons.append("median_distance")
+    if upper_quartile_gain >= required_gain:
+        progress_reasons.append("upper_quartile_distance")
+    if maximum_gain >= required_gain:
+        progress_reasons.append("furthest_distance")
+    if new_milestones:
+        progress_reasons.append("new_sector_milestone")
+    if candidate_lap_completions > reference_lap_completions:
+        progress_reasons.append("lap_completion")
+
+    safety_failures: list[str] = []
+    if aggregate_median_gain < -median_tolerance:
+        safety_failures.append("median_regression")
+    if minimum_gain < -minimum_tolerance:
+        safety_failures.append("minimum_regression")
+    if worst_paired_delta < -regression_limit:
+        safety_failures.append("paired_seed_regression")
+    if worst_order_position_delta < -regression_limit:
+        safety_failures.append("order_position_regression")
+    accepted = bool(progress_reasons) and not safety_failures
     return SafeActorProbeComparison(
         decision="accepted" if accepted else "rolled_back",
         reference_median_distance_m=reference_median,
         reference_minimum_distance_m=reference_minimum,
+        reference_upper_quartile_distance_m=reference_upper_quartile,
+        reference_maximum_distance_m=reference_maximum,
         candidate_median_distance_m=candidate_median,
         candidate_minimum_distance_m=candidate_minimum,
+        candidate_upper_quartile_distance_m=candidate_upper_quartile,
+        candidate_maximum_distance_m=candidate_maximum,
         aggregate_median_gain_m=aggregate_median_gain,
         minimum_gain_m=minimum_gain,
+        upper_quartile_gain_m=upper_quartile_gain,
+        maximum_gain_m=maximum_gain,
         paired_median_delta_m=paired_median_delta,
         worst_paired_delta_m=worst_paired_delta,
         paired_regressions=paired_regressions,
@@ -881,6 +984,11 @@ def safe_actor_probe_decision(
         candidate_seed_medians_m=tuple(
             float(value) for value in candidate_seed_medians
         ),
+        reference_lap_completions=reference_lap_completions,
+        candidate_lap_completions=candidate_lap_completions,
+        new_progress_milestones_m=new_milestones,
+        acceptance_reasons=tuple(progress_reasons),
+        safety_failures=tuple(safety_failures),
     )
 
 
@@ -1244,7 +1352,17 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "external_teacher": False,
             "behaviour_cloning": False,
             "racing_line_imitation": False,
-            "constraint": "action_space_trust_region_to_last_accepted_actor",
+            "robust_champion": {
+                "role": "immutable_source_policy",
+                "path": str(args.resume_from) if args.continuation else None,
+                "may_be_replaced_by_internal_probe": False,
+            },
+            "working_policy": {
+                "role": "last_locally_accepted_continuation_actor",
+                "path": str(args.model_path),
+                "may_accept_bounded_temporary_regressions": True,
+            },
+            "constraint": "action_space_trust_region_to_working_policy",
             "max_normalized_action_delta": args.safe_actor_max_action_delta,
             "gradient_clip_norm": args.safe_actor_gradient_norm,
             "actor_updates_per_inner_block": args.safe_actor_block_updates,
@@ -1316,11 +1434,19 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "robustness_probe_steering_noise_std": (
                 args.safe_actor_probe_noise_std
             ),
-            "reference_policy": "last_accepted_actor_on_same_challenge_seeds",
+            "reference_policy": "working_policy_on_same_challenge_seeds",
             "acceptance_metric": (
-                "order_stratified_seed_metrics_with_seed_and_position_guards"
+                "progress_in_median_upper_quartile_furthest_milestone_or_lap_"
+                "with_bounded_seed_and_position_regressions"
             ),
             "minimum_improvement_m": args.safe_actor_min_improvement_m,
+            "median_regression_tolerance_m": (
+                args.safe_actor_median_regression_tolerance_m
+            ),
+            "minimum_regression_tolerance_m": (
+                args.safe_actor_minimum_regression_tolerance_m
+            ),
+            "progress_milestones_m": list(SAFE_ACTOR_PROGRESS_MILESTONES_M),
             "maximum_paired_regression_m": (
                 args.safe_actor_max_paired_regression_m
             ),
@@ -1337,7 +1463,8 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             ],
             "critic_and_replay_survive_rollback": True,
             "candidate_probes_deferred_from_curriculum": True,
-            "saved_checkpoint_actor": "last_accepted_actor",
+            "saved_checkpoint_actor": "working_policy",
+            "held_out_evaluation_seeds_used_during_training": False,
         },
         "total_timesteps_requested": args.total_timesteps,
         "timestep_budget": {
@@ -1684,7 +1811,13 @@ def make_training_env_class(gym: Any, spaces: Any):
             """Commit one accepted probe result to the curriculum state."""
             if str(summary.get("stage_id")) != self.current_stage.stage_id:
                 return
-            completed_lap = int(summary.get("laps_completed") or 0) > 0
+            completed_lap = bool(
+                int(summary.get("laps_completed") or 0) > 0
+                or int(
+                    summary.get("safe_actor_candidate_lap_completions") or 0
+                )
+                > 0
+            )
             stage_success = (
                 float(median_distance_m) >= self.current_stage.distance_target_m
                 or completed_lap
@@ -3118,11 +3251,35 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             summary["safe_actor_probe_minimum_distance_m"] = result.get(
                 "minimum_distance_m"
             )
+            summary["safe_actor_probe_upper_quartile_distance_m"] = result.get(
+                "upper_quartile_distance_m"
+            )
+            summary["safe_actor_probe_maximum_distance_m"] = result.get(
+                "maximum_distance_m"
+            )
             summary["safe_actor_reference_median_distance_m"] = result.get(
                 "reference_median_distance_m"
             )
             summary["safe_actor_reference_minimum_distance_m"] = result.get(
                 "reference_minimum_distance_m"
+            )
+            summary["safe_actor_reference_upper_quartile_distance_m"] = (
+                result.get("reference_upper_quartile_distance_m")
+            )
+            summary["safe_actor_reference_maximum_distance_m"] = result.get(
+                "reference_maximum_distance_m"
+            )
+            summary["safe_actor_aggregate_median_gain_m"] = result.get(
+                "aggregate_median_gain_m"
+            )
+            summary["safe_actor_minimum_gain_m"] = result.get(
+                "minimum_gain_m"
+            )
+            summary["safe_actor_upper_quartile_gain_m"] = result.get(
+                "upper_quartile_gain_m"
+            )
+            summary["safe_actor_maximum_gain_m"] = result.get(
+                "maximum_gain_m"
             )
             summary["safe_actor_paired_median_delta_m"] = result.get(
                 "paired_median_delta_m"
@@ -3150,6 +3307,21 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             )
             summary["safe_actor_candidate_seed_medians_m"] = result.get(
                 "candidate_seed_medians_m"
+            )
+            summary["safe_actor_reference_lap_completions"] = result.get(
+                "reference_lap_completions"
+            )
+            summary["safe_actor_candidate_lap_completions"] = result.get(
+                "candidate_lap_completions"
+            )
+            summary["safe_actor_new_progress_milestones_m"] = result.get(
+                "new_progress_milestones_m"
+            )
+            summary["safe_actor_acceptance_reasons"] = result.get(
+                "acceptance_reasons"
+            )
+            summary["safe_actor_safety_failures"] = result.get(
+                "safety_failures"
             )
             summary["safe_actor_accepted_distance_m"] = result.get(
                 "accepted_distance_m"
@@ -3210,6 +3382,10 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                     f"{float(result['worst_paired_delta_m']):+.1f}m, "
                     "worst seed-position="
                     f"{float(worst_position_delta):+.1f}m"
+                    "; progress="
+                    f"{','.join(result.get('acceptance_reasons') or ['none'])}"
+                    "; safety="
+                    f"{','.join(result.get('safety_failures') or ['passed'])}"
                     f"{probe_suffix}"
                 )
 
@@ -3515,6 +3691,8 @@ def make_phased_continuation_td3_class(TD3: Any):
             return [
                 *super()._excluded_save_params(),
                 "_agent6_safe_actor_reference",
+                "_agent6_safe_actor_robust_state",
+                "_agent6_safe_actor_robust_target_state",
                 "_agent6_safe_actor_state",
                 "_agent6_safe_actor_target_state",
                 "_agent6_safe_actor_optimizer_state",
@@ -3589,6 +3767,12 @@ def make_phased_continuation_td3_class(TD3: Any):
             safe_actor_min_improvement_m: float = (
                 DEFAULT_SAFE_ACTOR_MIN_IMPROVEMENT_M
             ),
+            safe_actor_median_regression_tolerance_m: float = (
+                DEFAULT_SAFE_ACTOR_MEDIAN_REGRESSION_TOLERANCE_M
+            ),
+            safe_actor_minimum_regression_tolerance_m: float = (
+                DEFAULT_SAFE_ACTOR_MINIMUM_REGRESSION_TOLERANCE_M
+            ),
             safe_actor_max_paired_regression_m: float = (
                 DEFAULT_SAFE_ACTOR_MAX_PAIRED_REGRESSION_M
             ),
@@ -3661,6 +3845,14 @@ def make_phased_continuation_td3_class(TD3: Any):
                 0.0,
                 float(safe_actor_min_improvement_m),
             )
+            self._agent6_safe_actor_median_regression_tolerance_m = max(
+                0.0,
+                float(safe_actor_median_regression_tolerance_m),
+            )
+            self._agent6_safe_actor_minimum_regression_tolerance_m = max(
+                0.0,
+                float(safe_actor_minimum_regression_tolerance_m),
+            )
             self._agent6_safe_actor_max_paired_regression_m = max(
                 0.0,
                 float(safe_actor_max_paired_regression_m),
@@ -3708,6 +3900,14 @@ def make_phased_continuation_td3_class(TD3: Any):
                 0.0,
                 finite_float(source_verified_minimum_distance_m),
             )
+            self._agent6_safe_actor_accepted_upper_quartile_distance_m = (
+                self._agent6_safe_actor_accepted_distance_m
+            )
+            self._agent6_safe_actor_accepted_maximum_distance_m = (
+                self._agent6_safe_actor_accepted_distance_m
+            )
+            self._agent6_safe_actor_accepted_lap_completions = 0
+            self._agent6_safe_actor_accepted_milestones_m: tuple[float, ...] = ()
             self._agent6_safe_actor_candidate_id = 0
             self._agent6_safe_actor_candidate_updates = 0
             self._agent6_safe_actor_waiting_for_probe = False
@@ -3720,6 +3920,8 @@ def make_phased_continuation_td3_class(TD3: Any):
             self._agent6_safe_actor_candidate_distances_m: list[float] = []
             self._agent6_safe_actor_reference_order_positions: list[int] = []
             self._agent6_safe_actor_candidate_order_positions: list[int] = []
+            self._agent6_safe_actor_reference_laps_completed: list[int] = []
+            self._agent6_safe_actor_candidate_laps_completed: list[int] = []
             self._agent6_safe_actor_accepted_blocks = 0
             self._agent6_safe_actor_rolled_back_blocks = 0
             self._agent6_safe_actor_screened_out_blocks = 0
@@ -3738,6 +3940,8 @@ def make_phased_continuation_td3_class(TD3: Any):
             self._agent6_safe_actor_anchor_observations = None
             self._clear_safe_actor_candidate_snapshot()
             if self._agent6_safe_actor_enabled:
+                if not hasattr(self, "_agent6_safe_actor_robust_state"):
+                    self._snapshot_safe_actor_robust_champion()
                 self._snapshot_safe_actor()
 
         @staticmethod
@@ -3746,6 +3950,15 @@ def make_phased_continuation_td3_class(TD3: Any):
                 name: value.detach().clone()
                 for name, value in module.state_dict().items()
             }
+
+        def _snapshot_safe_actor_robust_champion(self) -> None:
+            """Capture the source champion once; working-policy accepts never replace it."""
+            self._agent6_safe_actor_robust_state = self._clone_module_state(
+                self.actor
+            )
+            self._agent6_safe_actor_robust_target_state = (
+                self._clone_module_state(self.actor_target)
+            )
 
         def _snapshot_safe_actor(self) -> None:
             self._agent6_safe_actor_state = self._clone_module_state(self.actor)
@@ -3826,7 +4039,7 @@ def make_phased_continuation_td3_class(TD3: Any):
             self._clear_safe_actor_candidate_snapshot()
             print(
                 "\nSafe actor candidate "
-                f"{candidate_id} is policy-equivalent to the accepted actor; "
+                f"{candidate_id} is policy-equivalent to the working policy; "
                 "skipped matched robustness probes."
             )
             return True
@@ -3849,6 +4062,8 @@ def make_phased_continuation_td3_class(TD3: Any):
             self._agent6_safe_actor_candidate_distances_m = []
             self._agent6_safe_actor_reference_order_positions = []
             self._agent6_safe_actor_candidate_order_positions = []
+            self._agent6_safe_actor_reference_laps_completed = []
+            self._agent6_safe_actor_candidate_laps_completed = []
             self._activate_safe_actor_probe_mode(
                 self._current_safe_actor_probe_order()[0]
             )
@@ -4030,9 +4245,25 @@ def make_phased_continuation_td3_class(TD3: Any):
             }
 
         def safe_actor_status(self) -> dict[str, Any]:
+            robust_state = getattr(
+                self,
+                "_agent6_safe_actor_robust_state",
+                {},
+            )
+            working_state = getattr(self, "_agent6_safe_actor_state", {})
             return {
                 "enabled": bool(
                     getattr(self, "_agent6_safe_actor_enabled", False)
+                ),
+                "robust_champion_role": "immutable_source_actor",
+                "working_policy_role": "last_locally_accepted_actor",
+                "working_policy_differs_from_robust_champion": bool(
+                    robust_state
+                    and working_state
+                    and not parameter_state_dicts_are_identical(
+                        robust_state,
+                        working_state,
+                    )
                 ),
                 "accepted_distance_m": float(
                     getattr(self, "_agent6_safe_actor_accepted_distance_m", 0.0)
@@ -4042,6 +4273,34 @@ def make_phased_continuation_td3_class(TD3: Any):
                         self,
                         "_agent6_safe_actor_accepted_minimum_distance_m",
                         0.0,
+                    )
+                ),
+                "accepted_upper_quartile_distance_m": float(
+                    getattr(
+                        self,
+                        "_agent6_safe_actor_accepted_upper_quartile_distance_m",
+                        0.0,
+                    )
+                ),
+                "accepted_maximum_distance_m": float(
+                    getattr(
+                        self,
+                        "_agent6_safe_actor_accepted_maximum_distance_m",
+                        0.0,
+                    )
+                ),
+                "accepted_lap_completions": int(
+                    getattr(
+                        self,
+                        "_agent6_safe_actor_accepted_lap_completions",
+                        0,
+                    )
+                ),
+                "accepted_milestones_m": list(
+                    getattr(
+                        self,
+                        "_agent6_safe_actor_accepted_milestones_m",
+                        (),
                     )
                 ),
                 "accepted_blocks": int(
@@ -4168,6 +4427,16 @@ def make_phased_continuation_td3_class(TD3: Any):
                         probe_slice
                     ]
                 ),
+                reference_laps_completed=(
+                    self._agent6_safe_actor_reference_laps_completed[
+                        probe_slice
+                    ]
+                ),
+                candidate_laps_completed=(
+                    self._agent6_safe_actor_candidate_laps_completed[
+                        probe_slice
+                    ]
+                ),
                 minimum_improvement_m=(
                     self._agent6_safe_actor_min_improvement_m
                     if minimum_improvement_m is None
@@ -4177,6 +4446,12 @@ def make_phased_continuation_td3_class(TD3: Any):
                     self._agent6_safe_actor_max_paired_regression_m
                     if maximum_regression_m is None
                     else maximum_regression_m
+                ),
+                median_regression_tolerance_m=(
+                    self._agent6_safe_actor_median_regression_tolerance_m
+                ),
+                minimum_regression_tolerance_m=(
+                    self._agent6_safe_actor_minimum_regression_tolerance_m
                 ),
             )
 
@@ -4189,14 +4464,28 @@ def make_phased_continuation_td3_class(TD3: Any):
                 "minimum_distance_m": (
                     comparison.candidate_minimum_distance_m
                 ),
+                "upper_quartile_distance_m": (
+                    comparison.candidate_upper_quartile_distance_m
+                ),
+                "maximum_distance_m": (
+                    comparison.candidate_maximum_distance_m
+                ),
                 "reference_median_distance_m": (
                     comparison.reference_median_distance_m
                 ),
                 "reference_minimum_distance_m": (
                     comparison.reference_minimum_distance_m
                 ),
+                "reference_upper_quartile_distance_m": (
+                    comparison.reference_upper_quartile_distance_m
+                ),
+                "reference_maximum_distance_m": (
+                    comparison.reference_maximum_distance_m
+                ),
                 "aggregate_median_gain_m": comparison.aggregate_median_gain_m,
                 "minimum_gain_m": comparison.minimum_gain_m,
+                "upper_quartile_gain_m": comparison.upper_quartile_gain_m,
+                "maximum_gain_m": comparison.maximum_gain_m,
                 "paired_median_delta_m": comparison.paired_median_delta_m,
                 "worst_paired_delta_m": comparison.worst_paired_delta_m,
                 "paired_regressions": comparison.paired_regressions,
@@ -4217,6 +4506,17 @@ def make_phased_continuation_td3_class(TD3: Any):
                 "candidate_seed_medians_m": list(
                     comparison.candidate_seed_medians_m
                 ),
+                "reference_lap_completions": (
+                    comparison.reference_lap_completions
+                ),
+                "candidate_lap_completions": (
+                    comparison.candidate_lap_completions
+                ),
+                "new_progress_milestones_m": list(
+                    comparison.new_progress_milestones_m
+                ),
+                "acceptance_reasons": list(comparison.acceptance_reasons),
+                "safety_failures": list(comparison.safety_failures),
             }
 
         def _reset_safe_actor_probe_runtime(self) -> None:
@@ -4231,6 +4531,8 @@ def make_phased_continuation_td3_class(TD3: Any):
             self._agent6_safe_actor_candidate_distances_m = []
             self._agent6_safe_actor_reference_order_positions = []
             self._agent6_safe_actor_candidate_order_positions = []
+            self._agent6_safe_actor_reference_laps_completed = []
+            self._agent6_safe_actor_candidate_laps_completed = []
             self._agent6_safe_actor_evidence_candidate_id = 0
             self._agent6_safe_actor_evidence_distances_m = []
             self._agent6_safe_actor_evidence_completed_lap = False
@@ -4266,6 +4568,23 @@ def make_phased_continuation_td3_class(TD3: Any):
                 self._agent6_safe_actor_accepted_minimum_distance_m = (
                     comparison.candidate_minimum_distance_m
                 )
+                self._agent6_safe_actor_accepted_upper_quartile_distance_m = (
+                    comparison.candidate_upper_quartile_distance_m
+                )
+                self._agent6_safe_actor_accepted_maximum_distance_m = (
+                    comparison.candidate_maximum_distance_m
+                )
+                self._agent6_safe_actor_accepted_lap_completions = (
+                    comparison.candidate_lap_completions
+                )
+                self._agent6_safe_actor_accepted_milestones_m = tuple(
+                    sorted(
+                        {
+                            *self._agent6_safe_actor_accepted_milestones_m,
+                            *comparison.new_progress_milestones_m,
+                        }
+                    )
+                )
                 self._agent6_safe_actor_accepted_blocks += 1
                 self._snapshot_safe_actor()
             else:
@@ -4284,6 +4603,8 @@ def make_phased_continuation_td3_class(TD3: Any):
                 "decision": decision,
                 "probe_episodes_completed": probe_episodes_completed,
                 "probe_episodes_skipped": probe_episodes_skipped,
+                "acceptance_reasons": list(comparison.acceptance_reasons),
+                "safety_failures": list(comparison.safety_failures),
             }
             metrics = self._safe_actor_comparison_metrics(comparison)
             self._reset_safe_actor_probe_runtime()
@@ -4314,6 +4635,10 @@ def make_phased_continuation_td3_class(TD3: Any):
             if context is None:
                 return None
             distance_m = max(0.0, finite_float(summary.get("distance_m")))
+            laps_completed = max(
+                0,
+                int(finite_float(summary.get("laps_completed"))),
+            )
             result = {
                 "mode": context["mode"],
                 "seed": context["seed"],
@@ -4334,8 +4659,16 @@ def make_phased_continuation_td3_class(TD3: Any):
                 "probe_episodes_skipped": None,
                 "median_distance_m": None,
                 "minimum_distance_m": None,
+                "upper_quartile_distance_m": None,
+                "maximum_distance_m": None,
                 "reference_median_distance_m": None,
                 "reference_minimum_distance_m": None,
+                "reference_upper_quartile_distance_m": None,
+                "reference_maximum_distance_m": None,
+                "aggregate_median_gain_m": None,
+                "minimum_gain_m": None,
+                "upper_quartile_gain_m": None,
+                "maximum_gain_m": None,
                 "paired_median_delta_m": None,
                 "worst_paired_delta_m": None,
                 "paired_regressions": None,
@@ -4346,8 +4679,18 @@ def make_phased_continuation_td3_class(TD3: Any):
                 "accepted_minimum_distance_m": (
                     self._agent6_safe_actor_accepted_minimum_distance_m
                 ),
+                "reference_lap_completions": None,
+                "candidate_lap_completions": None,
+                "new_progress_milestones_m": None,
+                "acceptance_reasons": None,
+                "safety_failures": None,
                 "required_distance_m": self._agent6_safe_actor_min_improvement_m,
-                "required_minimum_distance_m": 0.0,
+                "median_regression_tolerance_m": (
+                    self._agent6_safe_actor_median_regression_tolerance_m
+                ),
+                "minimum_regression_tolerance_m": (
+                    self._agent6_safe_actor_minimum_regression_tolerance_m
+                ),
                 "maximum_paired_regression_m": (
                     self._agent6_safe_actor_max_paired_regression_m
                 ),
@@ -4357,10 +4700,16 @@ def make_phased_continuation_td3_class(TD3: Any):
                 self._agent6_safe_actor_reference_order_positions.append(
                     int(context["order_position"])
                 )
+                self._agent6_safe_actor_reference_laps_completed.append(
+                    laps_completed
+                )
             else:
                 self._agent6_safe_actor_candidate_distances_m.append(distance_m)
                 self._agent6_safe_actor_candidate_order_positions.append(
                     int(context["order_position"])
+                )
+                self._agent6_safe_actor_candidate_laps_completed.append(
+                    laps_completed
                 )
             result["probe_episodes_completed"] = (
                 len(self._agent6_safe_actor_reference_distances_m)
@@ -5114,7 +5463,7 @@ def parse_args() -> argparse.Namespace:
         "--safe-actor-max-action-delta",
         type=float,
         default=DEFAULT_SAFE_ACTOR_MAX_ACTION_DELTA,
-        help="Maximum normalized action deviation from the accepted actor.",
+        help="Maximum normalized action deviation from the working policy.",
     )
     parser.add_argument(
         "--safe-actor-gradient-norm",
@@ -5177,7 +5526,28 @@ def parse_args() -> argparse.Namespace:
         "--safe-actor-min-improvement-m",
         type=float,
         default=DEFAULT_SAFE_ACTOR_MIN_IMPROVEMENT_M,
-        help="Required median-distance gain before a candidate is accepted.",
+        help=(
+            "Required gain in at least one progress metric before a safe "
+            "candidate can become the working policy."
+        ),
+    )
+    parser.add_argument(
+        "--safe-actor-median-regression-tolerance-m",
+        type=float,
+        default=DEFAULT_SAFE_ACTOR_MEDIAN_REGRESSION_TOLERANCE_M,
+        help=(
+            "Small median-distance regression allowed when another progress "
+            "metric improves."
+        ),
+    )
+    parser.add_argument(
+        "--safe-actor-minimum-regression-tolerance-m",
+        type=float,
+        default=DEFAULT_SAFE_ACTOR_MINIMUM_REGRESSION_TOLERANCE_M,
+        help=(
+            "Minimum-distance regression allowed before a candidate is "
+            "classified as unsafe."
+        ),
     )
     parser.add_argument(
         "--safe-actor-max-paired-regression-m",
@@ -5521,6 +5891,22 @@ def parse_args() -> argparse.Namespace:
             "--safe-actor-min-improvement-m must be finite and non-negative"
         )
     if (
+        not math.isfinite(args.safe_actor_median_regression_tolerance_m)
+        or args.safe_actor_median_regression_tolerance_m < 0.0
+    ):
+        parser.error(
+            "--safe-actor-median-regression-tolerance-m must be finite and "
+            "non-negative"
+        )
+    if (
+        not math.isfinite(args.safe_actor_minimum_regression_tolerance_m)
+        or args.safe_actor_minimum_regression_tolerance_m < 0.0
+    ):
+        parser.error(
+            "--safe-actor-minimum-regression-tolerance-m must be finite and "
+            "non-negative"
+        )
+    if (
         not math.isfinite(args.safe_actor_max_paired_regression_m)
         or args.safe_actor_max_paired_regression_m < 0.0
     ):
@@ -5749,6 +6135,12 @@ def main() -> None:
                 args.safe_actor_screening_trials_per_seed
             ),
             safe_actor_min_improvement_m=args.safe_actor_min_improvement_m,
+            safe_actor_median_regression_tolerance_m=(
+                args.safe_actor_median_regression_tolerance_m
+            ),
+            safe_actor_minimum_regression_tolerance_m=(
+                args.safe_actor_minimum_regression_tolerance_m
+            ),
             safe_actor_max_paired_regression_m=(
                 args.safe_actor_max_paired_regression_m
             ),
