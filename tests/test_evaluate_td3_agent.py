@@ -19,6 +19,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from agents.td3_agent import evaluation_checkpoint_is_verified  # noqa: E402
+from agents import td3_checkpointing  # noqa: E402
 
 
 spec = importlib.util.spec_from_file_location("evaluate_td3_agent", SCRIPT_PATH)
@@ -38,6 +39,11 @@ class Td3EvaluationTests(unittest.TestCase):
         self.assertEqual(
             evaluate_td3_agent.EVALUATION_PROTOCOL,
             "agent6_order_stratified_robustness_v5",
+        )
+        self.assertTrue(
+            str(args.best_completed_lap_model_path).endswith(
+                "agent6_td3_scratch_racer_best_completed_lap.zip"
+            )
         )
 
         with mock.patch.object(
@@ -480,6 +486,100 @@ class Td3EvaluationTests(unittest.TestCase):
                 )
             )
             self.assertEqual(best.read_bytes(), b"candidate-policy")
+
+    def test_completed_lap_champion_ranks_completion_reliability_then_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.zip"
+            stronger = root / "stronger.zip"
+            best = root / "best_completed_lap.zip"
+            first.write_bytes(b"first-lap-policy")
+            stronger.write_bytes(b"stronger-lap-policy")
+            first_record = {
+                "completed_laps": 1,
+                "validation_trials": 1,
+                "reliability": 1.0,
+                "best_lap_seconds": 95.0,
+            }
+
+            self.assertTrue(
+                evaluate_td3_agent.promote_best_completed_lap(
+                    first,
+                    best,
+                    {"model_family": "agent6_td3_scratch_racer"},
+                    first_record,
+                )
+            )
+            self.assertFalse(
+                evaluate_td3_agent.promote_best_completed_lap(
+                    stronger,
+                    best,
+                    {},
+                    {
+                        **first_record,
+                        "best_lap_seconds": 100.0,
+                    },
+                )
+            )
+            self.assertEqual(best.read_bytes(), b"first-lap-policy")
+
+            stronger_record = {
+                "completed_laps": 2,
+                "validation_trials": 5,
+                "reliability": 0.4,
+                "best_lap_seconds": 105.0,
+            }
+            self.assertTrue(
+                evaluate_td3_agent.promote_best_completed_lap(
+                    stronger,
+                    best,
+                    {},
+                    stronger_record,
+                )
+            )
+            self.assertEqual(best.read_bytes(), b"stronger-lap-policy")
+            metadata = evaluate_td3_agent.read_policy_metadata(best)
+            self.assertEqual(
+                metadata["best_completed_lap"]["completed_laps"],
+                2,
+            )
+            self.assertFalse(list(root.glob("*.tmp*")))
+
+    def test_atomic_promotion_failure_preserves_existing_champion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / "candidate.zip"
+            champion = root / "champion.zip"
+            candidate.write_bytes(b"new-policy")
+            champion.write_bytes(b"existing-policy")
+            champion_metadata = td3_checkpointing.metadata_path_for_policy(
+                champion
+            )
+            champion_metadata.write_text(
+                '{"generation": "existing"}\n',
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(
+                td3_checkpointing.os,
+                "replace",
+                side_effect=OSError("interrupted"),
+            ):
+                with self.assertRaisesRegex(OSError, "interrupted"):
+                    td3_checkpointing.promote_policy_bundle_atomically(
+                        candidate,
+                        champion,
+                        {"generation": "new"},
+                    )
+
+            self.assertEqual(champion.read_bytes(), b"existing-policy")
+            self.assertEqual(
+                json.loads(champion_metadata.read_text(encoding="utf-8")),
+                {"generation": "existing"},
+            )
+            self.assertFalse(
+                any(".tmp" in path.name for path in root.iterdir())
+            )
 
     def test_checkpoint_collection_is_numeric_and_deduplicated(self):
         with tempfile.TemporaryDirectory() as directory:

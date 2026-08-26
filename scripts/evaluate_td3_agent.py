@@ -4,7 +4,6 @@ import argparse
 import csv
 import json
 import math
-import shutil
 import statistics
 import sys
 from dataclasses import asdict, dataclass
@@ -29,6 +28,7 @@ from agents.td3_agent import (  # noqa: E402
     AGENT6_ROBUSTNESS_REPEATS,
     AGENT6_ROBUSTNESS_STEERING_NOISE_STD,
     AGENT6_ROBUSTNESS_TRIALS_PER_SEED,
+    DEFAULT_BEST_COMPLETED_LAP_MODEL_PATH,
     DEFAULT_BEST_EVALUATION_MODEL_PATH,
     DEFAULT_MODEL_PATH,
     FEATURE_NAMES,
@@ -44,6 +44,11 @@ from agents.td3_agent import (  # noqa: E402
     policy_contract_mismatches,
     policy_uses_legacy_action_contract,
     read_policy_metadata,
+)
+from agents.td3_checkpointing import (  # noqa: E402
+    completed_lap_quality,
+    promote_best_completed_lap,
+    promote_policy_bundle_atomically,
 )
 from gui.torcs_config import TorcsRaceSetup, TorcsRuntimeConfig  # noqa: E402
 
@@ -179,8 +184,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--best-evaluation-model-path",
+        "--best-robust-evaluation-model-path",
+        dest="best_evaluation_model_path",
         type=Path,
         default=DEFAULT_BEST_EVALUATION_MODEL_PATH,
+    )
+    parser.add_argument(
+        "--best-completed-lap-model-path",
+        type=Path,
+        default=DEFAULT_BEST_COMPLETED_LAP_MODEL_PATH,
     )
     args = parser.parse_args()
     if args.repeats < 3:
@@ -372,6 +384,31 @@ def main() -> int:
             )
         else:
             print("Verified TD3 evaluation checkpoint unchanged.")
+
+        lap_summaries = [
+            summary for summary in summaries if summary.completed_laps > 0
+        ]
+        if lap_summaries:
+            best_lap_summary = max(
+                lap_summaries,
+                key=lambda summary: completed_lap_quality(
+                    evaluation_completed_lap_record(summary)
+                ),
+            )
+            best_lap_path = Path(best_lap_summary.policy_path)
+            lap_record = evaluation_completed_lap_record(best_lap_summary)
+            if promote_best_completed_lap(
+                best_lap_path,
+                args.best_completed_lap_model_path,
+                read_policy_metadata(best_lap_path),
+                lap_record,
+            ):
+                print(
+                    "Promoted completed-lap TD3 checkpoint: "
+                    f"{args.best_completed_lap_model_path}"
+                )
+            else:
+                print("Completed-lap TD3 checkpoint unchanged.")
 
     json_path, csv_path = write_evaluation_logs(
         args.output_dir,
@@ -762,9 +799,6 @@ def promote_best_evaluation(
         ):
             return False
 
-    best_path.parent.mkdir(parents=True, exist_ok=True)
-    if candidate_path.resolve() != best_path.resolve():
-        shutil.copy2(candidate_path, best_path)
     source_metadata = read_policy_metadata(candidate_path)
     candidate_action_shape = source_metadata.get("action_shape", AGENT6_ACTION_SHAPE)
     candidate_action_version = source_metadata.get(
@@ -792,11 +826,33 @@ def promote_best_evaluation(
             "episodes": [asdict(episode) for episode in episodes],
         },
     }
-    metadata_path_for_policy(best_path).write_text(
-        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    promote_policy_bundle_atomically(
+        candidate_path,
+        best_path,
+        metadata,
     )
     return True
+
+
+def evaluation_completed_lap_record(
+    summary: EvaluationSummary,
+) -> dict[str, Any]:
+    repeats = max(1, int(summary.repeats))
+    return {
+        "source": "held_out_external_evaluation",
+        "source_policy_path": summary.policy_path,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "track": summary.track,
+        "deterministic": summary.deterministic,
+        "evaluation_protocol": summary.evaluation_protocol,
+        "evaluation_seeds": list(summary.evaluation_seeds),
+        "completed_laps": int(summary.completed_laps),
+        "validation_trials": repeats,
+        "reliability": float(summary.completed_repeats) / repeats,
+        "best_lap_seconds": summary.best_lap_seconds,
+        "median_progress_m": summary.median_progress_m,
+        "minimum_progress_m": summary.minimum_progress_m,
+    }
 
 
 def evaluation_protocol_key(

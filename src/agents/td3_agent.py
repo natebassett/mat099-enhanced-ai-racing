@@ -23,6 +23,12 @@ DEFAULT_BEST_REWARD_MODEL_PATH = (
 DEFAULT_BEST_EVALUATION_MODEL_PATH = (
     PROJECT_ROOT / "models" / "agent6_td3_scratch_racer_best_evaluation.zip"
 )
+DEFAULT_BEST_ROBUST_EVALUATION_MODEL_PATH = (
+    DEFAULT_BEST_EVALUATION_MODEL_PATH
+)
+DEFAULT_BEST_COMPLETED_LAP_MODEL_PATH = (
+    PROJECT_ROOT / "models" / "agent6_td3_scratch_racer_best_completed_lap.zip"
+)
 
 AGENT6_MODEL_FAMILY = "agent6_td3_scratch_racer"
 AGENT6_OBSERVATION_VERSION = "agent6_td3_raw_telemetry_v2"
@@ -670,6 +676,19 @@ def evaluation_checkpoint_is_verified(policy_path: Path) -> bool:
     )
 
 
+def completed_lap_checkpoint_is_verified(policy_path: Path) -> bool:
+    if not policy_path.is_file():
+        return False
+    completed_lap = read_policy_metadata(policy_path).get(
+        "best_completed_lap"
+    )
+    return bool(
+        isinstance(completed_lap, Mapping)
+        and finite_float(completed_lap.get("completed_laps")) >= 1.0
+        and finite_float(completed_lap.get("best_lap_seconds")) > 0.0
+    )
+
+
 def policy_contract_mismatches(
     metadata: Mapping[str, Any],
     *,
@@ -981,6 +1000,10 @@ class Td3ScratchAgent:
 def _default_policy_path() -> Path:
     if evaluation_checkpoint_is_verified(DEFAULT_BEST_EVALUATION_MODEL_PATH):
         return DEFAULT_BEST_EVALUATION_MODEL_PATH
+    if completed_lap_checkpoint_is_verified(
+        DEFAULT_BEST_COMPLETED_LAP_MODEL_PATH
+    ):
+        return DEFAULT_BEST_COMPLETED_LAP_MODEL_PATH
     if policy_checkpoint_is_verified(
         DEFAULT_BEST_DISTANCE_MODEL_PATH,
         "best_distance_episode",

@@ -47,6 +47,7 @@ from agents.td3_agent import (  # noqa: E402
     build_td3_observation,
     decode_legacy_td3_action,
     decode_td3_action,
+    completed_lap_checkpoint_is_verified,
     episode_metadata_is_deterministic_probe,
     episode_metadata_is_policy_controlled,
     metadata_path_for_policy,
@@ -413,6 +414,44 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                 previous_furthest_distance_m=1400.0,
             ),
         )
+
+    def test_sector_milestones_are_discovered_once_in_distance_order(self):
+        first = train_td3_agent.sector_milestones_crossed(
+            1449.0,
+            1560.0,
+        )
+        repeated = train_td3_agent.sector_milestones_crossed(
+            1560.0,
+            1800.0,
+            set(first),
+        )
+
+        self.assertEqual(first, (1450.0, 1550.0))
+        self.assertEqual(repeated, (1750.0,))
+        self.assertEqual(
+            train_td3_agent.SECTOR_PROGRESS_MILESTONES_M,
+            (1450.0, 1550.0, 1750.0),
+        )
+
+    def test_sector_milestone_bonus_is_explicit_and_does_not_remove_anti_stall(self):
+        stage = train_td3_agent.CURRICULUM[2]
+        previous = _telemetry(distance=1449.95, raced=1449.95, speed=12.0)
+        current = _telemetry(distance=1450.1, raced=1450.1, speed=10.0)
+        current["track"] = [60.0] * 19
+
+        components = train_td3_agent.calculate_td3_reward_components(
+            current,
+            {"accel": 0.0, "brake": 0.1},
+            previous_telemetry=previous,
+            stage=stage,
+            episode_distance_m=1450.1,
+            previous_furthest_distance_m=1449.95,
+            newly_achieved_sector_milestones_m=(1450.0,),
+        )
+
+        self.assertEqual(components["sector_milestone_bonus"], 120.0)
+        self.assertLess(components["clear_track_anti_stall_penalty"], 0.0)
+        self.assertNotIn("low_speed_creep_bonus", components)
 
     def test_curriculum_stages_progress_from_launch_to_full_lap(self):
         stages = train_td3_agent.CURRICULUM
@@ -1338,6 +1377,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertFalse(args.continuation_compatibility_probe)
         self.assertFalse(args.continuation_compatibility_probe_only)
         self.assertEqual(args.continuation_compatibility_min_fraction, 0.90)
+        self.assertFalse(args.end_of_run_evaluation)
         self.assertEqual(args.warmup_steer_std, 0.18)
         self.assertFalse(args.save_best_replay_buffer)
 
@@ -1424,6 +1464,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertFalse(args.allow_legacy_action_migration)
         self.assertTrue(args.continuation_compatibility_probe)
         self.assertFalse(args.continuation_compatibility_probe_only)
+        self.assertTrue(args.end_of_run_evaluation)
         self.assertEqual(train_td3_agent.policy_action_start_timestep(args), 0)
         self.assertEqual(
             train_td3_agent.gradient_update_start_timestep(args),
@@ -2217,6 +2258,22 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             self.assertTrue(torch.equal(value, accepted_actor[name]))
         self.assertEqual(model.safe_actor_status()["no_evidence_blocks"], 1)
 
+        with torch.no_grad():
+            next(model.actor.parameters()).add_(0.01)
+        model._agent6_safe_actor_candidate_id = 99
+        model._agent6_safe_actor_candidate_updates = 1
+        model._agent6_safe_actor_waiting_for_probe = False
+        lap_evidence = model.record_safe_actor_training_episode(
+            {
+                "distance_m": train_td3_agent.G_TRACK_3_LENGTH_METRES,
+                "laps_completed": 1,
+                "deterministic_probe": False,
+            }
+        )
+
+        self.assertEqual(lap_evidence["decision"], "probe_eligible")
+        self.assertTrue(model.safe_actor_probe_required())
+
     def test_safe_actor_projection_enforces_action_space_limit(self):
         import gymnasium as gym
         import torch
@@ -2408,6 +2465,89 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             self.assertIn("RuntimeError: disk unavailable", error)
             self.assertFalse(path.is_file())
             self.assertFalse((Path(directory) / "best.replay_buffer.pkl.tmp").is_file())
+
+    def test_valid_lap_callback_archives_and_promotes_immediately(self):
+        class FakeBaseCallback:
+            def __init__(self, verbose=0):
+                self.locals = {}
+                self.num_timesteps = 123_456
+
+        class FakeModel:
+            def save_runtime_policy(self, path):
+                Path(path).write_bytes(b"lap-policy")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lap_dir = root / "laps"
+            best_lap = root / "best_completed_lap.zip"
+            Callback = train_td3_agent.make_lap_checkpoint_callback_class(
+                FakeBaseCallback
+            )
+            callback = Callback(
+                lap_dir,
+                best_lap,
+                {"model_family": AGENT6_MODEL_FAMILY},
+            )
+            callback.model = FakeModel()
+            summary = {
+                "policy_controlled": True,
+                "deterministic_probe": False,
+                "laps_completed": 1,
+                "best_lap_time_seconds": 94.5,
+                "distance_m": train_td3_agent.G_TRACK_3_LENGTH_METRES,
+                "furthest_distance_m": train_td3_agent.G_TRACK_3_LENGTH_METRES,
+                "safe_actor_probe_mode": None,
+            }
+            callback.locals = {"infos": [{"episode_summary": summary}]}
+
+            self.assertTrue(callback._on_step())
+
+            archives = list(lap_dir.glob("*.zip"))
+            self.assertEqual(len(archives), 1)
+            self.assertEqual(archives[0].read_bytes(), b"lap-policy")
+            self.assertEqual(best_lap.read_bytes(), b"lap-policy")
+            self.assertTrue(completed_lap_checkpoint_is_verified(best_lap))
+            metadata = json.loads(
+                metadata_path_for_policy(best_lap).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                metadata["best_completed_lap"]["completed_laps"],
+                1,
+            )
+
+        self.assertFalse(
+            train_td3_agent.policy_lap_is_valid(
+                {
+                    **summary,
+                    "policy_controlled": False,
+                }
+            )
+        )
+
+    def test_automatic_evaluation_uses_separate_held_out_process(self):
+        args = types.SimpleNamespace(
+            model_path=Path("models/working.zip"),
+            track="g-track-3",
+            automatic_evaluation_output_dir=Path("evaluation"),
+            best_robust_evaluation_model_path=Path("models/robust.zip"),
+            best_completed_lap_model_path=Path("models/lap.zip"),
+        )
+        completed = types.SimpleNamespace(returncode=0)
+        with mock.patch.object(
+            train_td3_agent.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            result = train_td3_agent.run_automatic_end_evaluation(args)
+
+        command = run.call_args.args[0]
+        self.assertTrue(result["succeeded"])
+        self.assertEqual(command.count("--policy-path"), 1)
+        self.assertIn("--promote-best-if-improved", command)
+        self.assertIn("--best-robust-evaluation-model-path", command)
+        self.assertIn("--best-completed-lap-model-path", command)
+        self.assertEqual(run.call_args.kwargs["cwd"], PROJECT_ROOT)
+        self.assertFalse(run.call_args.kwargs["check"])
 
     def test_final_learning_rate_cannot_exceed_initial_rate(self):
         argv = [
@@ -2657,6 +2797,126 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(budget.stop_reason, "training_budget_reached")
         self.assertGreaterEqual(budget.as_dict()["training_fraction"], 0.80)
 
+    def test_probe_budget_restores_exact_counters_and_ratios(self):
+        original = train_td3_agent.ProbeBudgetController(20_000, 5_000)
+        original.record_infos([{"deterministic_probe": False}] * 4)
+        original.record_infos([{"deterministic_probe": True}] * 1)
+        original.deferred_probe_requests = 3
+
+        restored = train_td3_agent.ProbeBudgetController(20_000, 5_000)
+        restored.restore(original.as_dict())
+
+        self.assertEqual(restored.training_steps, 4)
+        self.assertEqual(restored.probe_steps, 1)
+        self.assertEqual(restored.environment_steps, 5)
+        self.assertEqual(restored.deferred_probe_requests, 3)
+        self.assertAlmostEqual(restored.as_dict()["training_fraction"], 0.8)
+
+    def test_exact_checkpoint_round_trips_all_external_training_state(self):
+        class FakeModel:
+            device = "cpu"
+
+            def __init__(self):
+                self.restored = None
+                self.loaded_replay = None
+
+            def save_runtime_policy(self, path):
+                Path(path).write_bytes(b"policy")
+
+            def save_replay_buffer(self, path):
+                Path(path).write_bytes(b"replay")
+
+            def exact_training_state_dict(self):
+                return {"safe_actor": {"candidate_id": 7}}
+
+            def load_replay_buffer(self, path):
+                self.loaded_replay = Path(path)
+
+            def restore_exact_training_state(self, state):
+                self.restored = state
+
+        class FakeEnvironment:
+            current_stage = types.SimpleNamespace(stage_id="sector_progression")
+            current_telemetry = {"speedX": 10.0}
+            steps = 4
+            sector_milestone_history = [{"milestone_m": 1450.0}]
+
+            def training_state_dict(self):
+                return {
+                    "stage_id": "sector_progression",
+                    "sector_milestone_history": self.sector_milestone_history,
+                }
+
+            def restore_training_state(self, state):
+                self.restored = dict(state)
+
+        class FakeExploration:
+            def training_state_dict(self):
+                return {"probe_episodes_completed": 2}
+
+            def restore_training_state(self, state):
+                self.restored = dict(state)
+
+        metadata = {
+            "model_family": AGENT6_MODEL_FAMILY,
+            "observation_version": AGENT6_OBSERVATION_VERSION,
+            "action_version": AGENT6_ACTION_VERSION,
+            "feature_names": FEATURE_NAMES,
+            "action_shape": AGENT6_ACTION_SHAPE,
+            "timestep_budget": {},
+        }
+        budget = train_td3_agent.ProbeBudgetController(20_000, 5_000)
+        budget.record_infos([{"deterministic_probe": False}] * 4)
+        model = FakeModel()
+        environment = FakeEnvironment()
+        exploration = FakeExploration()
+
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "emergency.zip"
+            record = train_td3_agent.save_exact_training_checkpoint(
+                model,
+                environment,
+                exploration,
+                budget,
+                policy_path,
+                metadata,
+                reason="unit_test",
+            )
+
+            self.assertTrue(policy_path.is_file())
+            self.assertTrue(
+                train_td3_agent.replay_buffer_path_for_policy(policy_path).is_file()
+            )
+            self.assertTrue(
+                train_td3_agent.training_state_path_for_policy(policy_path).is_file()
+            )
+            self.assertEqual(
+                train_td3_agent.exact_training_checkpoint_errors(policy_path),
+                [],
+            )
+            self.assertTrue(record["episode_restart_required"])
+
+            restored_budget = train_td3_agent.ProbeBudgetController(20_000, 5_000)
+            restored_model = FakeModel()
+            restored_environment = FakeEnvironment()
+            restored_exploration = FakeExploration()
+            restored_record = train_td3_agent.restore_exact_training_checkpoint(
+                restored_model,
+                restored_environment,
+                restored_exploration,
+                restored_budget,
+                policy_path,
+            )
+
+        self.assertEqual(restored_record["reason"], "unit_test")
+        self.assertEqual(restored_model.restored["safe_actor"]["candidate_id"], 7)
+        self.assertEqual(restored_budget.training_steps, 4)
+        self.assertEqual(
+            restored_environment.restored["sector_milestone_history"],
+            [{"milestone_m": 1450.0}],
+        )
+        self.assertEqual(restored_exploration.restored["probe_episodes_completed"], 2)
+
     def test_probe_evidence_requires_repeatable_recent_progress(self):
         self.assertTrue(
             train_td3_agent.training_progress_is_credible(
@@ -2750,6 +3010,52 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
         self.assertEqual(env.action_space.shape, (3,))
         self.assertTrue(env.use_legacy_action_contract)
+
+    def test_concrete_environment_and_exploration_serializers_own_their_fields(self):
+        fake_gym = types.SimpleNamespace(Env=object)
+        with mock.patch.object(
+            train_td3_agent,
+            "make_torcs_runner",
+            return_value=types.SimpleNamespace(),
+        ):
+            Env = train_td3_agent.make_training_env_class(
+                fake_gym,
+                _FakeSpaces,
+            )
+            env = Env(
+                initial_stage_id="sector_progression",
+                use_custom_warmup_action_space=False,
+            )
+
+        environment_state = env.training_state_dict()
+        self.assertEqual(environment_state["stage_id"], "sector_progression")
+        self.assertIn("stage_success_windows", environment_state)
+        self.assertNotIn("initial_sigma", environment_state)
+
+        class FakeBaseCallback:
+            def __init__(self, verbose=0):
+                self.locals = {}
+
+        callback_class = (
+            train_td3_agent.make_exploration_schedule_callback_class(
+                FakeBaseCallback
+            )
+        )
+        callback = callback_class(
+            types.SimpleNamespace(set_policy_mode=lambda **_kwargs: None),
+            lambda sigma: sigma,
+            learning_starts=20_000,
+            initial_sigma=0.02,
+            final_sigma=0.006,
+            decay_steps=100_000,
+            probe_interval=10,
+            training_gradient_steps=1,
+        )
+
+        exploration_state = callback.training_state_dict()
+        self.assertEqual(exploration_state["initial_sigma"], 0.02)
+        self.assertEqual(exploration_state["learning_starts"], 20_000)
+        self.assertNotIn("stage_success_windows", exploration_state)
 
 
 class _FakeBox:

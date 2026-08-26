@@ -7,8 +7,10 @@ import csv
 import io
 import json
 import math
+import os
 import random
 import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -40,6 +42,8 @@ from agents.td3_agent import (  # noqa: E402
     AGENT6_ROBUSTNESS_STEERING_NOISE_STD,
     AGENT6_TRAINING_CHALLENGE_BASE_SEED,
     DEFAULT_BEST_EVALUATION_MODEL_PATH,
+    DEFAULT_BEST_COMPLETED_LAP_MODEL_PATH,
+    DEFAULT_BEST_ROBUST_EVALUATION_MODEL_PATH,
     DEFAULT_BEST_DISTANCE_MODEL_PATH,
     DEFAULT_BEST_REWARD_MODEL_PATH,
     DEFAULT_MODEL_PATH,
@@ -74,6 +78,11 @@ from agents.td3_agent import (  # noqa: E402
     shift_gears,
     track_sensors,
 )
+from agents.td3_checkpointing import (  # noqa: E402
+    atomic_save_policy,
+    atomic_write_json,
+    promote_best_completed_lap,
+)
 from runner.lap_tracker import LapTracker, practice_finish_is_plausible  # noqa: E402
 
 
@@ -82,6 +91,15 @@ DEFAULT_RUNS_DIR = PROJECT_ROOT / "models" / "training_runs" / "agent6_td3_scrat
 DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "models" / "checkpoints" / "agent6_td3_scratch"
 DEFAULT_TENSORBOARD_DIR = PROJECT_ROOT / "models" / "tensorboard" / "agent6_td3_scratch"
 DEFAULT_REPLAY_BUFFER_PATH = PROJECT_ROOT / "models" / "replay_buffers" / "agent6_td3_scratch.pkl"
+DEFAULT_LAP_CHECKPOINT_DIR = (
+    PROJECT_ROOT / "models" / "checkpoints" / "agent6_td3_laps"
+)
+DEFAULT_AUTOMATIC_EVALUATION_OUTPUT_DIR = (
+    PROJECT_ROOT / "data" / "evaluation" / "agent6_td3"
+)
+DEFAULT_EMERGENCY_CHECKPOINT_PATH = (
+    DEFAULT_CHECKPOINT_DIR / "agent6_td3_emergency.zip"
+)
 DEFAULT_CHECKPOINT_FREQ = 25_000
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 1.0
 ACTION_NOISE_UPDATE_INTERVAL_STEPS = 1_000
@@ -121,7 +139,8 @@ SAFE_ACTOR_ROBUSTNESS_PROTOCOL = (
     "agent6_progress_aware_working_policy_internal_probe_v10"
 )
 
-REWARD_VERSION = "agent6_td3_reward_v2_clear_track_anti_stall"
+REWARD_VERSION = "agent6_td3_reward_v3_sector_milestones"
+EXACT_TRAINING_STATE_VERSION = "agent6_td3_exact_training_state_v1"
 OFF_TRACK_GRACE_STEPS = 4
 HARD_TRACK_BOUNDARY = 1.18
 SOFT_TRACK_BOUNDARY = 1.04
@@ -135,6 +154,12 @@ DEFAULT_STAGE_SUCCESS_REQUIREMENTS = {
     "sector_progression": 1,
     "full_lap": 1,
 }
+SECTOR_PROGRESS_MILESTONE_REWARDS = {
+    1450.0: 120.0,
+    1550.0: 160.0,
+    1750.0: 220.0,
+}
+SECTOR_PROGRESS_MILESTONES_M = tuple(SECTOR_PROGRESS_MILESTONE_REWARDS)
 
 
 @dataclass(frozen=True)
@@ -203,7 +228,12 @@ CURRICULUM: tuple[CurriculumStage, ...] = (
 )
 CURRICULUM_STAGE_IDS = tuple(stage.stage_id for stage in CURRICULUM)
 SAFE_ACTOR_PROGRESS_MILESTONES_M = tuple(
-    sorted({stage.distance_target_m for stage in CURRICULUM})
+    sorted(
+        {
+            *(stage.distance_target_m for stage in CURRICULUM),
+            *SECTOR_PROGRESS_MILESTONES_M,
+        }
+    )
 )
 
 EPISODE_COLUMNS = [
@@ -266,6 +296,7 @@ EPISODE_COLUMNS = [
     "reward",
     "distance_m",
     "furthest_distance_m",
+    "sector_milestones_reached_m",
     "duration_seconds",
     "average_speed_kmh",
     "max_speed_kmh",
@@ -314,6 +345,7 @@ STEP_COLUMNS = [
     "reward_progress",
     "reward_aligned_speed",
     "reward_new_distance",
+    "reward_sector_milestone_bonus",
     "reward_stable_progress_bonus",
     "reward_survival_cost",
     "reward_lateral_position_penalty",
@@ -380,11 +412,7 @@ def make_torcs_runner():
 
 
 def write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(path, payload)
 
 
 def make_default_run_dir() -> Path:
@@ -403,6 +431,26 @@ def replay_buffer_path_for_policy(policy_path: Path) -> Path:
     return Path(policy_path).with_suffix(".replay_buffer.pkl")
 
 
+def training_state_path_for_policy(policy_path: Path) -> Path:
+    return Path(policy_path).with_suffix(".training_state.pt")
+
+
+def sector_milestones_crossed(
+    previous_furthest_distance_m: float,
+    furthest_distance_m: float,
+    awarded_milestones_m: set[float] | tuple[float, ...] = (),
+) -> tuple[float, ...]:
+    """Return newly crossed sector gates in deterministic distance order."""
+    previous = max(0.0, finite_float(previous_furthest_distance_m))
+    current = max(previous, finite_float(furthest_distance_m))
+    awarded = {float(value) for value in awarded_milestones_m}
+    return tuple(
+        milestone
+        for milestone in SECTOR_PROGRESS_MILESTONES_M
+        if milestone not in awarded and previous < milestone <= current
+    )
+
+
 def save_replay_buffer_atomically(model: Any, path: Path) -> str | None:
     target = Path(path)
     temporary = target.with_name(f"{target.name}.tmp")
@@ -417,6 +465,198 @@ def save_replay_buffer_atomically(model: Any, path: Path) -> str | None:
             temporary.unlink()
         return f"{type(exc).__name__}: {exc}"
     return None
+
+
+def save_torch_payload_atomically(payload: Mapping[str, Any], path: Path) -> None:
+    import torch
+
+    target = Path(path)
+    temporary = target.with_name(f"{target.name}.tmp")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        temporary.unlink()
+    try:
+        torch.save(dict(payload), temporary)
+        with temporary.open("r+b") as file:
+            file.flush()
+            os.fsync(file.fileno())
+        temporary.replace(target)
+    finally:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+
+
+def load_exact_training_state(policy_path: Path, *, device: Any = "cpu") -> dict[str, Any]:
+    import torch
+
+    state_path = training_state_path_for_policy(policy_path)
+    if not state_path.is_file():
+        raise FileNotFoundError(f"exact training state does not exist: {state_path}")
+    try:
+        payload = torch.load(state_path, map_location=device, weights_only=False)
+    except TypeError:
+        payload = torch.load(state_path, map_location=device)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"invalid exact training state payload: {state_path}")
+    if payload.get("version") != EXACT_TRAINING_STATE_VERSION:
+        raise RuntimeError(
+            "exact training state version mismatch: expected "
+            f"{EXACT_TRAINING_STATE_VERSION}, found {payload.get('version')}"
+        )
+    return payload
+
+
+def capture_rng_state() -> dict[str, Any]:
+    import torch
+
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+        ),
+    }
+
+
+def restore_rng_state(state: Mapping[str, Any]) -> None:
+    import torch
+
+    if state.get("python") is not None:
+        random.setstate(state["python"])
+    if state.get("numpy") is not None:
+        np.random.set_state(state["numpy"])
+    if state.get("torch_cpu") is not None:
+        torch.set_rng_state(state["torch_cpu"].cpu())
+    cuda_states = state.get("torch_cuda")
+    if torch.cuda.is_available() and isinstance(cuda_states, (list, tuple)):
+        torch.cuda.set_rng_state_all([value.cpu() for value in cuda_states])
+
+
+def save_exact_training_checkpoint(
+    model: Any,
+    raw_env: Any,
+    exploration_callback: Any,
+    training_budget_state: "TrainingBudgetState",
+    policy_path: Path,
+    metadata: Mapping[str, Any],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    target = Path(policy_path)
+    replay_path = replay_buffer_path_for_policy(target)
+    state_path = training_state_path_for_policy(target)
+    save_runtime = getattr(model, "save_runtime_policy", None)
+    save_policy = save_runtime if callable(save_runtime) else model.save
+    atomic_save_policy(lambda path: save_policy(str(path)), target)
+    replay_error = save_replay_buffer_atomically(model, replay_path)
+    if replay_error is not None:
+        raise RuntimeError(f"failed to save exact-resume replay: {replay_error}")
+    checkpoint_record = {
+        "version": EXACT_TRAINING_STATE_VERSION,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "reason": str(reason),
+        "policy_path": str(target),
+        "replay_buffer_path": str(replay_path),
+        "training_state_path": str(state_path),
+        "episode_restart_required": bool(
+            getattr(raw_env, "current_telemetry", None) is not None
+            and int(getattr(raw_env, "steps", 0)) > 0
+        ),
+        "training_budget": training_budget_state.as_dict(),
+        "curriculum_stage": raw_env.current_stage.stage_id,
+        "sector_milestone_history": copy.deepcopy(
+            raw_env.sector_milestone_history
+        ),
+    }
+    payload = {
+        "version": EXACT_TRAINING_STATE_VERSION,
+        "checkpoint": checkpoint_record,
+        "model": model.exact_training_state_dict(),
+        "environment": raw_env.training_state_dict(),
+        "exploration_callback": exploration_callback.training_state_dict(),
+        "training_budget": training_budget_state.as_dict(),
+        "rng": capture_rng_state(),
+    }
+    save_torch_payload_atomically(payload, state_path)
+    checkpoint_metadata = copy.deepcopy(dict(metadata))
+    checkpoint_metadata["exact_resume_checkpoint"] = checkpoint_record
+    checkpoint_metadata["timestep_budget"]["run_state"] = (
+        training_budget_state.as_dict()
+    )
+    checkpoint_metadata["milestone_history"] = copy.deepcopy(
+        raw_env.sector_milestone_history
+    )
+    atomic_write_json(metadata_path_for_policy(target), checkpoint_metadata)
+    return checkpoint_record
+
+
+def restore_exact_training_checkpoint(
+    model: Any,
+    raw_env: Any,
+    exploration_callback: Any,
+    training_budget_state: "TrainingBudgetState",
+    policy_path: Path,
+) -> dict[str, Any]:
+    state = load_exact_training_state(
+        policy_path,
+        device=getattr(model, "device", "cpu"),
+    )
+    model.load_replay_buffer(str(replay_buffer_path_for_policy(policy_path)))
+    model.restore_exact_training_state(state["model"])
+    raw_env.restore_training_state(state["environment"])
+    training_budget_state.restore(state["training_budget"])
+    exploration_callback.restore_training_state(
+        state["exploration_callback"]
+    )
+    rng_state = state.get("rng")
+    if isinstance(rng_state, Mapping):
+        restore_rng_state(rng_state)
+    checkpoint = state.get("checkpoint")
+    return dict(checkpoint) if isinstance(checkpoint, Mapping) else {}
+
+
+def exact_training_checkpoint_errors(policy_path: Path) -> list[str]:
+    path = Path(policy_path)
+    errors: list[str] = []
+    if not path.is_file():
+        errors.append(f"exact-resume policy does not exist: {path}")
+    state_path = training_state_path_for_policy(path)
+    if not state_path.is_file():
+        errors.append(f"exact-resume state does not exist: {state_path}")
+    replay_path = replay_buffer_path_for_policy(path)
+    if not replay_path.is_file():
+        errors.append(f"exact-resume replay buffer does not exist: {replay_path}")
+    metadata = read_policy_metadata(path)
+    checkpoint = metadata.get("exact_resume_checkpoint")
+    if not isinstance(checkpoint, Mapping):
+        errors.append("exact-resume metadata is missing exact_resume_checkpoint")
+    elif checkpoint.get("version") != EXACT_TRAINING_STATE_VERSION:
+        errors.append("exact-resume metadata uses an unsupported state version")
+    errors.extend(
+        f"exact-resume checkpoint contract mismatch: {key}"
+        for key in policy_contract_mismatches(
+            metadata,
+            allow_legacy_action_contract=True,
+        )
+    )
+    return errors
+
+
+def continuation_source_path(args: argparse.Namespace) -> Path | None:
+    return getattr(args, "resume_exact_from", None) or getattr(
+        args,
+        "resume_from",
+        None,
+    )
+
+
+def continuation_training_protocol_enabled(args: argparse.Namespace) -> bool:
+    if not bool(getattr(args, "continuation", False)):
+        return False
+    if not bool(getattr(args, "exact_resume", False)):
+        return True
+    return bool(getattr(args, "exact_source_was_continuation", True))
 
 
 def continuation_source_errors(
@@ -482,7 +722,7 @@ def continuation_source_uses_legacy_action_contract(
     if not bool(getattr(args, "continuation", False)):
         return False
     return policy_uses_legacy_action_contract(
-        read_policy_metadata(getattr(args, "resume_from", None))
+        read_policy_metadata(continuation_source_path(args))
     )
 
 
@@ -503,18 +743,22 @@ def training_action_size(args: argparse.Namespace) -> int:
 
 
 def policy_action_start_timestep(args: argparse.Namespace) -> int:
-    return 0 if args.continuation else max(0, int(args.learning_starts))
+    return (
+        0
+        if continuation_training_protocol_enabled(args)
+        else max(0, int(args.learning_starts))
+    )
 
 
 def gradient_update_start_timestep(args: argparse.Namespace) -> int:
-    if args.continuation:
+    if continuation_training_protocol_enabled(args):
         return max(0, int(args.replay_refill_steps))
     return max(0, int(args.learning_starts))
 
 
 def actor_update_start_timestep(args: argparse.Namespace) -> int:
     gradient_start = gradient_update_start_timestep(args)
-    if not args.continuation:
+    if not continuation_training_protocol_enabled(args):
         return gradient_start
     return gradient_start + max(0, int(args.critic_warmup_steps))
 
@@ -1001,6 +1245,7 @@ def calculate_td3_reward_components(
     stage: CurriculumStage | None = None,
     episode_distance_m: float = 0.0,
     previous_furthest_distance_m: float = 0.0,
+    newly_achieved_sector_milestones_m: tuple[float, ...] = (),
     completed_lap: float | None = None,
     stage_success: bool = False,
     stuck: bool = False,
@@ -1029,6 +1274,10 @@ def calculate_td3_reward_components(
         "progress": clamp(progress, -2.0, 10.0) * stage.progress_weight,
         "aligned_speed": clamp(aligned_speed / 190.0, 0.0, 1.0) * 0.55,
         "new_distance": clamp(new_distance, 0.0, 12.0) * stage.milestone_weight,
+        "sector_milestone_bonus": sum(
+            SECTOR_PROGRESS_MILESTONE_REWARDS.get(float(milestone), 0.0)
+            for milestone in newly_achieved_sector_milestones_m
+        ),
         "stable_progress_bonus": 0.0,
         "survival_cost": -0.015,
         "lateral_position_penalty": 0.0,
@@ -1168,6 +1417,7 @@ def calculate_td3_reward(
     stage: CurriculumStage | None = None,
     episode_distance_m: float = 0.0,
     previous_furthest_distance_m: float = 0.0,
+    newly_achieved_sector_milestones_m: tuple[float, ...] = (),
     completed_lap: float | None = None,
     stage_success: bool = False,
     stuck: bool = False,
@@ -1181,6 +1431,9 @@ def calculate_td3_reward(
         stage=stage,
         episode_distance_m=episode_distance_m,
         previous_furthest_distance_m=previous_furthest_distance_m,
+        newly_achieved_sector_milestones_m=(
+            newly_achieved_sector_milestones_m
+        ),
         completed_lap=completed_lap,
         stage_success=stage_success,
         stuck=stuck,
@@ -1189,7 +1442,8 @@ def calculate_td3_reward(
 
 
 def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
-    source_metadata = read_policy_metadata(args.resume_from)
+    source_path = continuation_source_path(args)
+    source_metadata = read_policy_metadata(source_path)
     source_evaluation = source_metadata.get("best_evaluation")
     source_uses_legacy_action_contract = policy_uses_legacy_action_contract(
         source_metadata
@@ -1264,6 +1518,10 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "version": REWARD_VERSION,
             "low_speed_creep_bonus": False,
             "clear_track_anti_stall_penalty": True,
+            "sector_milestones_rewarded_once_per_episode": {
+                str(int(distance)): reward
+                for distance, reward in SECTOR_PROGRESS_MILESTONE_REWARDS.items()
+            },
             "logged_components": [
                 column.removeprefix("reward_")
                 for column in STEP_COLUMNS
@@ -1288,12 +1546,19 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "best_checkpoint_scope": "deterministic_policy_probe_episodes_only",
         "best_checkpoint_saves_replay_buffer": args.save_best_replay_buffer,
         "curriculum": [stage.__dict__ for stage in CURRICULUM],
+        "sector_progression_milestones_m": list(
+            SECTOR_PROGRESS_MILESTONES_M
+        ),
         "curriculum_start_stage": args.start_stage,
         "continuation": {
             "enabled": args.continuation,
-            "source_policy_path": (
-                str(args.resume_from) if args.resume_from is not None else None
+            "training_protocol_enabled": (
+                continuation_training_protocol_enabled(args)
             ),
+            "source_policy_path": (
+                str(source_path) if source_path is not None else None
+            ),
+            "exact_resume": bool(args.resume_exact_from),
             "source_observation_version": source_metadata.get("observation_version"),
             "source_action_version": source_metadata.get("action_version"),
             "source_action_shape": source_metadata.get("action_shape"),
@@ -1336,7 +1601,9 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
                     else "verified_champion_only"
                 )
             ),
-            "fresh_replay_buffer": args.continuation,
+            "fresh_replay_buffer": bool(
+                args.continuation and not args.resume_exact_from
+            ),
             "replay_refill_steps": args.replay_refill_steps,
             "replay_refill_uses_loaded_policy": args.continuation,
             "replay_refill_freezes_gradient_updates": args.continuation,
@@ -1354,13 +1621,19 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "racing_line_imitation": False,
             "robust_champion": {
                 "role": "immutable_source_policy",
-                "path": str(args.resume_from) if args.continuation else None,
+                "path": str(source_path) if args.continuation else None,
                 "may_be_replaced_by_internal_probe": False,
             },
             "working_policy": {
                 "role": "last_locally_accepted_continuation_actor",
                 "path": str(args.model_path),
                 "may_accept_bounded_temporary_regressions": True,
+            },
+            "qualified_candidate_validation": {
+                "automatic": True,
+                "completed_lap_freezes_actor_immediately": True,
+                "uses_rotating_internal_training_seeds": True,
+                "uses_external_evaluation_seeds": False,
             },
             "constraint": "action_space_trust_region_to_working_policy",
             "max_normalized_action_delta": args.safe_actor_max_action_delta,
@@ -1510,6 +1783,26 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "model_path": str(args.model_path),
         "best_distance_model_path": str(args.best_distance_model_path),
         "best_reward_model_path": str(args.best_reward_model_path),
+        "best_robust_evaluation_model_path": str(
+            args.best_robust_evaluation_model_path
+        ),
+        "best_completed_lap_model_path": str(
+            args.best_completed_lap_model_path
+        ),
+        "lap_checkpoint_dir": str(args.lap_checkpoint_dir),
+        "automatic_evaluation": {
+            "enabled": bool(args.end_of_run_evaluation),
+            "timing": "after_training_and_after_training_torcs_shutdown",
+            "external_evaluation_during_candidate_blocks": False,
+            "output_dir": str(args.automatic_evaluation_output_dir),
+            "robust_champion_path": str(
+                args.best_robust_evaluation_model_path
+            ),
+            "completed_lap_champion_path": str(
+                args.best_completed_lap_model_path
+            ),
+            "promotion": "atomic_model_and_metadata_staging",
+        },
         "checkpoint_dir": str(args.checkpoint_dir),
         "replay_buffer_path": str(args.replay_buffer_path),
         "monitor_path": str(args.run_dir / "monitor.csv") if args.run_dir else None,
@@ -1736,6 +2029,8 @@ def make_training_env_class(gym: Any, spaces: Any):
             self.episode_max_speed = 0.0
             self.episode_off_track_steps = 0
             self.episode_furthest_distance = 0.0
+            self.episode_sector_milestones_awarded_m: set[float] = set()
+            self.sector_milestone_history: list[dict[str, Any]] = []
             self.stopped_seconds = 0.0
             self.episode_max_stopped_seconds = 0.0
             self.consecutive_off_track_steps = 0
@@ -1746,6 +2041,86 @@ def make_training_env_class(gym: Any, spaces: Any):
         @property
         def current_stage(self) -> CurriculumStage:
             return CURRICULUM[self.stage_index]
+
+        def training_state_dict(self) -> dict[str, Any]:
+            return {
+                "stage_id": self.current_stage.stage_id,
+                "stage_success_streak": self.stage_success_streak,
+                "stage_success_totals": dict(self.stage_success_totals),
+                "stage_success_windows": copy.deepcopy(
+                    self.stage_success_windows
+                ),
+                "episodes_started": self.episodes_started,
+                "total_steps": self.total_steps,
+                "learning_starts": self.learning_starts,
+                "pre_update_training_phase": self.pre_update_training_phase,
+                "safe_actor_screening_max_episode_steps": (
+                    self.safe_actor_screening_max_episode_steps
+                ),
+                "sector_milestone_history": copy.deepcopy(
+                    self.sector_milestone_history
+                ),
+            }
+
+        def restore_training_state(self, state: Mapping[str, Any]) -> None:
+            stage_id = str(state.get("stage_id") or self.current_stage.stage_id)
+            self.stage_index = curriculum_stage_index(stage_id)
+            self.stage_success_streak = max(
+                0,
+                int(finite_float(state.get("stage_success_streak"))),
+            )
+            totals = state.get("stage_success_totals")
+            if isinstance(totals, Mapping):
+                self.stage_success_totals = {
+                    stage.stage_id: max(
+                        0,
+                        int(finite_float(totals.get(stage.stage_id))),
+                    )
+                    for stage in CURRICULUM
+                }
+            windows = state.get("stage_success_windows")
+            if isinstance(windows, Mapping):
+                self.stage_success_windows = {
+                    stage.stage_id: [
+                        bool(value)
+                        for value in list(windows.get(stage.stage_id, []))[
+                            -DEFAULT_STAGE_SUCCESS_WINDOW_SIZE:
+                        ]
+                    ]
+                    for stage in CURRICULUM
+                }
+            self.episodes_started = max(
+                0,
+                int(finite_float(state.get("episodes_started"))),
+            )
+            self.total_steps = max(
+                0,
+                int(finite_float(state.get("total_steps"))),
+            )
+            self.learning_starts = max(
+                0,
+                int(finite_float(state.get("learning_starts"), self.learning_starts)),
+            )
+            self.pre_update_training_phase = str(
+                state.get("pre_update_training_phase")
+                or self.pre_update_training_phase
+            )
+            self.safe_actor_screening_max_episode_steps = max(
+                1,
+                int(
+                    finite_float(
+                        state.get("safe_actor_screening_max_episode_steps"),
+                        self.safe_actor_screening_max_episode_steps,
+                    )
+                ),
+            )
+            history = state.get("sector_milestone_history")
+            self.sector_milestone_history = (
+                [dict(item) for item in history if isinstance(item, Mapping)]
+                if isinstance(history, (list, tuple))
+                else []
+            )
+            self.episode_sector_milestones_awarded_m = set()
 
         def set_policy_mode(
             self,
@@ -1886,6 +2261,7 @@ def make_training_env_class(gym: Any, spaces: Any):
             self.episode_max_speed = finite_float(self.current_telemetry.get("speedX"))
             self.episode_off_track_steps = 0
             self.episode_furthest_distance = 0.0
+            self.episode_sector_milestones_awarded_m = set()
             self.stopped_seconds = 0.0
             self.episode_max_stopped_seconds = 0.0
             self.consecutive_off_track_steps = 0
@@ -1927,6 +2303,25 @@ def make_training_env_class(gym: Any, spaces: Any):
                 self.episode_furthest_distance,
                 episode_distance_m,
             )
+            new_sector_milestones = sector_milestones_crossed(
+                previous_furthest,
+                self.episode_furthest_distance,
+                self.episode_sector_milestones_awarded_m,
+            )
+            if new_sector_milestones:
+                self.episode_sector_milestones_awarded_m.update(
+                    new_sector_milestones
+                )
+                for milestone in new_sector_milestones:
+                    self.sector_milestone_history.append(
+                        {
+                            "milestone_m": milestone,
+                            "episode": self.episodes_started,
+                            "global_step": self.total_steps + 1,
+                            "stage_id": self.current_stage.stage_id,
+                            "deterministic_probe": self.deterministic_probe,
+                        }
+                    )
             completed_lap = self.lap_tracker.update(telemetry)
             if (
                 completed_lap is None
@@ -1982,6 +2377,7 @@ def make_training_env_class(gym: Any, spaces: Any):
                 stage=self.current_stage,
                 episode_distance_m=episode_distance_m,
                 previous_furthest_distance_m=previous_furthest,
+                newly_achieved_sector_milestones_m=new_sector_milestones,
                 completed_lap=completed_lap,
                 stage_success=stage_success,
                 stuck=stuck,
@@ -2135,6 +2531,9 @@ def make_training_env_class(gym: Any, spaces: Any):
                 "stage_name": self.current_stage.name,
                 "distance_m": self.episode_furthest_distance,
                 "furthest_distance_m": self.episode_furthest_distance,
+                "sector_milestones_reached_m": sorted(
+                    self.episode_sector_milestones_awarded_m
+                ),
                 "lap_completion_fraction": calculate_lap_completion_fraction(
                     self.episode_furthest_distance
                 ),
@@ -2243,6 +2642,9 @@ def make_training_env_class(gym: Any, spaces: Any):
                 "reward": self.episode_reward,
                 "distance_m": distance_m,
                 "furthest_distance_m": distance_m,
+                "sector_milestones_reached_m": sorted(
+                    self.episode_sector_milestones_awarded_m
+                ),
                 "duration_seconds": duration_seconds,
                 "average_speed_kmh": average_speed_kmh,
                 "max_speed_kmh": self.episode_max_speed,
@@ -2418,6 +2820,7 @@ def make_training_env_class(gym: Any, spaces: Any):
                     reward_components.get("progress", 0.0),
                     reward_components.get("aligned_speed", 0.0),
                     reward_components.get("new_distance", 0.0),
+                    reward_components.get("sector_milestone_bonus", 0.0),
                     reward_components.get("stable_progress_bonus", 0.0),
                     reward_components.get("survival_cost", 0.0),
                     reward_components.get("lateral_position_penalty", 0.0),
@@ -2569,6 +2972,34 @@ class ProbeBudgetController:
     def should_stop(self) -> bool:
         return self.stop_reason is not None
 
+    def restore(self, state: Mapping[str, Any]) -> None:
+        saved_target = max(
+            1,
+            int(finite_float(state.get("target_training_steps"), 1.0)),
+        )
+        if saved_target != self.target_training_steps:
+            raise ValueError(
+                "exact-resume training target mismatch: expected "
+                f"{self.target_training_steps}, found {saved_target}"
+            )
+        self.training_steps = max(
+            0,
+            int(finite_float(state.get("training_steps"))),
+        )
+        self.probe_steps = max(
+            0,
+            int(finite_float(state.get("probe_steps"))),
+        )
+        self.environment_steps = max(
+            self.training_steps + self.probe_steps,
+            int(finite_float(state.get("environment_steps"))),
+        )
+        self.deferred_probe_requests = max(
+            0,
+            int(finite_float(state.get("deferred_probe_requests"))),
+        )
+        self._update_stop_reason()
+
     def as_dict(self) -> dict[str, Any]:
         total = max(1, self.environment_steps)
         return {
@@ -2629,7 +3060,7 @@ def training_progress_is_credible(
 def continuation_compatibility_minimum_distance_m(
     args: argparse.Namespace,
 ) -> float:
-    metadata = read_policy_metadata(args.resume_from)
+    metadata = read_policy_metadata(continuation_source_path(args))
     evaluation = metadata.get("best_evaluation")
     source_median = (
         finite_float(evaluation.get("median_progress_m"))
@@ -2905,9 +3336,107 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             self.policy_episodes_since_probe = 0
             self.current_episode_is_probe = False
             self.last_noise_update_timestep = -ACTION_NOISE_UPDATE_INTERVAL_STEPS
+            self._restored_state = False
 
         def _on_training_start(self):
-            self._apply_policy_mode(deterministic_probe=False, force=True)
+            self._apply_policy_mode(
+                deterministic_probe=(
+                    self.current_episode_is_probe if self._restored_state else False
+                ),
+                force=True,
+            )
+            self._restored_state = False
+
+        def training_state_dict(self) -> dict[str, Any]:
+            return {
+                "learning_starts": self.learning_starts,
+                "initial_sigma": self.initial_sigma,
+                "final_sigma": self.final_sigma,
+                "decay_steps": self.decay_steps,
+                "probe_interval": self.probe_interval,
+                "training_gradient_steps": self.training_gradient_steps,
+                "pre_update_training_phase": self.pre_update_training_phase,
+                "actor_update_start": self.actor_update_start,
+                "actor_full_unfreeze": self.actor_full_unfreeze,
+                "safe_probe_noise_std": self.safe_probe_noise_std,
+                "probe_evidence_window": self.probe_evidence_window,
+                "probe_min_evidence_episodes": self.probe_min_evidence_episodes,
+                "probe_evidence_max_regression_m": (
+                    self.probe_evidence_max_regression_m
+                ),
+                "probe_reference_distance_m": self.probe_reference_distance_m,
+                "recent_training_distances_m": list(
+                    self.recent_training_distances_m
+                ),
+                "recent_training_completed_lap": (
+                    self.recent_training_completed_lap
+                ),
+                "probe_episodes_completed": self.probe_episodes_completed,
+                "policy_episodes_since_probe": self.policy_episodes_since_probe,
+                "current_episode_is_probe": self.current_episode_is_probe,
+                "last_noise_update_timestep": self.last_noise_update_timestep,
+            }
+
+        def restore_training_state(self, state: Mapping[str, Any]) -> None:
+            integer_fields = (
+                "learning_starts",
+                "decay_steps",
+                "probe_interval",
+                "training_gradient_steps",
+                "actor_update_start",
+                "actor_full_unfreeze",
+                "probe_evidence_window",
+                "probe_min_evidence_episodes",
+            )
+            for name in integer_fields:
+                if state.get(name) is not None:
+                    setattr(self, name, int(finite_float(state[name])))
+            float_fields = (
+                "initial_sigma",
+                "final_sigma",
+                "safe_probe_noise_std",
+                "probe_evidence_max_regression_m",
+            )
+            for name in float_fields:
+                if state.get(name) is not None:
+                    setattr(self, name, finite_float(state[name]))
+            if state.get("pre_update_training_phase") is not None:
+                self.pre_update_training_phase = str(
+                    state["pre_update_training_phase"]
+                )
+            self.probe_reference_distance_m = max(
+                0.0,
+                finite_float(state.get("probe_reference_distance_m")),
+            )
+            distances = state.get("recent_training_distances_m")
+            self.recent_training_distances_m = (
+                [max(0.0, finite_float(value)) for value in distances][
+                    -self.probe_evidence_window:
+                ]
+                if isinstance(distances, (list, tuple))
+                else []
+            )
+            self.recent_training_completed_lap = bool(
+                state.get("recent_training_completed_lap")
+            )
+            self.probe_episodes_completed = max(
+                0,
+                int(finite_float(state.get("probe_episodes_completed"))),
+            )
+            self.policy_episodes_since_probe = max(
+                0,
+                int(finite_float(state.get("policy_episodes_since_probe"))),
+            )
+            self.current_episode_is_probe = bool(
+                state.get("current_episode_is_probe")
+            )
+            self.last_noise_update_timestep = int(
+                finite_float(
+                    state.get("last_noise_update_timestep"),
+                    -ACTION_NOISE_UPDATE_INTERVAL_STEPS,
+                )
+            )
+            self._restored_state = True
 
         def _on_step(self):
             completed_episode = False
@@ -3392,6 +3921,144 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
     return ExplorationScheduleCallback
 
 
+def policy_lap_is_valid(summary: Mapping[str, Any]) -> bool:
+    if not bool(summary.get("policy_controlled")):
+        return False
+    laps_completed = int(finite_float(summary.get("laps_completed")))
+    lap_time = finite_float(
+        summary.get("best_lap_time_seconds"),
+        default=float("nan"),
+    )
+    distance_m = max(
+        finite_float(summary.get("distance_m")),
+        finite_float(summary.get("furthest_distance_m")),
+    )
+    return bool(
+        laps_completed > 0
+        and math.isfinite(lap_time)
+        and lap_time > 0.0
+        and distance_m >= G_TRACK_3_LENGTH_METRES * 0.90
+    )
+
+
+def lap_checkpoint_record(
+    summary: Mapping[str, Any],
+    *,
+    source_policy_path: Path,
+    global_timestep: int,
+    track: str = DEFAULT_TRACK_NAME,
+) -> dict[str, Any]:
+    laps_completed = max(
+        1,
+        int(finite_float(summary.get("laps_completed"))),
+    )
+    return {
+        "source": "training_valid_lap",
+        "source_policy_path": str(source_policy_path),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "global_timestep": max(0, int(global_timestep)),
+        "track": str(track),
+        "deterministic": bool(summary.get("deterministic_probe")),
+        "completed_laps": laps_completed,
+        "validation_trials": 1,
+        "reliability": 1.0,
+        "best_lap_seconds": finite_float(
+            summary.get("best_lap_time_seconds")
+        ),
+        "distance_m": max(
+            finite_float(summary.get("distance_m")),
+            finite_float(summary.get("furthest_distance_m")),
+        ),
+        "policy_role": (
+            "candidate"
+            if summary.get("safe_actor_probe_mode") == "candidate"
+            else "working_policy"
+        ),
+        "episode_summary": dict(summary),
+    }
+
+
+def make_lap_checkpoint_callback_class(BaseCallback: Any):
+    class LapCheckpointCallback(BaseCallback):
+        def __init__(
+            self,
+            lap_checkpoint_dir: Path,
+            best_completed_lap_model_path: Path,
+            metadata: Mapping[str, Any],
+        ) -> None:
+            super().__init__(verbose=0)
+            self.lap_checkpoint_dir = Path(lap_checkpoint_dir)
+            self.best_completed_lap_model_path = Path(
+                best_completed_lap_model_path
+            )
+            self.metadata = dict(metadata)
+            self.saved_laps = 0
+
+        def _on_step(self):
+            for info in self.locals.get("infos", []):
+                summary = (
+                    info.get("episode_summary")
+                    if isinstance(info, Mapping)
+                    else None
+                )
+                if not isinstance(summary, Mapping) or not policy_lap_is_valid(
+                    summary
+                ):
+                    continue
+                self._archive_lap(summary)
+            return True
+
+        def _archive_lap(self, summary: Mapping[str, Any]) -> None:
+            self.saved_laps += 1
+            timestamp = datetime.now(timezone.utc).strftime(
+                "%Y%m%d-%H%M%S-%f"
+            )
+            archive_path = self.lap_checkpoint_dir / (
+                f"agent6_td3_lap_{int(self.num_timesteps):09d}_{timestamp}.zip"
+            )
+            save_runtime = getattr(self.model, "save_runtime_policy", None)
+
+            def save_policy(path: Path) -> None:
+                if callable(save_runtime):
+                    save_runtime(path)
+                else:
+                    self.model.save(str(path))
+
+            atomic_save_policy(save_policy, archive_path)
+            lap_record = lap_checkpoint_record(
+                summary,
+                source_policy_path=archive_path,
+                global_timestep=self.num_timesteps,
+                track=str(self.metadata.get("track") or DEFAULT_TRACK_NAME),
+            )
+            archive_metadata = {
+                **self.metadata,
+                "checkpoint_type": "valid_completed_lap_archive",
+                "valid_completed_lap": lap_record,
+            }
+            write_json(
+                metadata_path_for_policy(archive_path),
+                archive_metadata,
+            )
+            promoted = promote_best_completed_lap(
+                archive_path,
+                self.best_completed_lap_model_path,
+                archive_metadata,
+                lap_record,
+            )
+            print(
+                "\nSaved valid Agent 6 lap checkpoint: "
+                f"{archive_path}"
+            )
+            if promoted:
+                print(
+                    "Promoted completed-lap champion: "
+                    f"{self.best_completed_lap_model_path}"
+                )
+
+    return LapCheckpointCallback
+
+
 def make_best_model_callback_class(BaseCallback: Any):
     class BestModelCallback(BaseCallback):
         def __init__(
@@ -3617,12 +4284,20 @@ def make_checkpoint_callback(
     *,
     BaseCallback: Any = None,
     training_budget_state: TrainingBudgetState | None = None,
+    checkpoint_saver: Callable[[Path, str], Any] | None = None,
 ):
     if training_budget_state is not None and BaseCallback is not None:
         class TrainingBudgetCheckpointCallback(BaseCallback):
             def __init__(self) -> None:
                 super().__init__(verbose=0)
                 self.next_checkpoint_step = int(args.checkpoint_freq)
+
+            def _on_training_start(self) -> None:
+                completed = training_budget_state.training_steps
+                frequency = int(args.checkpoint_freq)
+                self.next_checkpoint_step = (
+                    completed // frequency + 1
+                ) * frequency
 
             def _on_step(self):
                 training_steps = training_budget_state.training_steps
@@ -3632,8 +4307,14 @@ def make_checkpoint_callback(
                     Path(args.checkpoint_dir)
                     / f"agent6_td3_scratch_{training_steps}_steps"
                 )
-                self.model.save(str(checkpoint_stem))
-                if args.save_checkpoint_replay_buffer:
+                if checkpoint_saver is not None:
+                    checkpoint_saver(
+                        checkpoint_stem.with_suffix(".zip"),
+                        "periodic_checkpoint",
+                    )
+                else:
+                    self.model.save(str(checkpoint_stem))
+                if args.save_checkpoint_replay_buffer and checkpoint_saver is None:
                     self.model.save_replay_buffer(
                         str(
                             checkpoint_stem.with_name(
@@ -3744,6 +4425,66 @@ def make_phased_continuation_td3_class(TD3: Any):
                 self.actor.load_state_dict(runtime_actor)
                 self.actor_target.load_state_dict(runtime_actor_target)
                 self.actor.optimizer.load_state_dict(runtime_optimizer)
+
+        def save_runtime_policy(self, path: Any) -> None:
+            """Save the actor currently driving TORCS, including a live candidate."""
+            super().save(path)
+
+        def exact_training_state_dict(self) -> dict[str, Any]:
+            """Serialize the continuation state excluded from ordinary SB3 saves."""
+            state: dict[str, Any] = {}
+            for name, value in self.__dict__.items():
+                if not name.startswith("_agent6_safe_actor_"):
+                    continue
+                if name == "_agent6_safe_actor_reference" or callable(value):
+                    continue
+                state[name] = copy.deepcopy(value)
+            return {
+                "safe_actor": state,
+                "n_updates": int(getattr(self, "_n_updates", 0)),
+                "num_timesteps": int(getattr(self, "num_timesteps", 0)),
+                "phased_continuation_configured": hasattr(
+                    self,
+                    "_agent6_actor_learning_rate_schedule",
+                ),
+            }
+
+        def restore_exact_training_state(self, state: Mapping[str, Any]) -> None:
+            safe_actor = state.get("safe_actor")
+            if not isinstance(safe_actor, Mapping):
+                raise RuntimeError("exact-resume state is missing safe_actor data")
+            for name, value in safe_actor.items():
+                if str(name).startswith("_agent6_safe_actor_"):
+                    setattr(self, str(name), copy.deepcopy(value))
+            if getattr(self, "_agent6_safe_actor_enabled", False):
+                reference = copy.deepcopy(self.actor)
+                accepted_state = getattr(
+                    self,
+                    "_agent6_safe_actor_state",
+                    None,
+                )
+                if not isinstance(accepted_state, Mapping):
+                    raise RuntimeError(
+                        "exact-resume state is missing the accepted actor snapshot"
+                    )
+                reference.load_state_dict(accepted_state)
+                reference.set_training_mode(False)
+                for parameter in reference.parameters():
+                    parameter.requires_grad_(False)
+                self._agent6_safe_actor_reference = reference
+            self._n_updates = max(
+                0,
+                int(finite_float(state.get("n_updates"))),
+            )
+            self.num_timesteps = max(
+                0,
+                int(finite_float(state.get("num_timesteps"))),
+            )
+            if not bool(state.get("phased_continuation_configured", True)):
+                with contextlib.suppress(AttributeError):
+                    del self._agent6_actor_learning_rate_schedule
+                with contextlib.suppress(AttributeError):
+                    del self._agent6_actor_updates_start_at
 
         def configure_continuation_updates(
             self,
@@ -4154,6 +4895,10 @@ def make_phased_continuation_td3_class(TD3: Any):
                 self._agent6_safe_actor_evidence_completed_lap
                 or int(finite_float(summary.get("laps_completed"))) > 0
             )
+            if self._agent6_safe_actor_evidence_completed_lap:
+                # Preserve the exact lap-producing actor until its matched
+                # internal validation can run within the probe allowance.
+                self._agent6_safe_actor_waiting_for_probe = True
             credible = training_progress_is_credible(
                 self._agent6_safe_actor_evidence_distances_m,
                 reference_distance_m=(
@@ -5223,11 +5968,13 @@ def create_td3_model(
         "device": args.device,
     }
     if args.continuation:
+        source_path = continuation_source_path(args)
         if (
-            continuation_source_uses_legacy_action_contract(args)
+            not bool(getattr(args, "exact_resume", False))
+            and continuation_source_uses_legacy_action_contract(args)
             and args.allow_legacy_action_migration
         ):
-            legacy_model = TD3.load(str(args.resume_from), device=args.device)
+            legacy_model = TD3.load(str(source_path), device=args.device)
             model = TD3(
                 "MlpPolicy",
                 policy_kwargs={"net_arch": args.net_arch},
@@ -5237,14 +5984,14 @@ def create_td3_model(
                 legacy_model,
                 model,
             )
-            migration["source_policy_path"] = str(args.resume_from)
+            migration["source_policy_path"] = str(source_path)
             migration["source_model_num_timesteps"] = int(
                 getattr(legacy_model, "num_timesteps", 0)
             )
             model.num_timesteps = int(getattr(legacy_model, "num_timesteps", 0))
             setattr(model, "_agent6_contract_migration", migration)
             return model
-        model = TD3.load(str(args.resume_from), **model_kwargs)
+        model = TD3.load(str(source_path), **model_kwargs)
         normalise_continuation_spaces(model, env)
         return model
     return TD3(
@@ -5332,6 +6079,50 @@ def normalise_continuation_spaces(model: Any, env: Any) -> None:
         replay_buffer.observation_space = observation_space
 
 
+def automatic_evaluation_command(args: argparse.Namespace) -> list[str]:
+    return [
+        sys.executable,
+        str(PROJECT_ROOT / "scripts" / "evaluate_td3_agent.py"),
+        "--policy-path",
+        str(args.model_path),
+        "--track",
+        str(args.track),
+        "--output-dir",
+        str(args.automatic_evaluation_output_dir),
+        "--promote-best-if-improved",
+        "--best-robust-evaluation-model-path",
+        str(args.best_robust_evaluation_model_path),
+        "--best-completed-lap-model-path",
+        str(args.best_completed_lap_model_path),
+    ]
+
+
+def run_automatic_end_evaluation(
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    command = automatic_evaluation_command(args)
+    started_at = datetime.now(timezone.utc).isoformat()
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=PROJECT_ROOT,
+            check=False,
+        )
+        return_code = int(completed.returncode)
+        error = None
+    except OSError as exc:
+        return_code = -1
+        error = f"{type(exc).__name__}: {exc}"
+    return {
+        "command": command,
+        "started_at": started_at,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "return_code": return_code,
+        "succeeded": return_code == 0,
+        "error": error,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -5372,6 +6163,15 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Verified Agent 6 evaluation checkpoint to continue training.",
+    )
+    parser.add_argument(
+        "--resume-exact-from",
+        type=Path,
+        default=None,
+        help=(
+            "Resume an interrupted Patch 5 checkpoint with its replay, "
+            "curriculum, probe, optimizer, and RNG state."
+        ),
     )
     parser.add_argument(
         "--allow-non-champion-source",
@@ -5605,8 +6405,47 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_BEST_REWARD_MODEL_PATH,
     )
+    parser.add_argument(
+        "--best-robust-evaluation-model-path",
+        type=Path,
+        default=DEFAULT_BEST_ROBUST_EVALUATION_MODEL_PATH,
+        help="Canonical held-out robustness champion.",
+    )
+    parser.add_argument(
+        "--best-completed-lap-model-path",
+        type=Path,
+        default=DEFAULT_BEST_COMPLETED_LAP_MODEL_PATH,
+        help="Best valid completed-lap policy found during training or evaluation.",
+    )
+    parser.add_argument(
+        "--lap-checkpoint-dir",
+        type=Path,
+        default=DEFAULT_LAP_CHECKPOINT_DIR,
+        help="Immutable archive directory for every valid policy-controlled lap.",
+    )
+    parser.add_argument(
+        "--end-of-run-evaluation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Run the strict held-out evaluator once after training and promote "
+            "eligible robust/lap champions. Enabled by default for continuation."
+        ),
+    )
+    parser.add_argument(
+        "--automatic-evaluation-output-dir",
+        type=Path,
+        default=DEFAULT_AUTOMATIC_EVALUATION_OUTPUT_DIR,
+        help="JSON and CSV destination for automatic held-out evaluation.",
+    )
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
     parser.add_argument("--checkpoint-freq", type=int, default=DEFAULT_CHECKPOINT_FREQ)
+    parser.add_argument(
+        "--emergency-checkpoint-path",
+        type=Path,
+        default=DEFAULT_EMERGENCY_CHECKPOINT_PATH,
+        help="Exact-resume checkpoint written on Ctrl+C or a TORCS failure.",
+    )
     parser.add_argument("--tensorboard-dir", type=Path, default=DEFAULT_TENSORBOARD_DIR)
     parser.add_argument("--replay-buffer-path", type=Path, default=DEFAULT_REPLAY_BUFFER_PATH)
     parser.add_argument("--run-dir", type=Path, default=None)
@@ -5690,11 +6529,139 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     args = parser.parse_args()
-    args.continuation = args.resume_from is not None
+    if args.resume_from is not None and args.resume_exact_from is not None:
+        parser.error("--resume-from and --resume-exact-from are mutually exclusive")
+    args.exact_resume = args.resume_exact_from is not None
+    args.continuation = bool(args.resume_from or args.resume_exact_from)
+    args.exact_source_was_continuation = False
+    if args.exact_resume:
+        exact_errors = exact_training_checkpoint_errors(args.resume_exact_from)
+        if exact_errors:
+            parser.error(exact_errors[0])
+        try:
+            exact_state = load_exact_training_state(args.resume_exact_from)
+        except (OSError, RuntimeError, ValueError) as exc:
+            parser.error(str(exc))
+        budget_state = exact_state.get("training_budget")
+        if not isinstance(budget_state, Mapping):
+            parser.error("exact-resume state is missing its training budget")
+        args.total_timesteps = max(
+            1,
+            int(finite_float(budget_state.get("target_training_steps"), 1.0)),
+        )
+        args.max_probe_overhead_steps = max(
+            1,
+            int(finite_float(budget_state.get("maximum_probe_steps"), 1.0)),
+        )
+        args.max_probe_fraction = finite_float(
+            budget_state.get("maximum_probe_fraction"),
+            DEFAULT_MAX_PROBE_FRACTION,
+        )
+        environment_state = exact_state.get("environment")
+        if isinstance(environment_state, Mapping):
+            args.start_stage = str(
+                environment_state.get("stage_id") or "sector_progression"
+            )
+        source_metadata = read_policy_metadata(args.resume_exact_from)
+        hyperparameters = source_metadata.get("td3_hyperparameters")
+        if isinstance(hyperparameters, Mapping):
+            exact_argument_keys = {
+                "buffer_size": "buffer_size",
+                "batch_size": "batch_size",
+                "gamma": "gamma",
+                "tau": "tau",
+                "learning_rate": "learning_rate",
+                "learning_rate_final": "learning_rate_final",
+                "actor_learning_rate": "actor_learning_rate",
+                "actor_learning_rate_final": "actor_learning_rate_final",
+                "critic_warmup_steps": "critic_warmup_steps",
+                "actor_unfreeze_steps": "actor_unfreeze_steps",
+                "safe_actor_improvement": "safe_actor_improvement",
+                "train_freq": "train_freq",
+                "gradient_steps": "gradient_steps",
+                "policy_delay": "policy_delay",
+                "target_policy_noise": "target_policy_noise",
+                "target_noise_clip": "target_noise_clip",
+                "action_noise_initial_sigma": "action_noise_sigma",
+                "action_noise_final_sigma": "action_noise_final_sigma",
+                "action_noise_decay_steps": "action_noise_decay_steps",
+                "net_arch": "net_arch",
+            }
+            for metadata_key, argument_key in exact_argument_keys.items():
+                if hyperparameters.get(metadata_key) is not None:
+                    setattr(args, argument_key, hyperparameters[metadata_key])
+        continuation = source_metadata.get("continuation")
+        if isinstance(continuation, Mapping):
+            args.exact_source_was_continuation = bool(
+                continuation.get(
+                    "training_protocol_enabled",
+                    continuation.get("enabled"),
+                )
+            )
+            args.replay_refill_steps = int(
+                finite_float(continuation.get("replay_refill_steps"))
+            )
+        safe_actor = source_metadata.get("safe_actor_improvement")
+        if isinstance(safe_actor, Mapping):
+            safe_argument_keys = {
+                "max_normalized_action_delta": "safe_actor_max_action_delta",
+                "gradient_clip_norm": "safe_actor_gradient_norm",
+                "actor_updates_per_inner_block": "safe_actor_block_updates",
+                "inner_blocks_per_robustness_probe": (
+                    "safe_actor_blocks_per_probe"
+                ),
+                "robustness_challenge_seeds": "safe_actor_probe_repeats",
+                "robustness_trials_per_seed": "safe_actor_trials_per_seed",
+                "screening_trials_per_seed": (
+                    "safe_actor_screening_trials_per_seed"
+                ),
+                "screening_maximum_regression_m": (
+                    "safe_actor_screening_max_regression_m"
+                ),
+                "screening_maximum_episode_steps": (
+                    "safe_actor_screening_max_episode_steps"
+                ),
+                "training_challenge_base_seed": "safe_actor_probe_base_seed",
+                "evidence_window_episodes": "probe_evidence_window",
+                "minimum_evidence_episodes": "probe_min_evidence_episodes",
+                "evidence_maximum_median_regression_m": (
+                    "probe_evidence_max_regression_m"
+                ),
+                "robustness_probe_steering_noise_std": (
+                    "safe_actor_probe_noise_std"
+                ),
+                "minimum_improvement_m": "safe_actor_min_improvement_m",
+                "median_regression_tolerance_m": (
+                    "safe_actor_median_regression_tolerance_m"
+                ),
+                "minimum_regression_tolerance_m": (
+                    "safe_actor_minimum_regression_tolerance_m"
+                ),
+                "maximum_paired_regression_m": (
+                    "safe_actor_max_paired_regression_m"
+                ),
+                "anchor_batch_size": "safe_actor_anchor_batch_size",
+            }
+            for metadata_key, argument_key in safe_argument_keys.items():
+                if safe_actor.get(metadata_key) is not None:
+                    setattr(args, argument_key, safe_actor[metadata_key])
+        args.seed = int(finite_float(source_metadata.get("seed"), args.seed))
+        args.policy_probe_interval = int(
+            finite_float(
+                source_metadata.get("policy_probe_interval_episodes"),
+                args.policy_probe_interval,
+            )
+        )
+        args.continuation_compatibility_probe = False
     if args.continuation_compatibility_probe_only:
         args.continuation_compatibility_probe = True
     if args.continuation_compatibility_probe is None:
         args.continuation_compatibility_probe = args.continuation
+    if args.end_of_run_evaluation is None:
+        args.end_of_run_evaluation = bool(
+            args.continuation
+            and not args.continuation_compatibility_probe_only
+        )
     if args.start_stage is None:
         args.start_stage = "sector_progression" if args.continuation else "launch"
     if args.replay_refill_steps is None:
@@ -5774,7 +6741,7 @@ def parse_args() -> argparse.Namespace:
         )
 
     if not args.continuation and args.start_stage != "launch":
-        parser.error("--start-stage requires --resume-from unless it is launch")
+        parser.error("--start-stage requires continuation unless it is launch")
     if args.continuation_compatibility_probe and not args.continuation:
         parser.error("--continuation-compatibility-probe requires --resume-from")
     if args.continuation_compatibility_probe_only and not args.continuation:
@@ -5783,14 +6750,29 @@ def parse_args() -> argparse.Namespace:
         )
     if args.allow_legacy_action_migration and not args.continuation:
         parser.error("--allow-legacy-action-migration requires --resume-from")
-    if args.continuation:
-        source_errors = continuation_source_errors(
-            args.resume_from,
-            track=args.track,
-            start_stage=args.start_stage,
+    managed_policy_paths = (
+        args.model_path.resolve(),
+        args.best_distance_model_path.resolve(),
+        args.best_reward_model_path.resolve(),
+        args.best_robust_evaluation_model_path.resolve(),
+        args.best_completed_lap_model_path.resolve(),
+        args.emergency_checkpoint_path.resolve(),
+    )
+    if len(set(managed_policy_paths)) != len(managed_policy_paths):
+        parser.error(
+            "working, distance, reward, robust, completed-lap, and emergency "
+            "policy "
+            "paths must be distinct"
         )
-        if source_errors:
-            parser.error(source_errors[0])
+    if args.continuation:
+        if not args.exact_resume:
+            source_errors = continuation_source_errors(
+                args.resume_from,
+                track=args.track,
+                start_stage=args.start_stage,
+            )
+            if source_errors:
+                parser.error(source_errors[0])
         if (
             args.allow_legacy_action_migration
             and not continuation_source_uses_legacy_action_contract(args)
@@ -5798,9 +6780,10 @@ def parse_args() -> argparse.Namespace:
             parser.error(
                 "--allow-legacy-action-migration requires a verified legacy v1 source"
             )
-        source_path = args.resume_from.resolve()
+        source_path = continuation_source_path(args).resolve()
         if (
-            not args.allow_non_champion_source
+            not args.exact_resume
+            and not args.allow_non_champion_source
             and source_path != DEFAULT_BEST_EVALUATION_MODEL_PATH.resolve()
         ):
             parser.error(
@@ -5812,6 +6795,7 @@ def parse_args() -> argparse.Namespace:
             args.model_path.resolve(),
             args.best_distance_model_path.resolve(),
             args.best_reward_model_path.resolve(),
+            args.best_completed_lap_model_path.resolve(),
         )
         if source_path in output_paths:
             parser.error("continuation outputs must not overwrite --resume-from")
@@ -6013,7 +6997,18 @@ def main() -> None:
     args.model_path.parent.mkdir(parents=True, exist_ok=True)
     args.best_distance_model_path.parent.mkdir(parents=True, exist_ok=True)
     args.best_reward_model_path.parent.mkdir(parents=True, exist_ok=True)
+    args.best_robust_evaluation_model_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    args.best_completed_lap_model_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    args.lap_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    args.automatic_evaluation_output_dir.mkdir(parents=True, exist_ok=True)
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    args.emergency_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     args.tensorboard_dir.mkdir(parents=True, exist_ok=True)
     args.replay_buffer_path.parent.mkdir(parents=True, exist_ok=True)
     training_budget_state = ProbeBudgetController(
@@ -6038,9 +7033,15 @@ def main() -> None:
         learning_starts=policy_action_start_timestep(args),
         initial_stage_id=args.start_stage,
         pre_update_training_phase=(
-            "replay_refill" if args.continuation else "warmup"
+            "learning"
+            if args.exact_resume
+            else "replay_refill"
+            if args.continuation
+            else "warmup"
         ),
-        use_custom_warmup_action_space=not args.continuation,
+        use_custom_warmup_action_space=(
+            not continuation_training_protocol_enabled(args)
+        ),
         use_legacy_action_contract=training_uses_legacy_action_contract(args),
         training_budget_state=training_budget_state,
         safe_actor_screening_max_episode_steps=(
@@ -6214,8 +7215,12 @@ def main() -> None:
             env.close()
             return
         print(
-            "Continuing verified Agent 6 policy from "
-            f"{args.resume_from} at stage={args.start_stage}; "
+            (
+                "Resuming exact Agent 6 training state from "
+                if args.exact_resume
+                else "Continuing verified Agent 6 policy from "
+            )
+            + f"{continuation_source_path(args)} at stage={args.start_stage}; "
             f"action contract={metadata['action_version']}; "
             f"replay refill={args.replay_refill_steps:,}, "
             f"critic warm-up={args.critic_warmup_steps:,}, "
@@ -6238,42 +7243,68 @@ def main() -> None:
     ExplorationScheduleCallback = make_exploration_schedule_callback_class(
         BaseCallback
     )
+    LapCheckpointCallback = make_lap_checkpoint_callback_class(BaseCallback)
     EpisodeSummaryCallback = make_episode_summary_callback_class(BaseCallback)
     BestModelCallback = make_best_model_callback_class(BaseCallback)
-    callbacks = [
-        ExplorationScheduleCallback(
-            raw_env,
-            make_action_noise,
-            learning_starts=gradient_update_start_timestep(args),
-            initial_sigma=args.action_noise_sigma,
-            final_sigma=args.action_noise_final_sigma,
-            decay_steps=args.action_noise_decay_steps,
-            probe_interval=args.policy_probe_interval,
-            training_gradient_steps=args.gradient_steps,
-            pre_update_training_phase=(
-                "replay_refill" if args.continuation else "warmup"
-            ),
-            actor_update_start=actor_update_start_timestep(args),
-            actor_full_unfreeze=actor_full_unfreeze_timestep(args),
-            safe_probe_noise_factory=make_safe_probe_noise,
-            safe_probe_noise_std=args.safe_actor_probe_noise_std,
-            training_budget_state=training_budget_state,
-            probe_reference_distance_m=finite_float(
-                metadata["continuation"].get(
-                    "source_verified_evaluation_progress_m"
-                )
-            ),
-            probe_evidence_window=args.probe_evidence_window,
-            probe_min_evidence_episodes=args.probe_min_evidence_episodes,
-            probe_evidence_max_regression_m=(
-                args.probe_evidence_max_regression_m
-            ),
+    exploration_callback = ExplorationScheduleCallback(
+        raw_env,
+        make_action_noise,
+        learning_starts=gradient_update_start_timestep(args),
+        initial_sigma=args.action_noise_sigma,
+        final_sigma=args.action_noise_final_sigma,
+        decay_steps=args.action_noise_decay_steps,
+        probe_interval=args.policy_probe_interval,
+        training_gradient_steps=args.gradient_steps,
+        pre_update_training_phase=(
+            "learning"
+            if args.exact_resume
+            else "replay_refill"
+            if args.continuation
+            else "warmup"
         ),
+        actor_update_start=actor_update_start_timestep(args),
+        actor_full_unfreeze=actor_full_unfreeze_timestep(args),
+        safe_probe_noise_factory=make_safe_probe_noise,
+        safe_probe_noise_std=args.safe_actor_probe_noise_std,
+        training_budget_state=training_budget_state,
+        probe_reference_distance_m=finite_float(
+            metadata["continuation"].get(
+                "source_verified_evaluation_progress_m"
+            )
+        ),
+        probe_evidence_window=args.probe_evidence_window,
+        probe_min_evidence_episodes=args.probe_min_evidence_episodes,
+        probe_evidence_max_regression_m=(
+            args.probe_evidence_max_regression_m
+        ),
+    )
+
+    def save_training_checkpoint(path: Path, reason: str) -> dict[str, Any]:
+        return save_exact_training_checkpoint(
+            model,
+            raw_env,
+            exploration_callback,
+            training_budget_state,
+            path,
+            metadata,
+            reason=reason,
+        )
+
+    callbacks = [
+        # Capture the actor that drove the lap before the exploration callback
+        # switches between candidate and working-policy probe roles.
+        LapCheckpointCallback(
+            args.lap_checkpoint_dir,
+            args.best_completed_lap_model_path,
+            metadata,
+        ),
+        exploration_callback,
         make_checkpoint_callback(
             CheckpointCallback,
             args,
             BaseCallback=BaseCallback,
             training_budget_state=training_budget_state,
+            checkpoint_saver=save_training_checkpoint,
         ),
         EpisodeSummaryCallback(run_dir, progress_state),
         BestModelCallback(
@@ -6286,6 +7317,35 @@ def main() -> None:
             training_budget_state=training_budget_state,
         ),
     ]
+    if args.exact_resume:
+        restored_checkpoint = restore_exact_training_checkpoint(
+            model,
+            raw_env,
+            exploration_callback,
+            training_budget_state,
+            args.resume_exact_from,
+        )
+        metadata["continuation"]["exact_resume_checkpoint"] = (
+            restored_checkpoint
+        )
+        metadata["continuation"]["restored_training_budget"] = (
+            training_budget_state.as_dict()
+        )
+        metadata["continuation"]["restored_curriculum_stage"] = (
+            raw_env.current_stage.stage_id
+        )
+        metadata["milestone_history"] = copy.deepcopy(
+            raw_env.sector_milestone_history
+        )
+        write_json(run_dir / "training_metadata.json", metadata)
+        print(
+            "Exact state restored: training="
+            f"{training_budget_state.training_steps:,}/"
+            f"{training_budget_state.target_training_steps:,}, probes="
+            f"{training_budget_state.probe_steps:,}, stage="
+            f"{raw_env.current_stage.stage_id}, milestones="
+            f"{len(raw_env.sector_milestone_history):,}."
+        )
     if not args.no_progress_bar and not args.verbose_training:
         ConsoleProgressCallback = make_console_progress_callback_class(BaseCallback)
         callbacks.append(
@@ -6297,28 +7357,58 @@ def main() -> None:
         )
     callback = CallbackList(callbacks)
 
+    training_completed = False
+    training_interrupted = False
     try:
+        remaining_environment_steps = (
+            max(
+                0,
+                training_budget_state.target_training_steps
+                - training_budget_state.training_steps,
+            )
+            + max(
+                0,
+                training_budget_state.effective_maximum_probe_steps
+                - training_budget_state.probe_steps,
+            )
+        )
+        if remaining_environment_steps < 1:
+            raise RuntimeError(
+                "exact-resume checkpoint has no remaining training budget"
+            )
         model.learn(
-            total_timesteps=training_budget_state.maximum_environment_steps,
+            total_timesteps=remaining_environment_steps,
             callback=callback,
-            reset_num_timesteps=True,
+            reset_num_timesteps=not args.exact_resume,
             log_interval=10,
         )
         end_summary = raw_env.write_end_of_run_summary(
             training_budget_state.stop_reason or "environment_step_limit_reached"
         )
-        model.save(str(args.model_path))
-        if args.save_replay_buffer:
-            model.save_replay_buffer(str(args.replay_buffer_path))
         metadata["finished_at"] = datetime.now(timezone.utc).isoformat()
         metadata["timestep_budget"]["run_state"] = (
             training_budget_state.as_dict()
+        )
+        metadata["milestone_history"] = copy.deepcopy(
+            raw_env.sector_milestone_history
         )
         safe_actor_status = getattr(model, "safe_actor_status", None)
         if callable(safe_actor_status):
             metadata["safe_actor_improvement"]["run_state"] = safe_actor_status()
         if end_summary is not None:
             metadata["end_of_run_summary"] = end_summary
+        final_checkpoint = save_training_checkpoint(
+            args.model_path,
+            "training_completed",
+        )
+        metadata["exact_resume_checkpoint"] = final_checkpoint
+        if args.save_replay_buffer:
+            replay_error = save_replay_buffer_atomically(
+                model,
+                args.replay_buffer_path,
+            )
+            if replay_error is not None:
+                raise RuntimeError(replay_error)
         write_json(run_dir / "training_metadata.json", metadata)
         write_json(metadata_path_for_policy(args.model_path), metadata)
         print(
@@ -6333,8 +7423,88 @@ def main() -> None:
         )
         print(f"Saved Agent 6 TD3 model to {args.model_path}")
         print(f"Saved training run logs to {run_dir}")
+        training_completed = True
+    except KeyboardInterrupt:
+        training_interrupted = True
+        end_summary = raw_env.write_end_of_run_summary("keyboard_interrupt")
+        metadata["interrupted_at"] = datetime.now(timezone.utc).isoformat()
+        metadata["interruption_reason"] = "keyboard_interrupt"
+        metadata["timestep_budget"]["run_state"] = (
+            training_budget_state.as_dict()
+        )
+        metadata["milestone_history"] = copy.deepcopy(
+            raw_env.sector_milestone_history
+        )
+        if end_summary is not None:
+            metadata["end_of_run_summary"] = end_summary
+        emergency = save_training_checkpoint(
+            args.emergency_checkpoint_path,
+            "keyboard_interrupt",
+        )
+        metadata["exact_resume_checkpoint"] = emergency
+        write_json(run_dir / "training_metadata.json", metadata)
+        write_json(
+            metadata_path_for_policy(args.emergency_checkpoint_path),
+            metadata,
+        )
+        print(
+            "\nTraining interrupted safely. Exact resume checkpoint: "
+            f"{args.emergency_checkpoint_path}"
+        )
+    except Exception as exc:
+        metadata["interrupted_at"] = datetime.now(timezone.utc).isoformat()
+        metadata["interruption_reason"] = f"{type(exc).__name__}: {exc}"
+        metadata["timestep_budget"]["run_state"] = (
+            training_budget_state.as_dict()
+        )
+        metadata["milestone_history"] = copy.deepcopy(
+            raw_env.sector_milestone_history
+        )
+        try:
+            emergency = save_training_checkpoint(
+                args.emergency_checkpoint_path,
+                f"runtime_failure:{type(exc).__name__}",
+            )
+            metadata["exact_resume_checkpoint"] = emergency
+            write_json(run_dir / "training_metadata.json", metadata)
+            write_json(
+                metadata_path_for_policy(args.emergency_checkpoint_path),
+                metadata,
+            )
+            print(
+                "Saved exact emergency checkpoint after runtime failure: "
+                f"{args.emergency_checkpoint_path}",
+                file=sys.stderr,
+            )
+        except Exception as checkpoint_exc:
+            print(
+                "Emergency checkpoint also failed: "
+                f"{type(checkpoint_exc).__name__}: {checkpoint_exc}",
+                file=sys.stderr,
+            )
+        raise
     finally:
         env.close()
+
+    if training_interrupted:
+        return
+
+    if training_completed and args.end_of_run_evaluation:
+        print(
+            "Starting one held-out end-of-run evaluation after closing the "
+            "training TORCS instance..."
+        )
+        evaluation_result = run_automatic_end_evaluation(args)
+        metadata["automatic_evaluation"]["run_state"] = evaluation_result
+        write_json(run_dir / "training_metadata.json", metadata)
+        write_json(metadata_path_for_policy(args.model_path), metadata)
+        if evaluation_result["succeeded"]:
+            print("Automatic held-out evaluation completed successfully.")
+        else:
+            print(
+                "Warning: training completed, but automatic held-out evaluation "
+                f"failed with exit code {evaluation_result['return_code']}."
+            )
 
 
 if __name__ == "__main__":
