@@ -4,6 +4,7 @@ import argparse
 import copy
 import contextlib
 import csv
+import hashlib
 import io
 import json
 import math
@@ -46,6 +47,7 @@ from agents.td3_agent import (  # noqa: E402
     DEFAULT_BEST_ROBUST_EVALUATION_MODEL_PATH,
     DEFAULT_BEST_DISTANCE_MODEL_PATH,
     DEFAULT_BEST_REWARD_MODEL_PATH,
+    DEFAULT_FRONTIER_MODEL_PATH,
     DEFAULT_MODEL_PATH,
     EXTERNAL_EVALUATION_SEED_MAX,
     EXTERNAL_EVALUATION_SEED_MIN,
@@ -53,6 +55,8 @@ from agents.td3_agent import (  # noqa: E402
     G_TRACK_3_LENGTH_METRES,
     MAX_REPRODUCIBLE_SEED,
     PEDAL_DEADZONE,
+    SeededGaussianActionNoise,
+    SeededLegacyActionNoise,
     SeededSteeringActionNoise,
     TRAINING_CHALLENGE_SEED_MAX,
     TRAINING_CHALLENGE_SEED_MIN,
@@ -82,6 +86,7 @@ from agents.td3_checkpointing import (  # noqa: E402
     atomic_save_policy,
     atomic_write_json,
     promote_best_completed_lap,
+    read_json_mapping,
 )
 from runner.lap_tracker import LapTracker, practice_finish_is_plausible  # noqa: E402
 
@@ -94,6 +99,40 @@ DEFAULT_REPLAY_BUFFER_PATH = PROJECT_ROOT / "models" / "replay_buffers" / "agent
 DEFAULT_LAP_CHECKPOINT_DIR = (
     PROJECT_ROOT / "models" / "checkpoints" / "agent6_td3_laps"
 )
+DEFAULT_FRONTIER_CHECKPOINT_DIR = (
+    PROJECT_ROOT / "models" / "checkpoints" / "agent6_td3_frontier"
+)
+DEFAULT_FRONTIER_EVIDENCE_PATH = (
+    PROJECT_ROOT / "data" / "policies" / "agent6_td3_frontier_evidence.json"
+)
+DEFAULT_FRONTIER_MILESTONES_M = (1_500.0, 1_700.0, 1_900.0)
+DEFAULT_FRONTIER_MIN_IMPROVEMENT_M = 5.0
+DEFAULT_FRONTIER_MAJOR_BREAKTHROUGH_M = 25.0
+DEFAULT_FRONTIER_QUALIFICATION_DISTANCE_M = 1_400.0
+DEFAULT_FRONTIER_QUALIFICATION_ATTEMPTS = 3
+DEFAULT_FRONTIER_EXPLORATION_START_DISTANCE_M = 1_300.0
+DEFAULT_DISCOVERY_COLLAPSE_EPISODES = 8
+DEFAULT_DISCOVERY_COLLAPSE_DISTANCE_M = 5.0
+DEFAULT_DISCOVERY_FRONTIER_PRESERVATION_FRACTION = 1.0
+DEFAULT_DISCOVERY_RECOVERY_COOLDOWN_STEPS = 10_000
+DEFAULT_DISCOVERY_MAX_RECOVERY_COOLDOWN_STEPS = 40_000
+DEFAULT_DISCOVERY_ACTOR_LR_BACKOFF = 0.5
+DEFAULT_DISCOVERY_MIN_ACTOR_LR_SCALE = 0.125
+DEFAULT_DISCOVERY_MAX_POLICY_DELAY = 8
+DEFAULT_EPISODE_GRADIENT_STEPS = 256
+DEFAULT_FROZEN_POLICY_HEALTH_FRACTION = 0.65
+DEFAULT_FROZEN_POLICY_HEALTH_FAILURES = 2
+LEAN_FRONTIER_REPLAY_REFILL_STEPS = 5_000
+LEAN_FRONTIER_CRITIC_WARMUP_STEPS = 10_000
+LEAN_FRONTIER_CRITIC_LEARNING_RATE = 3e-4
+LEAN_FRONTIER_ACTOR_LEARNING_RATE = 3e-5
+LEAN_FRONTIER_ACTION_NOISE_SIGMA = 0.05
+LEAN_FRONTIER_FINAL_ACTION_NOISE_SIGMA = 0.05
+LEAN_FRONTIER_TARGET_POLICY_NOISE = 0.10
+LEAN_FRONTIER_TARGET_NOISE_CLIP = 0.20
+LEAN_FRONTIER_GRADIENT_STEPS = 1
+LEAN_FRONTIER_GRADIENT_NORM = 1.0
+LEAN_FRONTIER_HUBER_BETA = 1.0
 DEFAULT_AUTOMATIC_EVALUATION_OUTPUT_DIR = (
     PROJECT_ROOT / "data" / "evaluation" / "agent6_td3"
 )
@@ -113,12 +152,12 @@ DEFAULT_CONTINUATION_BUFFER_SIZE = 300_000
 DEFAULT_CONTINUATION_REPLAY_REFILL_STEPS = 20_000
 DEFAULT_CONTINUATION_CRITIC_WARMUP_STEPS = 20_000
 DEFAULT_CONTINUATION_ACTOR_UNFREEZE_STEPS = 40_000
-DEFAULT_CONTINUATION_ACTION_NOISE_SIGMA = 0.02
-DEFAULT_CONTINUATION_FINAL_ACTION_NOISE_SIGMA = 0.006
+DEFAULT_CONTINUATION_ACTION_NOISE_SIGMA = AGENT6_ROBUSTNESS_STEERING_NOISE_STD
+DEFAULT_CONTINUATION_FINAL_ACTION_NOISE_SIGMA = 0.002
 DEFAULT_SAFE_ACTOR_MAX_ACTION_DELTA = 0.01
 DEFAULT_SAFE_ACTOR_GRADIENT_NORM = 1.0
 DEFAULT_SAFE_ACTOR_BLOCK_UPDATES = 100
-DEFAULT_SAFE_ACTOR_BLOCKS_PER_PROBE = 25
+DEFAULT_SAFE_ACTOR_BLOCKS_PER_PROBE = 1
 DEFAULT_SAFE_ACTOR_PROBE_REPEATS = 3
 DEFAULT_SAFE_ACTOR_TRIALS_PER_SEED = 2
 DEFAULT_SAFE_ACTOR_SCREENING_TRIALS_PER_SEED = 2
@@ -135,11 +174,14 @@ DEFAULT_MAX_PROBE_FRACTION = 0.20
 DEFAULT_PROBE_EVIDENCE_WINDOW = 8
 DEFAULT_PROBE_MIN_EVIDENCE_EPISODES = 3
 DEFAULT_PROBE_EVIDENCE_MAX_REGRESSION_M = 150.0
+DEFAULT_BREAKTHROUGH_IMPROVEMENT_M = 25.0
+TRAINING_ACTION_NOISE_SEED_STRIDE = 0x9E3779B9
 SAFE_ACTOR_ROBUSTNESS_PROTOCOL = (
-    "agent6_progress_aware_working_policy_internal_probe_v10"
+    "agent6_breakthrough_aware_working_policy_internal_probe_v12"
 )
+FRONTIER_CONTINUATION_PROTOCOL = "agent6_frontier_trajectory_gate_v1"
 
-REWARD_VERSION = "agent6_td3_reward_v3_sector_milestones"
+REWARD_VERSION = "agent6_td3_reward_v4_streamlined_progress"
 EXACT_TRAINING_STATE_VERSION = "agent6_td3_exact_training_state_v1"
 OFF_TRACK_GRACE_STEPS = 4
 HARD_TRACK_BOUNDARY = 1.18
@@ -256,6 +298,7 @@ EPISODE_COLUMNS = [
     "safe_actor_probe_order_position",
     "safe_actor_decision",
     "safe_actor_training_evidence_decision",
+    "safe_actor_training_evidence_reasons",
     "safe_actor_probe_episodes_completed",
     "safe_actor_probe_episodes_maximum",
     "safe_actor_probe_episodes_skipped",
@@ -287,6 +330,18 @@ EPISODE_COLUMNS = [
     "safe_actor_safety_failures",
     "safe_actor_accepted_distance_m",
     "safe_actor_accepted_minimum_distance_m",
+    "discovery_launch_failure_streak",
+    "discovery_recovery_triggered",
+    "discovery_recovery_count",
+    "discovery_recovery_cooldown_until",
+    "discovery_actor_learning_rate_scale",
+    "discovery_effective_policy_delay",
+    "discovery_actor_updates_since_anchor",
+    "discovery_frontier_gate_open",
+    "discovery_frontier_gate_distance_m",
+    "frozen_policy_health_threshold_m",
+    "frozen_policy_health_failure_streak",
+    "frozen_policy_health_decision",
     "curriculum_eligible",
     "training_phase",
     "action_noise_sigma",
@@ -342,27 +397,9 @@ STEP_COLUMNS = [
     "brake",
     "gear",
     "reward",
-    "reward_progress",
-    "reward_aligned_speed",
-    "reward_new_distance",
-    "reward_sector_milestone_bonus",
-    "reward_stable_progress_bonus",
-    "reward_survival_cost",
-    "reward_lateral_position_penalty",
-    "reward_angle_penalty",
-    "reward_lateral_speed_penalty",
-    "reward_speed_steer_penalty",
-    "reward_spin_penalty",
-    "reward_closing_danger_penalty",
-    "reward_clear_track_anti_stall_penalty",
-    "reward_stalled_penalty",
-    "reward_off_track_penalty",
-    "reward_crash_penalty",
-    "reward_backwards_penalty",
-    "reward_stuck_penalty",
-    "reward_terminal_failure_penalty",
-    "reward_stage_success_bonus",
-    "reward_lap_completion_bonus",
+    "reward_forward_speed",
+    "reward_track_edge_penalty",
+    "reward_terminal_failure",
     "terminated",
     "truncated",
     "termination_reason",
@@ -383,7 +420,6 @@ def import_training_dependencies():
         )
         from stable_baselines3.common.env_checker import check_env
         from stable_baselines3.common.monitor import Monitor
-        from stable_baselines3.common.noise import NormalActionNoise
     except ImportError as exc:
         raise SystemExit(
             "Agent 6 TD3 training needs extra packages:\n"
@@ -400,7 +436,6 @@ def import_training_dependencies():
         CheckpointCallback,
         Monitor,
         check_env,
-        NormalActionNoise,
     )
 
 
@@ -506,33 +541,6 @@ def load_exact_training_state(policy_path: Path, *, device: Any = "cpu") -> dict
     return payload
 
 
-def capture_rng_state() -> dict[str, Any]:
-    import torch
-
-    return {
-        "python": random.getstate(),
-        "numpy": np.random.get_state(),
-        "torch_cpu": torch.get_rng_state(),
-        "torch_cuda": (
-            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
-        ),
-    }
-
-
-def restore_rng_state(state: Mapping[str, Any]) -> None:
-    import torch
-
-    if state.get("python") is not None:
-        random.setstate(state["python"])
-    if state.get("numpy") is not None:
-        np.random.set_state(state["numpy"])
-    if state.get("torch_cpu") is not None:
-        torch.set_rng_state(state["torch_cpu"].cpu())
-    cuda_states = state.get("torch_cuda")
-    if torch.cuda.is_available() and isinstance(cuda_states, (list, tuple)):
-        torch.cuda.set_rng_state_all([value.cpu() for value in cuda_states])
-
-
 def save_exact_training_checkpoint(
     model: Any,
     raw_env: Any,
@@ -576,7 +584,6 @@ def save_exact_training_checkpoint(
         "environment": raw_env.training_state_dict(),
         "exploration_callback": exploration_callback.training_state_dict(),
         "training_budget": training_budget_state.as_dict(),
-        "rng": capture_rng_state(),
     }
     save_torch_payload_atomically(payload, state_path)
     checkpoint_metadata = copy.deepcopy(dict(metadata))
@@ -597,6 +604,8 @@ def restore_exact_training_checkpoint(
     exploration_callback: Any,
     training_budget_state: "TrainingBudgetState",
     policy_path: Path,
+    *,
+    allow_budget_extension: bool = False,
 ) -> dict[str, Any]:
     state = load_exact_training_state(
         policy_path,
@@ -605,13 +614,13 @@ def restore_exact_training_checkpoint(
     model.load_replay_buffer(str(replay_buffer_path_for_policy(policy_path)))
     model.restore_exact_training_state(state["model"])
     raw_env.restore_training_state(state["environment"])
-    training_budget_state.restore(state["training_budget"])
+    training_budget_state.restore(
+        state["training_budget"],
+        allow_budget_extension=allow_budget_extension,
+    )
     exploration_callback.restore_training_state(
         state["exploration_callback"]
     )
-    rng_state = state.get("rng")
-    if isinstance(rng_state, Mapping):
-        restore_rng_state(rng_state)
     checkpoint = state.get("checkpoint")
     return dict(checkpoint) if isinstance(checkpoint, Mapping) else {}
 
@@ -657,6 +666,11 @@ def continuation_training_protocol_enabled(args: argparse.Namespace) -> bool:
     if not bool(getattr(args, "exact_resume", False)):
         return True
     return bool(getattr(args, "exact_source_was_continuation", True))
+
+
+def lean_frontier_training_enabled(args: argparse.Namespace) -> bool:
+    """Use live per-step stable fine-tuning for frontier discovery."""
+    return bool(getattr(args, "lean_frontier_training", False))
 
 
 def continuation_source_errors(
@@ -716,6 +730,128 @@ def continuation_source_errors(
     return errors
 
 
+def frontier_evidence_distance_m(
+    metadata: Mapping[str, Any],
+    external_evidence: Mapping[str, Any] | None = None,
+) -> float:
+    """Return the strongest recorded distance evidence without claiming robustness."""
+    candidates: list[float] = []
+    if isinstance(external_evidence, Mapping):
+        candidates.append(finite_float(external_evidence.get("distance_m")))
+    frontier = metadata.get("frontier_champion")
+    if isinstance(frontier, Mapping):
+        candidates.append(finite_float(frontier.get("distance_m")))
+    evaluation = metadata.get("best_evaluation")
+    if isinstance(evaluation, Mapping):
+        candidates.extend(
+            finite_float(evaluation.get(key))
+            for key in ("maximum_progress_m", "median_progress_m")
+        )
+    best_distance = metadata.get("best_distance_episode")
+    if isinstance(best_distance, Mapping):
+        candidates.append(finite_float(best_distance.get("distance_m")))
+    continuation = metadata.get("continuation")
+    if isinstance(continuation, Mapping):
+        candidates.extend(
+            finite_float(continuation.get(key))
+            for key in (
+                "source_verified_evaluation_maximum_progress_m",
+                "source_verified_evaluation_progress_m",
+            )
+        )
+    discovery = metadata.get("discovery")
+    if isinstance(discovery, Mapping):
+        candidates.append(
+            finite_float(discovery.get("source_frontier_evidence_distance_m"))
+        )
+        run_state = discovery.get("run_state")
+        if isinstance(run_state, Mapping):
+            candidates.append(finite_float(run_state.get("best_distance_m")))
+    return max((value for value in candidates if value >= 0.0), default=0.0)
+
+
+def load_verified_frontier_evidence(
+    policy_path: Path,
+    evidence_path: Path,
+) -> tuple[dict[str, Any], list[str]]:
+    """Load external distance evidence only when it binds to the exact policy."""
+    evidence_file = Path(evidence_path)
+    if not evidence_file.is_file():
+        return {}, []
+    evidence = read_json_mapping(evidence_file)
+    configured_policy = evidence.get("policy_path")
+    configured_hash = str(evidence.get("policy_sha256") or "").casefold()
+    if not configured_policy or not configured_hash:
+        return {}, [
+            f"frontier evidence is missing policy_path or policy_sha256: {evidence_file}"
+        ]
+    configured_path = Path(str(configured_policy))
+    if not configured_path.is_absolute():
+        configured_path = PROJECT_ROOT / configured_path
+    source_path = Path(policy_path)
+    if configured_path.resolve() != source_path.resolve():
+        return {}, []
+    try:
+        with source_path.open("rb") as policy_file:
+            actual_hash = hashlib.file_digest(policy_file, "sha256").hexdigest()
+    except OSError as exc:
+        return {}, [f"could not hash frontier evidence policy: {exc}"]
+    if actual_hash.casefold() != configured_hash:
+        return {}, [
+            "frontier evidence policy hash mismatch: expected "
+            f"{configured_hash}, found {actual_hash.casefold()}"
+        ]
+    distance_m = finite_float(evidence.get("distance_m"), -1.0)
+    if distance_m <= 0.0:
+        return {}, ["frontier evidence distance_m must be positive"]
+    return dict(evidence), []
+
+
+def frontier_continuation_source_errors(
+    policy_path: Path,
+    *,
+    track: str,
+    start_stage: str,
+    external_evidence: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Validate a reward-only frontier without requiring robust-evaluation status."""
+    path = Path(policy_path)
+    if not path.is_file():
+        return [f"frontier checkpoint does not exist: {path}"]
+    metadata = read_policy_metadata(path)
+    errors = [
+        f"frontier checkpoint contract mismatch: {key}"
+        for key in policy_contract_mismatches(
+            metadata,
+            allow_legacy_action_contract=True,
+        )
+    ]
+    if str(metadata.get("learning_source") or "") != "reward_only":
+        errors.append("frontier checkpoint must be trained from reward only")
+    source_track = str(metadata.get("track") or "")
+    if source_track and source_track != str(track):
+        errors.append(
+            "frontier checkpoint track mismatch: "
+            f"expected {track}, found {source_track}"
+        )
+    stage_index = curriculum_stage_index(start_stage)
+    required_progress_m = (
+        0.0
+        if stage_index == 0
+        else CURRICULUM[stage_index - 1].distance_target_m
+    )
+    evidence_distance_m = frontier_evidence_distance_m(
+        metadata,
+        external_evidence,
+    )
+    if evidence_distance_m < required_progress_m:
+        errors.append(
+            f"frontier checkpoint has {evidence_distance_m:.1f}m evidence, but "
+            f"stage {start_stage} requires {required_progress_m:.1f}m"
+        )
+    return errors
+
+
 def continuation_source_uses_legacy_action_contract(
     args: argparse.Namespace,
 ) -> bool:
@@ -743,6 +879,10 @@ def training_action_size(args: argparse.Namespace) -> int:
 
 
 def policy_action_start_timestep(args: argparse.Namespace) -> int:
+    if lean_frontier_training_enabled(args):
+        # A transferred actor starts collecting immediately, but the fresh
+        # critic must not optimize against a tiny, highly correlated buffer.
+        return max(0, int(args.replay_refill_steps))
     return (
         0
         if continuation_training_protocol_enabled(args)
@@ -912,6 +1052,22 @@ def action_noise_sigma_at_timestep(
     elapsed = max(0, int(timestep) - max(0, int(learning_starts)))
     progress = clamp(elapsed / max(1, int(decay_steps)), 0.0, 1.0)
     return initial + (final - initial) * progress
+
+
+def training_action_noise_seed(base_seed: int, generation: int) -> int:
+    """Derive a reproducible stream seed without using NumPy's global RNG."""
+    seed = int(base_seed)
+    index = int(generation)
+    if not 0 <= seed <= MAX_REPRODUCIBLE_SEED:
+        raise ValueError(
+            f"base_seed must be between 0 and {MAX_REPRODUCIBLE_SEED}"
+        )
+    if index < 0:
+        raise ValueError("generation must be non-negative")
+    return int(
+        (seed + TRAINING_ACTION_NOISE_SEED_STRIDE * (index + 1))
+        & MAX_REPRODUCIBLE_SEED
+    )
 
 
 def linear_learning_rate_schedule(
@@ -1251,161 +1407,56 @@ def calculate_td3_reward_components(
     stuck: bool = False,
     terminal_failure: bool | None = None,
 ) -> dict[str, float]:
-    stage = stage or CURRICULUM[0]
+    # TORCS reports speedX in km/h and trackPos as a normalized lateral
+    # coordinate where +/-1 is the track edge. Keep this reward deliberately
+    # independent of curriculum stage and actuator choices so the critic sees
+    # one stable objective throughout continuation training.
+    _ = (
+        action,
+        previous_telemetry,
+        episode_distance_m,
+        previous_furthest_distance_m,
+        newly_achieved_sector_milestones_m,
+        stage,
+    )
     sensors = track_sensors(telemetry)
-    front_sensor = sensors[9] if len(sensors) > 9 else 200.0
     min_sensor = min(sensors) if sensors else 200.0
-    speed = finite_float(telemetry.get("speedX"))
+    speed_mps = finite_float(telemetry.get("speedX")) / 3.6
     angle = finite_float(telemetry.get("angle"))
     track_position = finite_float(telemetry.get("trackPos"))
-    lateral_speed = finite_float(telemetry.get("speedY"))
-    steer = abs(finite_float(action.get("steer")))
     damage = finite_float(telemetry.get("damage"), previous_damage)
-    progress = calculate_progress_delta(previous_telemetry, telemetry)
-    new_distance = max(0.0, episode_distance_m - previous_furthest_distance_m)
-    aligned_speed = speed * max(0.0, math.cos(angle))
     off_track = min_sensor < 0.0 or abs(track_position) > SOFT_TRACK_BOUNDARY
     crashed = damage > previous_damage
     backwards = math.cos(angle) < 0.0
     if terminal_failure is None:
         terminal_failure = off_track or crashed or backwards or stuck
+    physical_failure = bool(
+        terminal_failure and completed_lap is None and not stage_success
+    )
+    if physical_failure:
+        return {
+            "forward_speed": 0.0,
+            "track_edge_penalty": 0.0,
+            "terminal_failure": -25.0,
+            "total_unclipped": -25.0,
+            "total": -25.0,
+        }
 
-    components: dict[str, float] = {
-        "progress": clamp(progress, -2.0, 10.0) * stage.progress_weight,
-        "aligned_speed": clamp(aligned_speed / 190.0, 0.0, 1.0) * 0.55,
-        "new_distance": clamp(new_distance, 0.0, 12.0) * stage.milestone_weight,
-        "sector_milestone_bonus": sum(
-            SECTOR_PROGRESS_MILESTONE_REWARDS.get(float(milestone), 0.0)
-            for milestone in newly_achieved_sector_milestones_m
-        ),
-        "stable_progress_bonus": 0.0,
-        "survival_cost": -0.015,
-        "lateral_position_penalty": 0.0,
-        "angle_penalty": 0.0,
-        "lateral_speed_penalty": 0.0,
-        "speed_steer_penalty": 0.0,
-        "spin_penalty": 0.0,
-        "closing_danger_penalty": 0.0,
-        "clear_track_anti_stall_penalty": 0.0,
-        "stalled_penalty": 0.0,
-        "off_track_penalty": 0.0,
-        "crash_penalty": 0.0,
-        "backwards_penalty": 0.0,
-        "stuck_penalty": 0.0,
-        "terminal_failure_penalty": 0.0,
-        "stage_success_bonus": 0.0,
-        "lap_completion_bonus": 0.0,
+    forward_speed = speed_mps * max(0.0, math.cos(angle)) * 0.10
+    normalized_offset = abs(track_position)
+    track_edge_penalty = 0.0
+    if normalized_offset > 0.8:
+        track_edge_penalty = -1.5 * (
+            (normalized_offset - 0.8) / 0.2
+        ) ** 2
+    unclipped_total = forward_speed + track_edge_penalty
+    return {
+        "forward_speed": float(forward_speed),
+        "track_edge_penalty": float(track_edge_penalty),
+        "terminal_failure": 0.0,
+        "total_unclipped": float(unclipped_total),
+        "total": float(clamp(unclipped_total, -10.0, 5.0)),
     }
-    if progress > 0.18 and abs(track_position) < 0.85 and abs(angle) < 0.55:
-        components["stable_progress_bonus"] = 0.45
-
-    components["lateral_position_penalty"] -= (
-        max(0.0, abs(track_position) - 0.45) * 1.6
-    )
-    components["lateral_position_penalty"] -= (
-        max(0.0, abs(track_position) - 0.76) * 5.8
-    )
-    components["lateral_position_penalty"] -= (
-        max(0.0, abs(track_position) - 0.92) * 12.0
-    )
-    components["angle_penalty"] -= max(0.0, abs(angle) - 0.10) * 1.1
-    components["angle_penalty"] -= max(0.0, abs(angle) - 0.45) * 4.5
-    components["lateral_speed_penalty"] -= (
-        max(0.0, abs(lateral_speed) - 4.0) * 0.10
-    )
-    components["lateral_speed_penalty"] -= (
-        max(0.0, abs(lateral_speed) - 12.0) * 0.24
-    )
-
-    speed_pressure = clamp((speed - 40.0) / 115.0, 0.0, 1.0)
-    components["speed_steer_penalty"] -= (
-        max(0.0, steer - 0.28) * speed_pressure * 5.5
-    )
-    components["speed_steer_penalty"] -= (
-        max(0.0, steer - 0.55) * speed_pressure * 12.0
-    )
-    components["speed_steer_penalty"] -= (
-        max(0.0, abs(angle) - 0.35) * speed_pressure * 7.0
-    )
-    components["speed_steer_penalty"] -= (
-        max(0.0, abs(lateral_speed) - 7.0) * speed_pressure * 0.28
-    )
-    if abs(angle) > 1.05 and speed > 18.0:
-        spin_pressure = clamp((abs(angle) - 1.05) / 0.75, 0.0, 1.0)
-        components["spin_penalty"] = -42.0 * spin_pressure
-
-    closing_danger = front_sensor < 55.0 and speed > stage.safe_front_speed_kmh
-    if closing_danger:
-        brake = finite_float(action.get("brake"))
-        accel = finite_float(action.get("accel"))
-        overspeed_pressure = clamp(
-            (speed - stage.safe_front_speed_kmh) / 80.0,
-            0.0,
-            1.0,
-        )
-        front_pressure = clamp((55.0 - front_sensor) / 55.0, 0.0, 1.0)
-        components["closing_danger_penalty"] -= (
-            front_pressure * overspeed_pressure * 3.2
-        )
-        components["closing_danger_penalty"] -= (
-            front_pressure * overspeed_pressure * max(0.0, 0.25 - brake) * 4.0
-        )
-        components["closing_danger_penalty"] -= (
-            front_pressure * overspeed_pressure * accel * 2.4
-        )
-
-    clear_track = (
-        not off_track
-        and not backwards
-        and not crashed
-        and min_sensor >= 2.0
-        and front_sensor >= 24.0
-        and abs(angle) < 0.65
-        and episode_distance_m > 8.0
-    )
-    anti_stall_pressure = (
-        clamp((42.0 - speed) / 42.0, 0.0, 1.0)
-        * clamp((0.20 - progress) / 0.20, 0.0, 1.0)
-    )
-    if clear_track and anti_stall_pressure > 0.0:
-        accel = finite_float(action.get("accel"))
-        brake = finite_float(action.get("brake"))
-        throttle_gap = max(0.0, 0.35 - accel)
-        brake_drag = max(0.0, brake - 0.02)
-        components["clear_track_anti_stall_penalty"] = -anti_stall_pressure * (
-            2.2 + 2.4 * throttle_gap + 3.0 * brake_drag
-        )
-
-    if progress < 0.03 and speed < 8.0:
-        components["stalled_penalty"] = -4.0
-    if min_sensor < 0.0:
-        components["off_track_penalty"] -= 28.0
-    if abs(track_position) > 1.0:
-        components["off_track_penalty"] -= 42.0
-    if crashed:
-        components["crash_penalty"] = (
-            -65.0 - max(0.0, damage - previous_damage) * 0.15
-        )
-    if backwards:
-        components["backwards_penalty"] = (
-            -145.0 - clamp(abs(speed) / 120.0, 0.0, 1.0) * 55.0
-        )
-    if stuck:
-        components["stuck_penalty"] = -80.0
-    if terminal_failure and completed_lap is None and not stage_success:
-        remaining = 1.0 - calculate_lap_completion_fraction(episode_distance_m)
-        components["terminal_failure_penalty"] = (
-            -stage.failure_penalty * (0.35 + 0.65 * remaining)
-        )
-    if stage_success:
-        components["stage_success_bonus"] = stage.success_reward
-    if completed_lap is not None:
-        components["lap_completion_bonus"] = max(stage.success_reward, 850.0)
-
-    unclipped_total = float(sum(components.values()))
-    components["total_unclipped"] = unclipped_total
-    components["total"] = float(clamp(unclipped_total, -450.0, 1000.0))
-    return components
 
 
 def calculate_td3_reward(
@@ -1477,6 +1528,11 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
         if isinstance(source_evaluation, Mapping)
         else None
     )
+    source_maximum_progress_m = (
+        finite_float(source_evaluation.get("maximum_progress_m"))
+        if isinstance(source_evaluation, Mapping)
+        else None
+    )
     return {
         "model_family": AGENT6_MODEL_FAMILY,
         "observation_version": observation_version,
@@ -1495,6 +1551,142 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "racing_line_imitation": False,
         "automatic_gear_shift": True,
         "actuator_rate_limited": True,
+        "training_objective": (
+            "frontier_distance_discovery"
+            if args.discovery_mode
+            else "completed_lap_frontier_robustification"
+            if args.robustify_frontier
+            else "robust_policy_improvement"
+        ),
+        "discovery": {
+            "enabled": bool(args.discovery_mode),
+            "source_frontier_evidence_distance_m": (
+                frontier_evidence_distance_m(
+                    source_metadata,
+                    args.frontier_verified_evidence,
+                )
+                if args.discovery_mode
+                else None
+            ),
+            "source_frontier_evidence": (
+                copy.deepcopy(args.frontier_verified_evidence)
+                if args.discovery_mode
+                else None
+            ),
+            "frontier_evidence_path": str(args.frontier_evidence_path),
+            "frontier_model_path": str(args.frontier_model_path),
+            "frontier_checkpoint_dir": str(args.frontier_checkpoint_dir),
+            "milestones_m": list(args.frontier_milestones_m),
+            "minimum_record_improvement_m": args.frontier_min_improvement_m,
+            "major_breakthrough_improvement_m": (
+                args.frontier_major_breakthrough_m
+            ),
+            "routine_internal_robustness_probes": not args.discovery_mode,
+            "safe_actor_rollback": False,
+            "trajectory_gate": {
+                "protocol": FRONTIER_CONTINUATION_PROTOCOL,
+                "enabled": bool(
+                    args.discovery_mode
+                    and not lean_frontier_training_enabled(args)
+                ),
+                "qualification_enabled": bool(
+                    args.frontier_qualification_enabled
+                ),
+                "qualification_distance_m": (
+                    args.frontier_qualification_distance_m
+                ),
+                "qualification_attempts": args.frontier_qualification_attempts,
+                "qualification_result": None,
+                "exploration_start_distance_m": (
+                    args.frontier_exploration_start_distance_m
+                ),
+                "source_actor_frozen_during_qualification": True,
+                "replay_refill_action_noise_sigma": (
+                    args.action_noise_sigma
+                    if lean_frontier_training_enabled(args)
+                    else 0.0
+                ),
+                "critic_warmup_action_noise_sigma": (
+                    args.action_noise_sigma
+                    if lean_frontier_training_enabled(args)
+                    else 0.0
+                ),
+                "critic_may_learn_before_frontier": True,
+                "actor_updates_before_frontier": lean_frontier_training_enabled(args),
+                "exploration_before_frontier": lean_frontier_training_enabled(args),
+                "optimisation_boundary": (
+                    "environment_step"
+                    if lean_frontier_training_enabled(args)
+                    else "completed_episode"
+                ),
+                "frozen_policy_health_fraction": (
+                    DEFAULT_FROZEN_POLICY_HEALTH_FRACTION
+                ),
+                "frozen_policy_health_failures": (
+                    DEFAULT_FROZEN_POLICY_HEALTH_FAILURES
+                ),
+                "learning_source": "reward_only",
+                "behaviour_cloning": False,
+                "trajectory_imitation": False,
+            },
+            "collapse_recovery": {
+                "enabled": bool(
+                    args.discovery_mode
+                    and not lean_frontier_training_enabled(args)
+                ),
+                "consecutive_failure_episodes": (
+                    args.discovery_collapse_episodes
+                ),
+                "failure_distance_m": args.discovery_collapse_distance_m,
+                "frontier_preservation_fraction": (
+                    args.discovery_frontier_preservation_fraction
+                ),
+                "effective_failure_distance_m": max(
+                    args.discovery_collapse_distance_m,
+                    args.frontier_exploration_start_distance_m
+                    * args.discovery_frontier_preservation_fraction,
+                ),
+                "base_actor_cooldown_steps": (
+                    args.discovery_recovery_cooldown_steps
+                ),
+                "maximum_actor_cooldown_steps": (
+                    args.discovery_max_recovery_cooldown_steps
+                ),
+                "actor_learning_rate_backoff": (
+                    args.discovery_actor_lr_backoff
+                ),
+                "minimum_actor_learning_rate_scale": (
+                    args.discovery_min_actor_lr_scale
+                ),
+                "maximum_effective_policy_delay": (
+                    args.discovery_max_policy_delay
+                ),
+                "restore_scope": "actor_target_and_actor_optimizer_only",
+                "critic_and_replay_preserved": True,
+            },
+            "legacy_exploration_noise": (
+                "correlated_steer_and_antisymmetric_longitudinal"
+                if training_uses_legacy_action_contract(args)
+                else None
+            ),
+            "pre_actor_exploration_noise": (
+                "none_before_frontier_gate"
+                if args.discovery_mode
+                else "seeded_correlated_steering_only"
+                if args.continuation
+                else None
+            ),
+            "lightweight_screen": (
+                "completed_policy_controlled_training_episode_with_forward_progress"
+            ),
+            "strict_evaluation_trigger": (
+                "new_distance_milestone_configured_frontier_gain_or_completed_lap"
+            ),
+            "strict_evaluation_timing": "after_training_torcs_shutdown",
+            "robust_champion_is_independent": True,
+            "frontier_is_not_a_robustness_claim": True,
+        },
+        "robustify_frontier": bool(args.robustify_frontier),
         "action_contract": (
             {
                 "outputs": ["steer", "throttle", "brake"],
@@ -1516,12 +1708,14 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "reward_contract": {
             "version": REWARD_VERSION,
-            "low_speed_creep_bonus": False,
-            "clear_track_anti_stall_penalty": True,
-            "sector_milestones_rewarded_once_per_episode": {
-                str(int(distance)): reward
-                for distance, reward in SECTOR_PROGRESS_MILESTONE_REWARDS.items()
-            },
+            "speed_input_unit": "km/h converted to m/s before reward",
+            "track_position_input": "normalized TORCS trackPos; +/-1 is edge",
+            "forward_speed_scale": 0.10,
+            "soft_track_edge_start": 0.8,
+            "nonterminal_clip": [-10.0, 5.0],
+            "physical_failure_reward": -25.0,
+            "curriculum_changes_reward": False,
+            "sector_milestones_affect_reward": False,
             "logged_components": [
                 column.removeprefix("reward_")
                 for column in STEP_COLUMNS
@@ -1559,12 +1753,18 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
                 str(source_path) if source_path is not None else None
             ),
             "exact_resume": bool(args.resume_exact_from),
+            "exact_resume_budget_extension": copy.deepcopy(
+                getattr(args, "exact_resume_budget_extension", None)
+            ),
             "source_observation_version": source_metadata.get("observation_version"),
             "source_action_version": source_metadata.get("action_version"),
             "source_action_shape": source_metadata.get("action_shape"),
             "source_verified_evaluation_progress_m": source_progress_m,
             "source_verified_evaluation_minimum_progress_m": (
                 source_minimum_progress_m
+            ),
+            "source_verified_evaluation_maximum_progress_m": (
+                source_maximum_progress_m
             ),
             "source_policy_contract_migration": {
                 "required": action_contract_migration_required,
@@ -1604,6 +1804,18 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "fresh_replay_buffer": bool(
                 args.continuation and not args.resume_exact_from
             ),
+            "actor_only_transfer": bool(
+                args.continuation and not args.resume_exact_from
+            ),
+            "fresh_critic": bool(
+                args.continuation and not args.resume_exact_from
+            ),
+            "fresh_critic_target": bool(
+                args.continuation and not args.resume_exact_from
+            ),
+            "fresh_optimizers": bool(
+                args.continuation and not args.resume_exact_from
+            ),
             "replay_refill_steps": args.replay_refill_steps,
             "replay_refill_uses_loaded_policy": args.continuation,
             "replay_refill_freezes_gradient_updates": args.continuation,
@@ -1632,6 +1844,9 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "qualified_candidate_validation": {
                 "automatic": True,
                 "completed_lap_freezes_actor_immediately": True,
+                "breakthrough_freezes_actor_immediately": True,
+                "completed_candidate_blocks_receive_seeded_screen": True,
+                "noisy_training_evidence_is_advisory": True,
                 "uses_rotating_internal_training_seeds": True,
                 "uses_external_evaluation_seeds": False,
             },
@@ -1680,6 +1895,10 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "minimum_evidence_episodes": args.probe_min_evidence_episodes,
             "evidence_maximum_median_regression_m": (
                 args.probe_evidence_max_regression_m
+            ),
+            "breakthrough_improvement_m": args.breakthrough_improvement_m,
+            "breakthrough_milestones_m": list(
+                SAFE_ACTOR_PROGRESS_MILESTONES_M
             ),
             "probe_pairing": (
                 "first_seed_short_ab_ba_collapse_screen_then_"
@@ -1773,6 +1992,11 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "probe_exhaustion_action": (
                 "defer_probe_freeze_actor_continue_critic_and_replay"
             ),
+            "end_of_budget_probe_drain": (
+                "finish_pending_safe_actor_comparison_only_when_each_next_"
+                "trial_fits_earned_probe_capacity"
+            ),
+            "training_target_episode_boundary": "truncate_without_curriculum_credit",
             "learning_rate_and_noise_schedules_use_training_steps": True,
             "checkpoints_use_training_steps": True,
         },
@@ -1789,6 +2013,8 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
         "best_completed_lap_model_path": str(
             args.best_completed_lap_model_path
         ),
+        "frontier_model_path": str(args.frontier_model_path),
+        "frontier_checkpoint_dir": str(args.frontier_checkpoint_dir),
         "lap_checkpoint_dir": str(args.lap_checkpoint_dir),
         "automatic_evaluation": {
             "enabled": bool(args.end_of_run_evaluation),
@@ -1815,6 +2041,11 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "brake_probability": args.warmup_brake_probability,
         },
         "td3_hyperparameters": {
+            "optimizer_protocol": (
+                "stable_frontier_td3_v1"
+                if lean_frontier_training_enabled(args)
+                else "legacy_phased_td3"
+            ),
             "buffer_size": args.buffer_size,
             "learning_starts": args.learning_starts,
             "policy_action_starts_at_timestep": policy_action_start_timestep(args),
@@ -1827,23 +2058,61 @@ def make_training_metadata(args: argparse.Namespace) -> dict[str, Any]:
             "learning_rate": args.learning_rate,
             "learning_rate_final": args.learning_rate_final,
             "critic_learning_rate_schedule": "linear_after_replay_refill",
+            "critic_loss": (
+                "smooth_l1_beta_1.0"
+                if lean_frontier_training_enabled(args)
+                else "smooth_l1"
+            ),
+            "critic_gradient_clip_norm": LEAN_FRONTIER_GRADIENT_NORM,
             "learning_rate_decay_starts_at_timestep": (
                 gradient_update_start_timestep(args)
             ),
             "actor_learning_rate": args.actor_learning_rate,
             "actor_learning_rate_final": args.actor_learning_rate_final,
-            "actor_learning_rate_schedule": "frozen_then_linear_ramp_and_decay",
+            "actor_learning_rate_schedule": (
+                "frozen_then_constant"
+                if lean_frontier_training_enabled(args)
+                else "frozen_then_linear_ramp_and_decay"
+            ),
+            "actor_gradient_clip_norm": args.safe_actor_gradient_norm,
             "critic_warmup_steps": args.critic_warmup_steps,
+            "critic_warmup_unit": (
+                "successful_critic_optimizer_updates"
+                if lean_frontier_training_enabled(args)
+                else "environment_steps"
+            ),
             "actor_unfreeze_steps": args.actor_unfreeze_steps,
             "safe_actor_improvement": args.safe_actor_improvement,
             "train_freq": args.train_freq,
+            "train_freq_unit": (
+                "step" if lean_frontier_training_enabled(args) else "episode"
+            ),
             "gradient_steps": args.gradient_steps,
+            "live_episode_gradient_updates": lean_frontier_training_enabled(args),
+            "episode_atomic_policy": not lean_frontier_training_enabled(args),
+            "offline_optimizer_torcs_suspension": bool(
+                args.continuation and not lean_frontier_training_enabled(args)
+            ),
+            "time_limit_bootstrapping": (
+                "bootstrap_on_truncation_stop_on_physical_failure"
+            ),
             "policy_delay": args.policy_delay,
             "target_policy_noise": args.target_policy_noise,
             "target_noise_clip": args.target_noise_clip,
             "action_noise_initial_sigma": args.action_noise_sigma,
             "action_noise_final_sigma": args.action_noise_final_sigma,
             "action_noise_decay_steps": args.action_noise_decay_steps,
+            "action_noise_rng": "isolated_seeded_numpy_generator",
+            "action_noise_seed_schedule": "base_seed_plus_golden_ratio_stride",
+            "action_noise_independent_from_replay_sampling": True,
+            "frontier_conditioned_exploration": bool(
+                args.discovery_mode and not lean_frontier_training_enabled(args)
+            ),
+            "frontier_exploration_start_distance_m": (
+                args.frontier_exploration_start_distance_m
+                if args.discovery_mode and not lean_frontier_training_enabled(args)
+                else None
+            ),
             "net_arch": args.net_arch,
             "device": args.device,
         },
@@ -1995,6 +2264,8 @@ def make_training_env_class(gym: Any, spaces: Any):
             self.stage_index = curriculum_stage_index(initial_stage_id)
             self.pre_update_training_phase = str(pre_update_training_phase)
             self.training_phase = self.pre_update_training_phase
+            self.discovery_frontier_gate_open = False
+            self.discovery_frontier_gate_distance_m = 0.0
             self.stage_success_streak = 0
             self.stage_success_totals = {
                 stage.stage_id: 0
@@ -2135,6 +2406,8 @@ def make_training_env_class(gym: Any, spaces: Any):
             safe_actor_trials_per_seed: int | None = None,
             safe_actor_probe_stage: str | None = None,
             safe_actor_probe_order_position: int | None = None,
+            discovery_frontier_gate_open: bool = False,
+            discovery_frontier_gate_distance_m: float = 0.0,
         ) -> None:
             self.deterministic_probe = bool(deterministic_probe)
             self.safe_actor_candidate_probe = bool(
@@ -2176,6 +2449,13 @@ def make_training_env_class(gym: Any, spaces: Any):
             )
             self.action_noise_sigma = max(0.0, float(action_noise_sigma))
             self.training_phase = str(training_phase)
+            self.discovery_frontier_gate_open = bool(
+                discovery_frontier_gate_open
+            )
+            self.discovery_frontier_gate_distance_m = max(
+                0.0,
+                finite_float(discovery_frontier_gate_distance_m),
+            )
 
         def accept_safe_actor_probe(
             self,
@@ -2369,6 +2649,11 @@ def make_training_env_class(gym: Any, spaces: Any):
                 or backwards
                 or stuck
             )
+            physical_failure = bool(
+                terminal_failure
+                and completed_lap is None
+                and not stage_success
+            )
             reward_components = calculate_td3_reward_components(
                 telemetry,
                 action,
@@ -2381,7 +2666,7 @@ def make_training_env_class(gym: Any, spaces: Any):
                 completed_lap=completed_lap,
                 stage_success=stage_success,
                 stuck=stuck,
-                terminal_failure=terminal_failure,
+                terminal_failure=physical_failure,
             )
             reward = reward_components["total"]
 
@@ -2418,7 +2703,15 @@ def make_training_env_class(gym: Any, spaces: Any):
                 and episode_step_limit < self.current_stage.max_episode_steps
                 and self.steps >= episode_step_limit
             )
-            truncated = self.steps >= episode_step_limit
+            training_budget_boundary_reached = bool(
+                self.training_budget_state is not None
+                and not self.deterministic_probe
+                and self.training_budget_state.reaches_training_boundary()
+            )
+            truncated = bool(
+                self.steps >= episode_step_limit
+                or training_budget_boundary_reached
+            )
             policy_controlled = episode_is_policy_controlled(
                 self.episode_start_timestep,
                 self.learning_starts,
@@ -2426,7 +2719,10 @@ def make_training_env_class(gym: Any, spaces: Any):
             curriculum_eligible = episode_is_curriculum_eligible(
                 policy_controlled=policy_controlled,
                 deterministic_probe=self.deterministic_probe,
-            ) and not self.safe_actor_candidate_probe
+            ) and not (
+                self.safe_actor_candidate_probe
+                or training_budget_boundary_reached
+            )
             applied_action_noise_sigma = (
                 None
                 if not policy_controlled
@@ -2498,6 +2794,8 @@ def make_training_env_class(gym: Any, spaces: Any):
                     reason = "stuck"
                 elif done:
                     reason = "torcs_done"
+                elif training_budget_boundary_reached:
+                    reason = "training_budget_reached"
                 elif screening_horizon_reached:
                     reason = "safe_actor_screening_horizon"
 
@@ -2527,6 +2825,12 @@ def make_training_env_class(gym: Any, spaces: Any):
                 "curriculum_eligible": curriculum_eligible,
                 "training_phase": self.training_phase,
                 "action_noise_sigma": applied_action_noise_sigma,
+                "discovery_frontier_gate_open": (
+                    self.discovery_frontier_gate_open
+                ),
+                "discovery_frontier_gate_distance_m": (
+                    self.discovery_frontier_gate_distance_m
+                ),
                 "stage_id": self.current_stage.stage_id,
                 "stage_name": self.current_stage.name,
                 "distance_m": self.episode_furthest_distance,
@@ -2537,6 +2841,11 @@ def make_training_env_class(gym: Any, spaces: Any):
                 "lap_completion_fraction": calculate_lap_completion_fraction(
                     self.episode_furthest_distance
                 ),
+                "training_budget_boundary_reached": (
+                    training_budget_boundary_reached
+                ),
+                "physical_failure": physical_failure,
+                "TimeLimit.truncated": bool(truncated and not terminated),
                 "termination_reason": reason,
             }
             if terminated or truncated:
@@ -2636,6 +2945,12 @@ def make_training_env_class(gym: Any, spaces: Any):
                 "curriculum_eligible": curriculum_eligible,
                 "training_phase": self.training_phase,
                 "action_noise_sigma": applied_action_noise_sigma,
+                "discovery_frontier_gate_open": (
+                    self.discovery_frontier_gate_open
+                ),
+                "discovery_frontier_gate_distance_m": (
+                    self.discovery_frontier_gate_distance_m
+                ),
                 "stage_id": self.current_stage.stage_id,
                 "stage_name": self.current_stage.name,
                 "steps": self.steps,
@@ -2695,7 +3010,10 @@ def make_training_env_class(gym: Any, spaces: Any):
                         self._restart_torcs()
                     assert self.runner.env is not None
                     with maybe_suppress_stdout(self.quiet_reset_log):
-                        return self.runner.env.reset(relaunch=relaunch)
+                        # Process ownership belongs to TorcsRunner. Passing the
+                        # relaunch request into gym_torcs invokes its legacy
+                        # shell-based path as well as the managed restart above.
+                        return self.runner.env.reset(relaunch=False)
                 except Exception as exc:
                     last_error = exc
                     if attempt >= self.reset_retries:
@@ -2717,19 +3035,49 @@ def make_training_env_class(gym: Any, spaces: Any):
             self._launch_and_connect_torcs()
 
         def _launch_and_connect_torcs(self) -> None:
-            if not self.manual_start:
-                self.runner.launch()
-            self.runner.connect()
-            self.runner.load_track(self.track_name)
+            last_error: Exception | None = None
+            for attempt in range(self.reset_retries + 1):
+                try:
+                    if not self.manual_start:
+                        self.runner.launch()
+                    self.runner.connect()
+                    self.runner.load_track(self.track_name)
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    self._close_torcs_env()
+                    if not self.manual_start:
+                        self.runner.shutdown()
+                    if attempt >= self.reset_retries:
+                        break
+                    print(
+                        "TORCS connection failed; restarting simulator "
+                        f"[{attempt + 2}/{self.reset_retries + 1}]..."
+                    )
+                    time.sleep(1.0)
+            raise RuntimeError(
+                "TORCS launch/connect failed after "
+                f"{self.reset_retries + 1} attempts"
+            ) from last_error
 
         def _close_torcs_env(self) -> None:
-            if self.runner.env is None:
+            torcs_env = self.runner.env
+            if torcs_env is None:
                 return
-            try:
-                self.runner.env.end()
-            except Exception:
-                pass
             self.runner.env = None
+            client = getattr(torcs_env, "client", None)
+            shutdown_client = getattr(client, "shutdown", None)
+            if callable(shutdown_client):
+                with contextlib.suppress(Exception):
+                    shutdown_client()
+            with contextlib.suppress(Exception):
+                torcs_env.end()
+
+        def suspend_torcs_for_offline_updates(self) -> None:
+            """Release the live simulator before an episode-boundary replay batch."""
+            self._close_torcs_env()
+            if not self.manual_start:
+                self.runner.shutdown()
 
         def _build_observation(self) -> np.ndarray:
             if self.current_telemetry is None:
@@ -2817,27 +3165,9 @@ def make_training_env_class(gym: Any, spaces: Any):
                     action["brake"],
                     action["gear"],
                     reward,
-                    reward_components.get("progress", 0.0),
-                    reward_components.get("aligned_speed", 0.0),
-                    reward_components.get("new_distance", 0.0),
-                    reward_components.get("sector_milestone_bonus", 0.0),
-                    reward_components.get("stable_progress_bonus", 0.0),
-                    reward_components.get("survival_cost", 0.0),
-                    reward_components.get("lateral_position_penalty", 0.0),
-                    reward_components.get("angle_penalty", 0.0),
-                    reward_components.get("lateral_speed_penalty", 0.0),
-                    reward_components.get("speed_steer_penalty", 0.0),
-                    reward_components.get("spin_penalty", 0.0),
-                    reward_components.get("closing_danger_penalty", 0.0),
-                    reward_components.get("clear_track_anti_stall_penalty", 0.0),
-                    reward_components.get("stalled_penalty", 0.0),
-                    reward_components.get("off_track_penalty", 0.0),
-                    reward_components.get("crash_penalty", 0.0),
-                    reward_components.get("backwards_penalty", 0.0),
-                    reward_components.get("stuck_penalty", 0.0),
-                    reward_components.get("terminal_failure_penalty", 0.0),
-                    reward_components.get("stage_success_bonus", 0.0),
-                    reward_components.get("lap_completion_bonus", 0.0),
+                    reward_components.get("forward_speed", 0.0),
+                    reward_components.get("track_edge_penalty", 0.0),
+                    reward_components.get("terminal_failure", 0.0),
                     terminated,
                     truncated,
                     reason,
@@ -2867,10 +3197,14 @@ class TrainingProgressState:
         self.current_stage = str(row.get("stage_name") or self.current_stage)
 
     def record_best_distance(self, distance_m: float) -> None:
-        self.best_distance_m = float(distance_m)
+        candidate = float(distance_m)
+        if self.best_distance_m is None or candidate > self.best_distance_m:
+            self.best_distance_m = candidate
 
     def record_best_reward(self, reward: float) -> None:
-        self.best_reward = float(reward)
+        candidate = float(reward)
+        if self.best_reward is None or candidate > self.best_reward:
+            self.best_reward = candidate
 
 
 @dataclass
@@ -2951,6 +3285,17 @@ class ProbeBudgetController:
         completed = min(self.training_steps, self.target_training_steps)
         return 1.0 - completed / self.target_training_steps
 
+    @property
+    def training_budget_reached(self) -> bool:
+        return self.training_steps >= self.target_training_steps
+
+    def reaches_training_boundary(self, additional_steps: int = 1) -> bool:
+        """Return whether a non-probe transition reaches the training target."""
+        return (
+            self.training_steps + max(1, int(additional_steps))
+            >= self.target_training_steps
+        )
+
     def record_infos(self, infos: list[Any] | tuple[Any, ...]) -> None:
         for info in infos:
             self.environment_steps += 1
@@ -2964,7 +3309,7 @@ class ProbeBudgetController:
         self._update_stop_reason()
 
     def _update_stop_reason(self) -> None:
-        if self.training_steps >= self.target_training_steps:
+        if self.training_budget_reached:
             self.stop_reason = "training_budget_reached"
         else:
             self.stop_reason = None
@@ -2972,15 +3317,50 @@ class ProbeBudgetController:
     def should_stop(self) -> bool:
         return self.stop_reason is not None
 
-    def restore(self, state: Mapping[str, Any]) -> None:
+    def restore(
+        self,
+        state: Mapping[str, Any],
+        *,
+        allow_budget_extension: bool = False,
+    ) -> None:
         saved_target = max(
             1,
             int(finite_float(state.get("target_training_steps"), 1.0)),
         )
-        if saved_target != self.target_training_steps:
+        saved_maximum_probe_steps = max(
+            0,
+            int(finite_float(state.get("maximum_probe_steps"))),
+        )
+        saved_maximum_probe_fraction = finite_float(
+            state.get("maximum_probe_fraction"),
+            DEFAULT_MAX_PROBE_FRACTION,
+        )
+        target_matches = saved_target == self.target_training_steps
+        probe_ceiling_matches = (
+            saved_maximum_probe_steps == self.maximum_probe_steps
+        )
+        fraction_matches = math.isclose(
+            saved_maximum_probe_fraction,
+            self.maximum_probe_fraction,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        valid_extension = bool(
+            allow_budget_extension
+            and self.target_training_steps >= saved_target
+            and self.maximum_probe_steps >= saved_maximum_probe_steps
+            and fraction_matches
+        )
+        if not (
+            fraction_matches
+            and ((target_matches and probe_ceiling_matches) or valid_extension)
+        ):
             raise ValueError(
-                "exact-resume training target mismatch: expected "
-                f"{self.target_training_steps}, found {saved_target}"
+                "exact-resume budget mismatch: current target/probe/fraction "
+                f"{self.target_training_steps}/{self.maximum_probe_steps}/"
+                f"{self.maximum_probe_fraction:.6f}, saved "
+                f"{saved_target}/{saved_maximum_probe_steps}/"
+                f"{saved_maximum_probe_fraction:.6f}"
             )
         self.training_steps = max(
             0,
@@ -3025,6 +3405,92 @@ class ProbeBudgetController:
 
 # Kept as an API alias for existing analysis scripts and saved run tooling.
 TrainingBudgetState = ProbeBudgetController
+
+
+def resolve_exact_resume_budget(
+    state: Mapping[str, Any],
+    *,
+    additional_training_steps: int,
+    requested_maximum_probe_steps: int | None,
+) -> dict[str, int | float]:
+    """Extend a checkpoint budget monotonically while preserving its ratio cap."""
+    extension = int(additional_training_steps)
+    if extension < 0:
+        raise ValueError("additional training steps cannot be negative")
+    saved_target = max(
+        1,
+        int(finite_float(state.get("target_training_steps"), 1.0)),
+    )
+    saved_probe_ceiling = max(
+        0,
+        int(finite_float(state.get("maximum_probe_steps"))),
+    )
+    saved_probe_fraction = finite_float(
+        state.get("maximum_probe_fraction"),
+        DEFAULT_MAX_PROBE_FRACTION,
+    )
+    if not 0.0 < saved_probe_fraction <= DEFAULT_MAX_PROBE_FRACTION:
+        raise ValueError("saved exact-resume probe fraction is invalid")
+
+    added_probe_capacity = int(
+        math.floor(
+            extension
+            * saved_probe_fraction
+            / (1.0 - saved_probe_fraction)
+        )
+    )
+    if requested_maximum_probe_steps is None:
+        probe_ceiling = saved_probe_ceiling + added_probe_capacity
+    else:
+        probe_ceiling = int(requested_maximum_probe_steps)
+        if probe_ceiling < saved_probe_ceiling:
+            raise ValueError(
+                "exact-resume probe ceiling cannot be lower than the saved "
+                f"ceiling ({saved_probe_ceiling:,})"
+            )
+
+    return {
+        "saved_training_target_steps": saved_target,
+        "additional_training_steps": extension,
+        "target_training_steps": saved_target + extension,
+        "saved_maximum_probe_steps": saved_probe_ceiling,
+        "added_probe_capacity_steps": added_probe_capacity,
+        "maximum_probe_steps": probe_ceiling,
+        "maximum_probe_fraction": saved_probe_fraction,
+    }
+
+
+def training_breakthrough_reasons(
+    distance_m: float,
+    *,
+    reference_maximum_distance_m: float,
+    minimum_improvement_m: float = DEFAULT_BREAKTHROUGH_IMPROVEMENT_M,
+    progress_milestones_m: tuple[float, ...] = (
+        SAFE_ACTOR_PROGRESS_MILESTONES_M
+    ),
+    completed_lap: bool = False,
+) -> tuple[str, ...]:
+    """Classify a frontier result that merits immediate matched validation."""
+    if completed_lap:
+        return ("lap_completion",)
+    distance = max(0.0, finite_float(distance_m))
+    reference = max(0.0, finite_float(reference_maximum_distance_m))
+    required_gain = max(0.0, finite_float(minimum_improvement_m))
+    reasons: list[str] = []
+    if distance >= reference + required_gain:
+        reasons.append("furthest_distance")
+    new_milestones = tuple(
+        sorted(
+            {
+                float(milestone)
+                for milestone in progress_milestones_m
+                if reference < float(milestone) <= distance
+            }
+        )
+    )
+    if new_milestones:
+        reasons.append("new_sector_milestone")
+    return tuple(reasons)
 
 
 def training_progress_is_credible(
@@ -3077,13 +3543,15 @@ def run_continuation_compatibility_probe(
     minimum_distance_m: float,
     training_budget_state: TrainingBudgetState | None = None,
     seed: int | None = None,
+    raise_on_failure: bool = True,
+    training_phase: str = "continuation_compatibility_probe",
 ) -> dict[str, Any]:
     """Verify the loaded policy in TORCS before replay collection or updates."""
     minimum_distance = max(0.0, finite_float(minimum_distance_m))
     raw_env.set_policy_mode(
         deterministic_probe=True,
         action_noise_sigma=0.0,
-        training_phase="continuation_compatibility_probe",
+        training_phase=training_phase,
     )
     try:
         observation, _reset_info = raw_env.reset(seed=seed)
@@ -3142,7 +3610,7 @@ def run_continuation_compatibility_probe(
             "deterministic": True,
             "seed": seed,
         }
-        if not result["passed"]:
+        if not result["passed"] and raise_on_failure:
             raise RuntimeError(
                 "continuation compatibility probe failed before training: "
                 f"reached {distance_m:.1f}m, required {minimum_distance:.1f}m. "
@@ -3155,6 +3623,59 @@ def run_continuation_compatibility_probe(
             action_noise_sigma=0.0,
             training_phase="replay_refill",
         )
+
+
+def run_frontier_source_qualification(
+    model: Any,
+    raw_env: Any,
+    *,
+    minimum_distance_m: float,
+    maximum_attempts: int,
+    training_budget_state: TrainingBudgetState | None = None,
+    base_seed: int = 0,
+) -> dict[str, Any]:
+    """Admit discovery only after the frozen source reproduces its frontier."""
+    required_distance_m = max(0.0, finite_float(minimum_distance_m))
+    attempts_requested = max(1, int(maximum_attempts))
+    attempts: list[dict[str, Any]] = []
+    for attempt_index in range(attempts_requested):
+        seed = (int(base_seed) + attempt_index) % (MAX_REPRODUCIBLE_SEED + 1)
+        result = run_continuation_compatibility_probe(
+            model,
+            raw_env,
+            minimum_distance_m=required_distance_m,
+            training_budget_state=training_budget_state,
+            seed=seed,
+            raise_on_failure=False,
+            training_phase="frontier_source_qualification",
+        )
+        result["attempt_index"] = attempt_index + 1
+        attempts.append(result)
+        if bool(result["passed"]):
+            return {
+                "protocol": FRONTIER_CONTINUATION_PROTOCOL,
+                "passed": True,
+                "minimum_distance_m": required_distance_m,
+                "best_distance_m": max(
+                    finite_float(item.get("distance_m")) for item in attempts
+                ),
+                "attempts_requested": attempts_requested,
+                "attempts_completed": len(attempts),
+                "successful_attempt": attempt_index + 1,
+                "actor_frozen": True,
+                "action_noise_sigma": 0.0,
+                "gradient_updates": 0,
+                "attempts": attempts,
+            }
+
+    distances = ", ".join(
+        f"{finite_float(item.get('distance_m')):.1f}m" for item in attempts
+    )
+    raise RuntimeError(
+        "frontier source qualification failed before training: the frozen "
+        f"actor reached [{distances}], but must reproduce "
+        f"{required_distance_m:.1f}m. No replay or gradient training was started."
+    )
 
 
 def format_duration(seconds: float | None) -> str:
@@ -3282,6 +3803,7 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             pre_update_training_phase: str = "warmup",
             actor_update_start: int | None = None,
             actor_full_unfreeze: int | None = None,
+            pre_actor_noise_factory: Any = None,
             safe_probe_noise_factory: Any = None,
             safe_probe_noise_std: float = DEFAULT_SAFE_ACTOR_PROBE_NOISE_STD,
             training_budget_state: TrainingBudgetState | None = None,
@@ -3292,6 +3814,15 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             ),
             probe_evidence_max_regression_m: float = (
                 DEFAULT_PROBE_EVIDENCE_MAX_REGRESSION_M
+            ),
+            regular_probes_enabled: bool = True,
+            frontier_exploration_start_distance_m: float = 0.0,
+            frozen_policy_baseline_distance_m: float = 0.0,
+            frozen_policy_health_fraction: float = (
+                DEFAULT_FROZEN_POLICY_HEALTH_FRACTION
+            ),
+            frozen_policy_health_failures: int = (
+                DEFAULT_FROZEN_POLICY_HEALTH_FAILURES
             ),
         ) -> None:
             super().__init__(verbose=0)
@@ -3314,6 +3845,7 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                 if actor_full_unfreeze is None
                 else max(self.actor_update_start, int(actor_full_unfreeze))
             )
+            self.pre_actor_noise_factory = pre_actor_noise_factory
             self.safe_probe_noise_factory = safe_probe_noise_factory
             self.safe_probe_noise_std = max(0.0, float(safe_probe_noise_std))
             self.training_budget_state = training_budget_state
@@ -3330,6 +3862,30 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                 0.0,
                 finite_float(probe_evidence_max_regression_m),
             )
+            self.regular_probes_enabled = bool(regular_probes_enabled)
+            self.frontier_exploration_start_distance_m = max(
+                0.0,
+                finite_float(frontier_exploration_start_distance_m),
+            )
+            self.frontier_gate_enabled = bool(
+                self.frontier_exploration_start_distance_m > 0.0
+            )
+            self.frontier_gate_open = False
+            self.frozen_policy_baseline_distance_m = max(
+                0.0,
+                finite_float(frozen_policy_baseline_distance_m),
+            )
+            self.frozen_policy_health_fraction = clamp(
+                finite_float(frozen_policy_health_fraction),
+                0.01,
+                1.0,
+            )
+            self.frozen_policy_health_failures = max(
+                1,
+                int(frozen_policy_health_failures),
+            )
+            self.frozen_policy_health_failure_streak = 0
+            self.frozen_policy_health_failure_reason: str | None = None
             self.recent_training_distances_m: list[float] = []
             self.recent_training_completed_lap = False
             self.probe_episodes_completed = 0
@@ -3339,6 +3895,10 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             self._restored_state = False
 
         def _on_training_start(self):
+            # TORCS resumes at a new episode, so exact-resume state cannot carry
+            # an open within-episode frontier gate across process boundaries.
+            self._set_frontier_gate_open(False)
+            self._set_model_episode_actor_eligible(False)
             self._apply_policy_mode(
                 deterministic_probe=(
                     self.current_episode_is_probe if self._restored_state else False
@@ -3364,6 +3924,23 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                 "probe_evidence_max_regression_m": (
                     self.probe_evidence_max_regression_m
                 ),
+                "regular_probes_enabled": self.regular_probes_enabled,
+                "frontier_exploration_start_distance_m": (
+                    self.frontier_exploration_start_distance_m
+                ),
+                "frontier_gate_enabled": self.frontier_gate_enabled,
+                "frontier_gate_open": self.frontier_gate_open,
+                "frozen_policy_baseline_distance_m": (
+                    self.frozen_policy_baseline_distance_m
+                ),
+                "frozen_policy_health_fraction": self.frozen_policy_health_fraction,
+                "frozen_policy_health_failures": self.frozen_policy_health_failures,
+                "frozen_policy_health_failure_streak": (
+                    self.frozen_policy_health_failure_streak
+                ),
+                "frozen_policy_health_failure_reason": (
+                    self.frozen_policy_health_failure_reason
+                ),
                 "probe_reference_distance_m": self.probe_reference_distance_m,
                 "recent_training_distances_m": list(
                     self.recent_training_distances_m
@@ -3387,6 +3964,7 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                 "actor_full_unfreeze",
                 "probe_evidence_window",
                 "probe_min_evidence_episodes",
+                "frozen_policy_health_failures",
             )
             for name in integer_fields:
                 if state.get(name) is not None:
@@ -3396,6 +3974,9 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                 "final_sigma",
                 "safe_probe_noise_std",
                 "probe_evidence_max_regression_m",
+                "frontier_exploration_start_distance_m",
+                "frozen_policy_baseline_distance_m",
+                "frozen_policy_health_fraction",
             )
             for name in float_fields:
                 if state.get(name) is not None:
@@ -3404,6 +3985,25 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                 self.pre_update_training_phase = str(
                     state["pre_update_training_phase"]
                 )
+            if state.get("regular_probes_enabled") is not None:
+                self.regular_probes_enabled = bool(
+                    state["regular_probes_enabled"]
+                )
+            if state.get("frontier_gate_enabled") is not None:
+                self.frontier_gate_enabled = bool(state["frontier_gate_enabled"])
+            self.frontier_gate_open = bool(state.get("frontier_gate_open", False))
+            self.frozen_policy_health_failure_streak = max(
+                0,
+                int(
+                    finite_float(
+                        state.get("frozen_policy_health_failure_streak"),
+                    )
+                ),
+            )
+            restored_health_reason = state.get("frozen_policy_health_failure_reason")
+            self.frozen_policy_health_failure_reason = (
+                str(restored_health_reason) if restored_health_reason else None
+            )
             self.probe_reference_distance_m = max(
                 0.0,
                 finite_float(state.get("probe_reference_distance_m")),
@@ -3440,9 +4040,11 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
 
         def _on_step(self):
             completed_episode = False
+            health_abort_requested = False
             infos = self.locals.get("infos", [])
             if self.training_budget_state is not None:
                 self.training_budget_state.record_infos(infos)
+            self._update_frontier_gate(infos)
             for info in infos:
                 summary = info.get("episode_summary") if isinstance(info, dict) else None
                 if summary is None:
@@ -3461,6 +4063,10 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                         self.training_budget_state.deferred_probe_requests
                     )
                 completed_episode = True
+                health_abort_requested = bool(
+                    self._record_frozen_policy_health(summary)
+                    or health_abort_requested
+                )
                 if bool(summary.get("policy_controlled")):
                     if bool(summary.get("deterministic_probe")):
                         safe_result = self._record_safe_actor_probe(summary)
@@ -3470,16 +4076,29 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                             self._record_regular_probe_result(summary)
                         self.probe_episodes_completed += 1
                         self.policy_episodes_since_probe = 0
-                    else:
+                    elif not bool(
+                        summary.get("training_budget_boundary_reached")
+                    ):
                         self.policy_episodes_since_probe += 1
+                        self._record_discovery_recovery(summary)
                         self._record_training_evidence(summary)
 
             if completed_episode:
+                completed_episode_was_probe = self.current_episode_is_probe
+                self._set_model_episode_actor_eligible(
+                    bool(
+                        self.frontier_gate_open
+                        and not completed_episode_was_probe
+                    )
+                )
+                self._set_frontier_gate_open(False)
                 next_episode_is_probe = self._next_episode_should_probe()
                 self._apply_policy_mode(
                     deterministic_probe=next_episode_is_probe,
                     force=True,
                 )
+                if completed_episode_was_probe:
+                    self.model.gradient_steps = 0
             elif self.current_episode_is_probe:
                 # The first probe action is selected after the preceding rollout's
                 # final update. Freeze from this point until the probe terminates.
@@ -3495,9 +4114,16 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                 >= ACTION_NOISE_UPDATE_INTERVAL_STEPS
             ):
                 self._apply_policy_mode(deterministic_probe=False, force=False)
-            return not (
-                self.training_budget_state is not None
-                and self.training_budget_state.should_stop()
+            if health_abort_requested:
+                self.model.gradient_steps = 0
+                return False
+            if self.training_budget_state is None:
+                return True
+            if not self.training_budget_state.should_stop():
+                return True
+            return bool(
+                self.current_episode_is_probe
+                and self._safe_actor_probe_required()
             )
 
         def _on_training_end(self):
@@ -3517,7 +4143,10 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                 final_sigma=self.final_sigma,
                 decay_steps=self.decay_steps,
             )
-            self.model.action_noise = self.noise_factory(sigma)
+            self._set_frontier_gate_open(False)
+            self.model.action_noise = None if self.frontier_gate_enabled else (
+                self._training_noise(sigma)
+            )
             self.model.gradient_steps = self.training_gradient_steps
 
         def _apply_policy_mode(
@@ -3542,6 +4171,9 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             if safe_probe_requested and safe_context is None:
                 deterministic_probe = False
             safe_actor_probe = safe_context is not None
+            training_noise_enabled = bool(
+                not self.frontier_gate_enabled or self.frontier_gate_open
+            )
             mode_changed = deterministic_probe != self.current_episode_is_probe
             if force or mode_changed or not deterministic_probe:
                 if safe_actor_probe:
@@ -3557,8 +4189,13 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                         )
                 else:
                     self.model.action_noise = (
-                        None if deterministic_probe else self.noise_factory(sigma)
+                        None
+                        if deterministic_probe or not training_noise_enabled
+                        else self._training_noise(sigma)
                     )
+            self._set_model_frontier_gate(
+                bool(training_noise_enabled and not deterministic_probe)
+            )
             self.model.gradient_steps = (
                 0
                 if self._budget_timestep() < self.learning_starts
@@ -3581,7 +4218,11 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             self.raw_env.set_policy_mode(
                 deterministic_probe=deterministic_probe,
                 action_noise_sigma=(
-                    self.safe_probe_noise_std if safe_actor_probe else sigma
+                    self.safe_probe_noise_std
+                    if safe_actor_probe
+                    else sigma
+                    if training_noise_enabled and not deterministic_probe
+                    else 0.0
                 ),
                 training_phase=training_phase,
                 safe_actor_candidate_probe=safe_actor_probe,
@@ -3603,7 +4244,120 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                 safe_actor_probe_order_position=(
                     safe_context.get("order_position") if safe_context else None
                 ),
+                discovery_frontier_gate_open=(
+                    self.frontier_gate_open
+                    if self.frontier_gate_enabled
+                    else False
+                ),
+                discovery_frontier_gate_distance_m=(
+                    self.frontier_exploration_start_distance_m
+                    if self.frontier_gate_enabled
+                    else 0.0
+                ),
             )
+
+        def _update_frontier_gate(self, infos: Any) -> None:
+            if (
+                not self.frontier_gate_enabled
+                or self.current_episode_is_probe
+                or self.frontier_gate_open
+                or self._budget_timestep() < self.actor_update_start
+            ):
+                return
+            furthest_distance_m = 0.0
+            for info in infos:
+                if not isinstance(info, Mapping):
+                    continue
+                if bool(info.get("deterministic_probe")):
+                    continue
+                furthest_distance_m = max(
+                    furthest_distance_m,
+                    finite_float(info.get("distance_m")),
+                    finite_float(info.get("furthest_distance_m")),
+                )
+            if (
+                furthest_distance_m
+                < self.frontier_exploration_start_distance_m
+            ):
+                return
+            self._set_frontier_gate_open(True)
+            self._apply_policy_mode(deterministic_probe=False, force=True)
+
+        def _set_frontier_gate_open(self, value: bool) -> None:
+            self.frontier_gate_open = bool(
+                self.frontier_gate_enabled and value
+            )
+            self._set_model_frontier_gate(self.frontier_gate_open)
+
+        def _set_model_frontier_gate(self, value: bool) -> None:
+            setter = getattr(
+                self.model,
+                "set_discovery_frontier_gate_open",
+                None,
+            )
+            if callable(setter):
+                setter(bool(value))
+
+        def _set_model_episode_actor_eligible(self, value: bool) -> None:
+            setter = getattr(
+                self.model,
+                "set_discovery_episode_actor_eligible",
+                None,
+            )
+            if callable(setter):
+                setter(bool(value))
+
+        def _record_frozen_policy_health(self, summary: dict[str, Any]) -> bool:
+            threshold_m = (
+                self.frozen_policy_baseline_distance_m
+                * self.frozen_policy_health_fraction
+            )
+            monitoring = bool(
+                threshold_m > 0.0
+                and self._budget_timestep() < self.actor_update_start
+                and bool(summary.get("policy_controlled"))
+                and not bool(summary.get("deterministic_probe"))
+                and finite_float(summary.get("action_noise_sigma")) <= 0.0
+            )
+            if not monitoring:
+                return False
+
+            distance_m = max(
+                finite_float(summary.get("distance_m")),
+                finite_float(summary.get("furthest_distance_m")),
+            )
+            if distance_m >= threshold_m:
+                self.frozen_policy_health_failure_streak = 0
+                decision = "healthy"
+            else:
+                self.frozen_policy_health_failure_streak += 1
+                decision = "degraded"
+
+            abort_requested = bool(
+                self.frozen_policy_health_failure_streak
+                >= self.frozen_policy_health_failures
+            )
+            if abort_requested:
+                decision = "abort_before_actor_updates"
+                self.frozen_policy_health_failure_reason = (
+                    "frozen policy became unhealthy before actor updates: "
+                    f"{self.frozen_policy_health_failure_streak} consecutive "
+                    f"episodes below {threshold_m:.1f}m"
+                )
+            summary["frozen_policy_health_threshold_m"] = threshold_m
+            summary["frozen_policy_health_failure_streak"] = (
+                self.frozen_policy_health_failure_streak
+            )
+            summary["frozen_policy_health_decision"] = decision
+            return abort_requested
+
+        def _training_noise(self, sigma: float) -> Any:
+            if (
+                self.pre_actor_noise_factory is not None
+                and self._budget_timestep() < self.actor_update_start
+            ):
+                return self.pre_actor_noise_factory(sigma)
+            return self.noise_factory(sigma)
 
         def _budget_timestep(self) -> int:
             if self.training_budget_state is None:
@@ -3652,6 +4406,18 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             decision = str(result.get("decision") or "")
             if isinstance(summary, dict):
                 summary["safe_actor_training_evidence_decision"] = decision
+                summary["safe_actor_training_evidence_reasons"] = result.get(
+                    "evidence_reasons"
+                )
+            if decision == "probe_eligible_breakthrough" and bool(
+                result.get("new_breakthrough")
+            ):
+                print(
+                    "\nSafe actor candidate "
+                    f"{result['candidate_id']} reached a new frontier; "
+                    "actor updates are frozen pending matched validation "
+                    f"({','.join(result.get('evidence_reasons') or [])})."
+                )
             if decision == "rolled_back_no_evidence":
                 self.recent_training_distances_m = []
                 self.recent_training_completed_lap = False
@@ -3720,6 +4486,13 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
                     self._safe_actor_probe_eligible()
                     and self._probe_budget_allows(safe_actor_probe=True)
                 )
+            if (
+                self.training_budget_state is not None
+                and self.training_budget_state.training_budget_reached
+            ):
+                return False
+            if not self.regular_probes_enabled:
+                return False
             scheduled = should_schedule_policy_probe(
                 timestep=self._budget_timestep(),
                 learning_starts=self.learning_starts,
@@ -3745,6 +4518,52 @@ def make_exploration_schedule_callback_class(BaseCallback: Any):
             ):
                 return None
             return record(summary)
+
+        def _record_discovery_recovery(
+            self,
+            summary: dict[str, Any],
+        ) -> None:
+            record = getattr(
+                self.model,
+                "record_discovery_training_episode",
+                None,
+            )
+            if not callable(record):
+                return
+            result = record(summary)
+            if not isinstance(result, Mapping):
+                return
+            summary["discovery_launch_failure_streak"] = result.get(
+                "launch_failure_streak"
+            )
+            summary["discovery_recovery_triggered"] = bool(
+                result.get("triggered")
+            )
+            summary["discovery_recovery_count"] = result.get(
+                "recovery_count"
+            )
+            summary["discovery_recovery_cooldown_until"] = result.get(
+                "cooldown_until"
+            )
+            summary["discovery_actor_learning_rate_scale"] = result.get(
+                "actor_learning_rate_scale"
+            )
+            summary["discovery_effective_policy_delay"] = result.get(
+                "effective_policy_delay"
+            )
+            summary["discovery_actor_updates_since_anchor"] = result.get(
+                "actor_updates_since_anchor"
+            )
+            if bool(result.get("triggered")):
+                print(
+                    "\nDiscovery frontier regression recovered: restored the "
+                    f"{finite_float(result.get('anchor_distance_m')):.1f}m "
+                    "frontier actor; recovery="
+                    f"{int(finite_float(result.get('recovery_count')))}, "
+                    "actor cooldown until training step "
+                    f"{int(finite_float(result.get('cooldown_until'))):,}; "
+                    "critic and replay retained."
+                )
 
         def _annotate_safe_actor_probe(
             self,
@@ -4059,6 +4878,334 @@ def make_lap_checkpoint_callback_class(BaseCallback: Any):
     return LapCheckpointCallback
 
 
+def make_frontier_checkpoint_callback_class(BaseCallback: Any):
+    class FrontierCheckpointCallback(BaseCallback):
+        """Protect distance discoveries independently from the robust champion."""
+
+        def __init__(
+            self,
+            frontier_model_path: Path,
+            frontier_checkpoint_dir: Path,
+            metadata: Mapping[str, Any],
+            *,
+            source_policy_path: Path | None,
+            source_evidence: Mapping[str, Any] | None,
+            milestones_m: tuple[float, ...],
+            minimum_improvement_m: float,
+            major_breakthrough_improvement_m: float,
+            progress_state: TrainingProgressState | None = None,
+        ) -> None:
+            super().__init__(verbose=0)
+            self.frontier_model_path = Path(frontier_model_path)
+            self.frontier_checkpoint_dir = Path(frontier_checkpoint_dir)
+            self.metadata = dict(metadata)
+            self.source_policy_path = (
+                Path(source_policy_path) if source_policy_path is not None else None
+            )
+            self.source_evidence = dict(source_evidence or {})
+            self.milestones_m = tuple(
+                sorted({max(0.0, finite_float(value)) for value in milestones_m})
+            )
+            self.minimum_improvement_m = max(
+                0.0,
+                finite_float(minimum_improvement_m),
+            )
+            self.major_breakthrough_improvement_m = max(
+                self.minimum_improvement_m,
+                finite_float(major_breakthrough_improvement_m),
+            )
+            self.progress_state = progress_state
+            existing = read_policy_metadata(self.frontier_model_path)
+            existing_frontier = existing.get("frontier_champion")
+            self.best_distance_m = (
+                max(0.0, finite_float(existing_frontier.get("distance_m")))
+                if isinstance(existing_frontier, Mapping)
+                else None
+            )
+            self.completed_lap = bool(
+                isinstance(existing_frontier, Mapping)
+                and existing_frontier.get("completed_lap")
+            )
+            self.best_lap_time_seconds = (
+                finite_float(
+                    existing_frontier.get("best_lap_time_seconds"),
+                    default=float("inf"),
+                )
+                if isinstance(existing_frontier, Mapping)
+                else float("inf")
+            )
+            history = existing.get("frontier_history")
+            self.history = (
+                [dict(item) for item in history if isinstance(item, Mapping)][-24:]
+                if isinstance(history, list)
+                else []
+            )
+            self.saved_milestones_m = {
+                milestone
+                for milestone in self.milestones_m
+                if self.best_distance_m is not None
+                and self.best_distance_m >= milestone
+            }
+            self.major_breakthrough_this_run = False
+            self.completed_lap_this_run = False
+            self.records_saved_this_run = 0
+            self.strict_evaluation_reference_distance_m = (
+                self.best_distance_m or 0.0
+            )
+            if self.progress_state is not None and self.best_distance_m is not None:
+                self.progress_state.record_best_distance(self.best_distance_m)
+
+        def _on_training_start(self) -> None:
+            if self.best_distance_m is not None and self.frontier_model_path.is_file():
+                return
+            source_metadata = read_policy_metadata(self.source_policy_path)
+            initial_distance_m = frontier_evidence_distance_m(
+                source_metadata,
+                self.source_evidence,
+            )
+            self._save_frontier(
+                distance_m=initial_distance_m,
+                summary=None,
+                completed_lap=False,
+                selection_reason="bootstrap_from_historical_frontier_evidence",
+                count_as_run_breakthrough=False,
+            )
+            self.strict_evaluation_reference_distance_m = (
+                self.best_distance_m or 0.0
+            )
+
+        def _on_step(self) -> bool:
+            for info in self.locals.get("infos", []):
+                summary = (
+                    info.get("episode_summary")
+                    if isinstance(info, Mapping)
+                    else None
+                )
+                if not isinstance(summary, Mapping) or not bool(
+                    summary.get("policy_controlled")
+                ):
+                    continue
+                distance_m = max(
+                    0.0,
+                    finite_float(summary.get("distance_m")),
+                    finite_float(summary.get("furthest_distance_m")),
+                )
+                lap_completed = policy_lap_is_valid(summary)
+                lap_time_seconds = finite_float(
+                    summary.get("best_lap_time_seconds"),
+                    default=float("inf"),
+                )
+                if self.completed_lap:
+                    if not lap_completed:
+                        continue
+                    if lap_time_seconds >= self.best_lap_time_seconds:
+                        continue
+                previous_distance_m = self.best_distance_m or 0.0
+                crossed_milestone = any(
+                    previous_distance_m < milestone <= distance_m
+                    for milestone in self.milestones_m
+                )
+                improved = distance_m >= (
+                    previous_distance_m + self.minimum_improvement_m
+                )
+                if not (lap_completed or crossed_milestone or improved):
+                    continue
+                self._save_frontier(
+                    distance_m=distance_m,
+                    summary=summary,
+                    completed_lap=lap_completed,
+                    selection_reason=(
+                        "completed_lap"
+                        if lap_completed
+                        else "distance_milestone"
+                        if crossed_milestone
+                        else "new_furthest_policy_controlled_episode"
+                    ),
+                    count_as_run_breakthrough=True,
+                )
+            return True
+
+        @property
+        def requires_strict_evaluation(self) -> bool:
+            return bool(
+                self.major_breakthrough_this_run or self.completed_lap_this_run
+            )
+
+        def status(self) -> dict[str, Any]:
+            return {
+                "frontier_model_path": str(self.frontier_model_path),
+                "best_distance_m": self.best_distance_m,
+                "completed_lap": self.completed_lap,
+                "best_lap_time_seconds": (
+                    self.best_lap_time_seconds
+                    if math.isfinite(self.best_lap_time_seconds)
+                    else None
+                ),
+                "saved_milestones_m": sorted(self.saved_milestones_m),
+                "records_saved_this_run": self.records_saved_this_run,
+                "strict_evaluation_reference_distance_m": (
+                    self.strict_evaluation_reference_distance_m
+                ),
+                "major_breakthrough_this_run": self.major_breakthrough_this_run,
+                "completed_lap_this_run": self.completed_lap_this_run,
+                "requires_strict_evaluation": self.requires_strict_evaluation,
+            }
+
+        def _save_frontier(
+            self,
+            *,
+            distance_m: float,
+            summary: Mapping[str, Any] | None,
+            completed_lap: bool,
+            selection_reason: str,
+            count_as_run_breakthrough: bool,
+        ) -> None:
+            previous_distance_m = self.best_distance_m or 0.0
+            recorded_distance_m = max(previous_distance_m, float(distance_m))
+            crossed = tuple(
+                milestone
+                for milestone in self.milestones_m
+                if previous_distance_m < milestone <= recorded_distance_m
+            )
+            significant_gain = recorded_distance_m >= (
+                self.strict_evaluation_reference_distance_m
+                + self.major_breakthrough_improvement_m
+            )
+            best_lap_time_seconds = (
+                finite_float(
+                    summary.get("best_lap_time_seconds"),
+                    default=float("inf"),
+                )
+                if completed_lap and summary is not None
+                else self.best_lap_time_seconds
+            )
+            record = {
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "global_timestep": int(self.num_timesteps),
+                "distance_m": recorded_distance_m,
+                "episode_distance_m": float(distance_m),
+                "completed_lap": bool(completed_lap),
+                "best_lap_time_seconds": (
+                    best_lap_time_seconds
+                    if math.isfinite(best_lap_time_seconds)
+                    else None
+                ),
+                "selection_reason": str(selection_reason),
+                "policy_controlled": (
+                    bool(summary.get("policy_controlled"))
+                    if summary is not None
+                    else None
+                ),
+                "evidence_source": (
+                    "observed_training_episode"
+                    if summary is not None
+                    else "source_checkpoint_metadata"
+                ),
+                "deterministic": bool(
+                    summary is not None and summary.get("deterministic_probe")
+                ),
+                "robustness_verified": False,
+                "strict_evaluation_required": bool(
+                    count_as_run_breakthrough
+                    and (crossed or completed_lap or significant_gain)
+                ),
+                "milestones_crossed_m": list(crossed),
+                "source_policy_path": (
+                    str(self.source_policy_path)
+                    if self.source_policy_path is not None
+                    else None
+                ),
+                "source_external_evidence": (
+                    dict(self.source_evidence) if self.source_evidence else None
+                ),
+                "episode_summary": dict(summary) if summary is not None else None,
+            }
+            self.history.append(
+                {
+                    key: value
+                    for key, value in record.items()
+                    if key != "episode_summary"
+                }
+            )
+            self.history = self.history[-25:]
+            payload = {
+                **self.metadata,
+                "checkpoint_type": "distance_frontier_champion",
+                "frontier_champion": record,
+                "frontier_history": list(self.history),
+            }
+            self._save_policy_bundle(self.frontier_model_path, payload)
+            for milestone in crossed:
+                milestone_path = self.frontier_checkpoint_dir / (
+                    f"agent6_td3_frontier_{int(round(milestone)):04d}m.zip"
+                )
+                milestone_payload = {
+                    **payload,
+                    "checkpoint_type": "distance_frontier_milestone",
+                    "frontier_milestone": {
+                        "milestone_m": milestone,
+                        "source_frontier_path": str(self.frontier_model_path),
+                        "record": record,
+                    },
+                }
+                self._save_policy_bundle(milestone_path, milestone_payload)
+                self.saved_milestones_m.add(milestone)
+                print(
+                    "\nSaved Agent 6 frontier milestone: "
+                    f"{milestone:.0f}m -> {milestone_path}"
+                )
+            self.best_distance_m = recorded_distance_m
+            self.completed_lap = bool(self.completed_lap or completed_lap)
+            if completed_lap:
+                self.best_lap_time_seconds = best_lap_time_seconds
+            snapshot_recovery_anchor = getattr(
+                self.model,
+                "snapshot_discovery_recovery_anchor",
+                None,
+            )
+            if callable(snapshot_recovery_anchor):
+                snapshot_recovery_anchor(self.best_distance_m)
+            if self.progress_state is not None:
+                self.progress_state.record_best_distance(self.best_distance_m)
+            if count_as_run_breakthrough:
+                self.records_saved_this_run += 1
+                self.major_breakthrough_this_run = bool(
+                    self.major_breakthrough_this_run
+                    or crossed
+                    or significant_gain
+                )
+                self.completed_lap_this_run = bool(
+                    self.completed_lap_this_run or completed_lap
+                )
+                if crossed or significant_gain or completed_lap:
+                    self.strict_evaluation_reference_distance_m = (
+                        recorded_distance_m
+                    )
+                print(
+                    "\nUpdated Agent 6 frontier champion: "
+                    f"{self.best_distance_m:.1f}m -> {self.frontier_model_path}"
+                )
+
+        def _save_policy_bundle(
+            self,
+            path: Path,
+            payload: Mapping[str, Any],
+        ) -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            save_runtime = getattr(self.model, "save_runtime_policy", None)
+
+            def save_policy(target: Path) -> None:
+                if callable(save_runtime):
+                    save_runtime(target)
+                else:
+                    self.model.save(str(target))
+
+            atomic_save_policy(save_policy, path)
+            write_json(metadata_path_for_policy(path), payload)
+
+    return FrontierCheckpointCallback
+
+
 def make_best_model_callback_class(BaseCallback: Any):
     class BestModelCallback(BaseCallback):
         def __init__(
@@ -4360,6 +5507,382 @@ def resolve_tensorboard_log_dir(tensorboard_dir: Path, *, disable_tensorboard: b
     return None
 
 
+def make_stable_frontier_td3_class(TD3: Any):
+    """Build the compact actor-preserving TD3 continuation used by Agent 6."""
+    import torch as th
+    import torch.nn.functional as F
+    from stable_baselines3.common.utils import polyak_update, update_learning_rate
+
+    class StableFrontierTD3(TD3):
+        def _excluded_save_params(self) -> list[str]:
+            return [
+                *super()._excluded_save_params(),
+                "_agent6_training_budget_state",
+                "_agent6_actor_learning_rate_schedule",
+            ]
+
+        @staticmethod
+        def _set_module_requires_grad(module: Any, enabled: bool) -> None:
+            for parameter in module.parameters():
+                parameter.requires_grad_(enabled)
+
+        def configure_training_budget(
+            self,
+            training_budget_state: TrainingBudgetState,
+        ) -> None:
+            self._agent6_training_budget_state = training_budget_state
+
+        def configure_continuation_updates(
+            self,
+            *,
+            actor_learning_rate_schedule: Callable[[int], float],
+            actor_updates_start_at: int,
+            critic_warmup_updates: int = LEAN_FRONTIER_CRITIC_WARMUP_STEPS,
+            critic_gradient_norm: float = LEAN_FRONTIER_GRADIENT_NORM,
+            critic_huber_beta: float = LEAN_FRONTIER_HUBER_BETA,
+            freeze_actor_before_updates: bool = True,
+            **_legacy_options: Any,
+        ) -> None:
+            self._agent6_actor_learning_rate_schedule = (
+                actor_learning_rate_schedule
+            )
+            self._agent6_actor_updates_start_at = max(
+                0,
+                int(actor_updates_start_at),
+            )
+            self._agent6_critic_warmup_updates = max(
+                0,
+                int(critic_warmup_updates),
+            )
+            self._agent6_critic_updates_since_transfer = 0
+            self._agent6_critic_gradient_norm = max(
+                0.0,
+                float(critic_gradient_norm),
+            )
+            self._agent6_critic_huber_beta = max(
+                np.finfo(np.float32).eps,
+                float(critic_huber_beta),
+            )
+            self._agent6_actor_gradient_norm = LEAN_FRONTIER_GRADIENT_NORM
+            self._agent6_actor_parameters_frozen = bool(
+                freeze_actor_before_updates
+                and self._agent6_critic_warmup_updates > 0
+            )
+            self._set_module_requires_grad(
+                self.actor,
+                not self._agent6_actor_parameters_frozen,
+            )
+
+        def _training_budget_timestep(self) -> int:
+            state = getattr(self, "_agent6_training_budget_state", None)
+            return int(self.num_timesteps) if state is None else int(
+                state.training_steps
+            )
+
+        def _apply_training_budget_progress(self) -> None:
+            state = getattr(self, "_agent6_training_budget_state", None)
+            if state is not None:
+                self._current_progress_remaining = state.progress_remaining
+
+        def save_runtime_policy(self, path: Any) -> None:
+            super().save(path)
+
+        def exact_training_state_dict(self) -> dict[str, Any]:
+            return {
+                "frontier_finetuning": {
+                    "critic_updates_since_transfer": int(
+                        getattr(
+                            self,
+                            "_agent6_critic_updates_since_transfer",
+                            0,
+                        )
+                    ),
+                    "critic_warmup_updates": int(
+                        getattr(self, "_agent6_critic_warmup_updates", 0)
+                    ),
+                    "actor_updates_start_at": int(
+                        getattr(self, "_agent6_actor_updates_start_at", 0)
+                    ),
+                    "actor_parameters_frozen": bool(
+                        getattr(
+                            self,
+                            "_agent6_actor_parameters_frozen",
+                            False,
+                        )
+                    ),
+                    "critic_gradient_norm": float(
+                        getattr(
+                            self,
+                            "_agent6_critic_gradient_norm",
+                            LEAN_FRONTIER_GRADIENT_NORM,
+                        )
+                    ),
+                    "critic_huber_beta": float(
+                        getattr(
+                            self,
+                            "_agent6_critic_huber_beta",
+                            LEAN_FRONTIER_HUBER_BETA,
+                        )
+                    ),
+                },
+                "n_updates": int(getattr(self, "_n_updates", 0)),
+                "num_timesteps": int(getattr(self, "num_timesteps", 0)),
+            }
+
+        def restore_exact_training_state(self, state: Mapping[str, Any]) -> None:
+            protocol = state.get("frontier_finetuning")
+            if not isinstance(protocol, Mapping):
+                raise RuntimeError(
+                    "exact-resume state is missing frontier fine-tuning data"
+                )
+            self._agent6_critic_updates_since_transfer = max(
+                0,
+                int(
+                    finite_float(
+                        protocol.get("critic_updates_since_transfer")
+                    )
+                ),
+            )
+            self._agent6_critic_warmup_updates = max(
+                0,
+                int(finite_float(protocol.get("critic_warmup_updates"))),
+            )
+            self._agent6_actor_updates_start_at = max(
+                0,
+                int(finite_float(protocol.get("actor_updates_start_at"))),
+            )
+            self._agent6_critic_gradient_norm = max(
+                0.0,
+                finite_float(
+                    protocol.get("critic_gradient_norm"),
+                    LEAN_FRONTIER_GRADIENT_NORM,
+                ),
+            )
+            self._agent6_critic_huber_beta = max(
+                np.finfo(np.float32).eps,
+                finite_float(
+                    protocol.get("critic_huber_beta"),
+                    LEAN_FRONTIER_HUBER_BETA,
+                ),
+            )
+            self._agent6_actor_parameters_frozen = bool(
+                protocol.get("actor_parameters_frozen")
+            )
+            self._set_module_requires_grad(
+                self.actor,
+                not self._agent6_actor_parameters_frozen,
+            )
+            self._n_updates = max(0, int(finite_float(state.get("n_updates"))))
+            self.num_timesteps = max(
+                0,
+                int(finite_float(state.get("num_timesteps"))),
+            )
+
+        def train(self, gradient_steps: int, batch_size: int = 100) -> None:
+            self._apply_training_budget_progress()
+            self.policy.set_training_mode(True)
+            budget_timestep = self._training_budget_timestep()
+            critic_learning_rate = self.lr_schedule(
+                self._current_progress_remaining
+            )
+            actor_learning_rate = float(
+                self._agent6_actor_learning_rate_schedule(budget_timestep)
+            )
+            update_learning_rate(self.critic.optimizer, critic_learning_rate)
+            update_learning_rate(self.actor.optimizer, actor_learning_rate)
+
+            actor_losses: list[float] = []
+            actor_gradient_norms: list[float] = []
+            critic_losses: list[float] = []
+            critic_gradient_norms: list[float] = []
+            q1_means: list[float] = []
+            q2_means: list[float] = []
+            target_q_means: list[float] = []
+            td_error_means: list[float] = []
+            td_error_maxima: list[float] = []
+
+            for _ in range(gradient_steps):
+                self._n_updates += 1
+                replay_data = self.replay_buffer.sample(
+                    batch_size,
+                    env=self._vec_normalize_env,
+                )
+                discounts = (
+                    replay_data.discounts
+                    if replay_data.discounts is not None
+                    else self.gamma
+                )
+                with th.no_grad():
+                    noise = (
+                        th.randn_like(replay_data.actions)
+                        * self.target_policy_noise
+                    ).clamp(-self.target_noise_clip, self.target_noise_clip)
+                    next_actions = (
+                        self.actor_target(replay_data.next_observations) + noise
+                    ).clamp(-1.0, 1.0)
+                    target_q_values = th.cat(
+                        self.critic_target(
+                            replay_data.next_observations,
+                            next_actions,
+                        ),
+                        dim=1,
+                    ).min(dim=1, keepdim=True).values
+                    target_q_values = (
+                        replay_data.rewards
+                        + (1.0 - replay_data.dones)
+                        * discounts
+                        * target_q_values
+                    )
+
+                current_q_values = self.critic(
+                    replay_data.observations,
+                    replay_data.actions,
+                )
+                critic_loss = sum(
+                    F.smooth_l1_loss(
+                        current_q,
+                        target_q_values,
+                        beta=self._agent6_critic_huber_beta,
+                    )
+                    for current_q in current_q_values
+                )
+                critic_loss_value = float(critic_loss.item())
+                self.critic.optimizer.zero_grad()
+                critic_update_valid = math.isfinite(critic_loss_value)
+                if critic_update_valid:
+                    critic_loss.backward()
+                    critic_gradient_norm = th.nn.utils.clip_grad_norm_(
+                        self.critic.parameters(),
+                        self._agent6_critic_gradient_norm,
+                    )
+                    critic_gradient_norm_value = float(
+                        critic_gradient_norm.item()
+                    )
+                    critic_update_valid = math.isfinite(
+                        critic_gradient_norm_value
+                    )
+                else:
+                    critic_gradient_norm_value = math.nan
+                if not critic_update_valid:
+                    self.critic.optimizer.zero_grad()
+                    continue
+
+                self.critic.optimizer.step()
+                self._agent6_critic_updates_since_transfer += 1
+                critic_losses.append(critic_loss_value)
+                critic_gradient_norms.append(critic_gradient_norm_value)
+                q1_means.append(float(current_q_values[0].mean().item()))
+                q2_means.append(float(current_q_values[1].mean().item()))
+                target_q_means.append(float(target_q_values.mean().item()))
+                absolute_td_errors = th.cat(
+                    [
+                        (current_q.detach() - target_q_values).abs()
+                        for current_q in current_q_values
+                    ],
+                    dim=1,
+                )
+                td_error_means.append(float(absolute_td_errors.mean().item()))
+                td_error_maxima.append(float(absolute_td_errors.max().item()))
+                polyak_update(
+                    self.critic.parameters(),
+                    self.critic_target.parameters(),
+                    self.tau,
+                )
+                polyak_update(
+                    self.critic_batch_norm_stats,
+                    self.critic_batch_norm_stats_target,
+                    1.0,
+                )
+
+                actor_ready = bool(
+                    budget_timestep > self._agent6_actor_updates_start_at
+                    and self._agent6_critic_updates_since_transfer
+                    > self._agent6_critic_warmup_updates
+                    and actor_learning_rate > 0.0
+                )
+                if actor_ready and self._agent6_actor_parameters_frozen:
+                    self._set_module_requires_grad(self.actor, True)
+                    self._agent6_actor_parameters_frozen = False
+                if not actor_ready or self._n_updates % self.policy_delay != 0:
+                    continue
+
+                actor_loss = -self.critic.q1_forward(
+                    replay_data.observations,
+                    self.actor(replay_data.observations),
+                ).mean()
+                actor_loss_value = float(actor_loss.item())
+                self.actor.optimizer.zero_grad()
+                if not math.isfinite(actor_loss_value):
+                    continue
+                actor_loss.backward()
+                actor_gradient_norm = th.nn.utils.clip_grad_norm_(
+                    self.actor.parameters(),
+                    self._agent6_actor_gradient_norm,
+                )
+                actor_gradient_norm_value = float(actor_gradient_norm.item())
+                if not math.isfinite(actor_gradient_norm_value):
+                    self.actor.optimizer.zero_grad()
+                    continue
+                self.actor.optimizer.step()
+                actor_losses.append(actor_loss_value)
+                actor_gradient_norms.append(actor_gradient_norm_value)
+                polyak_update(
+                    self.actor.parameters(),
+                    self.actor_target.parameters(),
+                    self.tau,
+                )
+                polyak_update(
+                    self.actor_batch_norm_stats,
+                    self.actor_batch_norm_stats_target,
+                    1.0,
+                )
+
+            self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+            self.logger.record("train/learning_rate", critic_learning_rate)
+            self.logger.record("train/critic_learning_rate", critic_learning_rate)
+            self.logger.record("train/actor_learning_rate", actor_learning_rate)
+            self.logger.record(
+                "train/critic_warmup_updates_completed",
+                self._agent6_critic_updates_since_transfer,
+            )
+            self.logger.record(
+                "train/actor_parameters_frozen",
+                int(self._agent6_actor_parameters_frozen),
+            )
+            self.logger.record(
+                "train/actor_updates_enabled",
+                int(not self._agent6_actor_parameters_frozen),
+            )
+            if critic_losses:
+                self.logger.record("train/critic_loss", np.mean(critic_losses))
+                self.logger.record(
+                    "train/critic_gradient_norm",
+                    np.mean(critic_gradient_norms),
+                )
+                self.logger.record("train/q1_mean", np.mean(q1_means))
+                self.logger.record("train/q2_mean", np.mean(q2_means))
+                self.logger.record(
+                    "train/target_q_mean",
+                    np.mean(target_q_means),
+                )
+                self.logger.record(
+                    "train/td_error_abs_mean",
+                    np.mean(td_error_means),
+                )
+                self.logger.record(
+                    "train/td_error_abs_max",
+                    np.max(td_error_maxima),
+                )
+            if actor_losses:
+                self.logger.record("train/actor_loss", np.mean(actor_losses))
+                self.logger.record(
+                    "train/actor_gradient_norm",
+                    np.mean(actor_gradient_norms),
+                )
+
+    return StableFrontierTD3
+
+
 def make_phased_continuation_td3_class(TD3: Any):
     import torch as th
     import torch.nn.functional as F
@@ -4382,6 +5905,10 @@ def make_phased_continuation_td3_class(TD3: Any):
                 "_agent6_safe_actor_candidate_target_state",
                 "_agent6_safe_actor_candidate_optimizer_state",
                 "_agent6_training_budget_state",
+                "_agent6_episode_atomic_raw_env",
+                "_agent6_discovery_anchor_state",
+                "_agent6_discovery_anchor_target_state",
+                "_agent6_discovery_anchor_optimizer_state",
             ]
 
         def configure_training_budget(
@@ -4389,6 +5916,38 @@ def make_phased_continuation_td3_class(TD3: Any):
             training_budget_state: TrainingBudgetState,
         ) -> None:
             self._agent6_training_budget_state = training_budget_state
+
+        def configure_standard_td3_updates(self) -> None:
+            """Use SB3's ordinary per-step TD3 optimizer without policy gates."""
+            self._agent6_standard_td3_updates = True
+
+        @staticmethod
+        def _set_module_requires_grad(module: Any, enabled: bool) -> None:
+            for parameter in module.parameters():
+                parameter.requires_grad_(enabled)
+
+        def configure_episode_atomic_updates(self, raw_env: Any) -> None:
+            """Run post-episode replay updates without a live TORCS session."""
+            self._agent6_episode_atomic_raw_env = raw_env
+            self._agent6_episode_atomic_batches = 0
+
+        def _reset_after_episode_atomic_update(self) -> None:
+            if self.env is None:
+                raise RuntimeError(
+                    "cannot resume TORCS after replay updates without an environment"
+                )
+            fresh_observation = self.env.reset()
+            self._last_obs = fresh_observation
+            if self._vec_normalize_env is not None:
+                self._last_original_obs = (
+                    self._vec_normalize_env.get_original_obs()
+                )
+            self._last_episode_starts = np.ones(
+                (self.env.num_envs,),
+                dtype=bool,
+            )
+            if self.action_noise is not None:
+                self.action_noise.reset()
 
         def _training_budget_timestep(self) -> int:
             state = getattr(self, "_agent6_training_budget_state", None)
@@ -4441,6 +6000,45 @@ def make_phased_continuation_td3_class(TD3: Any):
                 state[name] = copy.deepcopy(value)
             return {
                 "safe_actor": state,
+                "discovery_recovery": {
+                    name: copy.deepcopy(value)
+                    for name, value in self.__dict__.items()
+                    if name.startswith("_agent6_discovery_")
+                    and not callable(value)
+                },
+                "frontier_finetuning": {
+                    "critic_updates_since_transfer": int(
+                        getattr(
+                            self,
+                            "_agent6_critic_updates_since_transfer",
+                            0,
+                        )
+                    ),
+                    "critic_warmup_updates": int(
+                        getattr(self, "_agent6_critic_warmup_updates", 0)
+                    ),
+                    "actor_parameters_frozen": bool(
+                        getattr(
+                            self,
+                            "_agent6_actor_parameters_frozen",
+                            False,
+                        )
+                    ),
+                    "critic_gradient_norm": float(
+                        getattr(
+                            self,
+                            "_agent6_critic_gradient_norm",
+                            LEAN_FRONTIER_GRADIENT_NORM,
+                        )
+                    ),
+                    "critic_huber_beta": float(
+                        getattr(
+                            self,
+                            "_agent6_critic_huber_beta",
+                            LEAN_FRONTIER_HUBER_BETA,
+                        )
+                    ),
+                },
                 "n_updates": int(getattr(self, "_n_updates", 0)),
                 "num_timesteps": int(getattr(self, "num_timesteps", 0)),
                 "phased_continuation_configured": hasattr(
@@ -4456,6 +6054,52 @@ def make_phased_continuation_td3_class(TD3: Any):
             for name, value in safe_actor.items():
                 if str(name).startswith("_agent6_safe_actor_"):
                     setattr(self, str(name), copy.deepcopy(value))
+            discovery_recovery = state.get("discovery_recovery")
+            if isinstance(discovery_recovery, Mapping):
+                for name, value in discovery_recovery.items():
+                    if str(name).startswith("_agent6_discovery_"):
+                        setattr(self, str(name), copy.deepcopy(value))
+            frontier_finetuning = state.get("frontier_finetuning")
+            if isinstance(frontier_finetuning, Mapping):
+                self._agent6_critic_updates_since_transfer = max(
+                    0,
+                    int(
+                        finite_float(
+                            frontier_finetuning.get(
+                                "critic_updates_since_transfer"
+                            )
+                        )
+                    ),
+                )
+                self._agent6_critic_warmup_updates = max(
+                    0,
+                    int(
+                        finite_float(
+                            frontier_finetuning.get("critic_warmup_updates")
+                        )
+                    ),
+                )
+                self._agent6_critic_gradient_norm = max(
+                    0.0,
+                    finite_float(
+                        frontier_finetuning.get("critic_gradient_norm"),
+                        LEAN_FRONTIER_GRADIENT_NORM,
+                    ),
+                )
+                self._agent6_critic_huber_beta = max(
+                    np.finfo(np.float32).eps,
+                    finite_float(
+                        frontier_finetuning.get("critic_huber_beta"),
+                        LEAN_FRONTIER_HUBER_BETA,
+                    ),
+                )
+                self._agent6_actor_parameters_frozen = bool(
+                    frontier_finetuning.get("actor_parameters_frozen")
+                )
+                self._set_module_requires_grad(
+                    self.actor,
+                    not self._agent6_actor_parameters_frozen,
+                )
             if getattr(self, "_agent6_safe_actor_enabled", False):
                 reference = copy.deepcopy(self.actor)
                 accepted_state = getattr(
@@ -4472,6 +6116,37 @@ def make_phased_continuation_td3_class(TD3: Any):
                 for parameter in reference.parameters():
                     parameter.requires_grad_(False)
                 self._agent6_safe_actor_reference = reference
+                candidate_snapshot = (
+                    getattr(self, "_agent6_safe_actor_candidate_state", None),
+                    getattr(
+                        self,
+                        "_agent6_safe_actor_candidate_target_state",
+                        None,
+                    ),
+                    getattr(
+                        self,
+                        "_agent6_safe_actor_candidate_optimizer_state",
+                        None,
+                    ),
+                )
+                waiting_for_probe = bool(
+                    getattr(self, "_agent6_safe_actor_waiting_for_probe", False)
+                )
+                candidate_snapshot_complete = all(
+                    isinstance(value, Mapping) for value in candidate_snapshot
+                )
+                if waiting_for_probe and candidate_snapshot_complete:
+                    self._restore_safe_actor_candidate()
+                elif waiting_for_probe:
+                    self._restore_safe_actor()
+                    self._agent6_safe_actor_rolled_back_blocks += 1
+                    self._agent6_safe_actor_last_decision = {
+                        "candidate_id": self._agent6_safe_actor_candidate_id,
+                        "decision": "rolled_back_resume_missing_candidate",
+                    }
+                    self._reset_safe_actor_probe_runtime()
+                else:
+                    self._restore_safe_actor()
             self._n_updates = max(
                 0,
                 int(finite_float(state.get("n_updates"))),
@@ -4529,15 +6204,73 @@ def make_phased_continuation_td3_class(TD3: Any):
             safe_actor_evidence_max_regression_m: float = (
                 DEFAULT_PROBE_EVIDENCE_MAX_REGRESSION_M
             ),
+            safe_actor_breakthrough_improvement_m: float = (
+                DEFAULT_BREAKTHROUGH_IMPROVEMENT_M
+            ),
             source_verified_distance_m: float = 0.0,
             source_verified_minimum_distance_m: float = 0.0,
+            source_verified_maximum_distance_m: float = 0.0,
+            legacy_action_contract: bool = False,
+            discovery_recovery_enabled: bool = False,
+            discovery_collapse_episodes: int = (
+                DEFAULT_DISCOVERY_COLLAPSE_EPISODES
+            ),
+            discovery_collapse_distance_m: float = (
+                DEFAULT_DISCOVERY_COLLAPSE_DISTANCE_M
+            ),
+            discovery_recovery_cooldown_steps: int = (
+                DEFAULT_DISCOVERY_RECOVERY_COOLDOWN_STEPS
+            ),
+            discovery_max_recovery_cooldown_steps: int = (
+                DEFAULT_DISCOVERY_MAX_RECOVERY_COOLDOWN_STEPS
+            ),
+            discovery_actor_lr_backoff: float = (
+                DEFAULT_DISCOVERY_ACTOR_LR_BACKOFF
+            ),
+            discovery_min_actor_lr_scale: float = (
+                DEFAULT_DISCOVERY_MIN_ACTOR_LR_SCALE
+            ),
+            discovery_max_policy_delay: int = (
+                DEFAULT_DISCOVERY_MAX_POLICY_DELAY
+            ),
+            discovery_frontier_gate_enabled: bool = False,
+            discovery_frontier_gate_distance_m: float = 0.0,
+            discovery_frontier_preservation_fraction: float = (
+                DEFAULT_DISCOVERY_FRONTIER_PRESERVATION_FRACTION
+            ),
+            critic_warmup_updates: int = 0,
+            critic_gradient_norm: float = LEAN_FRONTIER_GRADIENT_NORM,
+            critic_huber_beta: float = LEAN_FRONTIER_HUBER_BETA,
+            freeze_actor_before_updates: bool = True,
         ) -> None:
             self._agent6_actor_learning_rate_schedule = actor_learning_rate_schedule
             self._agent6_actor_updates_start_at = max(
                 0,
                 int(actor_updates_start_at),
             )
+            self._agent6_critic_warmup_updates = max(
+                0,
+                int(critic_warmup_updates),
+            )
+            self._agent6_critic_updates_since_transfer = 0
+            self._agent6_critic_gradient_norm = max(
+                0.0,
+                float(critic_gradient_norm),
+            )
+            self._agent6_critic_huber_beta = max(
+                np.finfo(np.float32).eps,
+                float(critic_huber_beta),
+            )
+            self._agent6_actor_parameters_frozen = bool(
+                freeze_actor_before_updates
+                and self._agent6_critic_warmup_updates > 0
+            )
+            self._set_module_requires_grad(
+                self.actor,
+                not self._agent6_actor_parameters_frozen,
+            )
             self._agent6_safe_actor_enabled = bool(safe_actor_improvement)
+            self._agent6_legacy_action_contract = bool(legacy_action_contract)
             self._agent6_safe_actor_max_action_delta = max(
                 0.0,
                 float(safe_actor_max_action_delta),
@@ -4633,6 +6366,10 @@ def make_phased_continuation_td3_class(TD3: Any):
                 0.0,
                 finite_float(safe_actor_evidence_max_regression_m),
             )
+            self._agent6_safe_actor_breakthrough_improvement_m = max(
+                0.0,
+                finite_float(safe_actor_breakthrough_improvement_m),
+            )
             self._agent6_safe_actor_accepted_distance_m = max(
                 0.0,
                 finite_float(source_verified_distance_m),
@@ -4644,8 +6381,9 @@ def make_phased_continuation_td3_class(TD3: Any):
             self._agent6_safe_actor_accepted_upper_quartile_distance_m = (
                 self._agent6_safe_actor_accepted_distance_m
             )
-            self._agent6_safe_actor_accepted_maximum_distance_m = (
-                self._agent6_safe_actor_accepted_distance_m
+            self._agent6_safe_actor_accepted_maximum_distance_m = max(
+                self._agent6_safe_actor_accepted_distance_m,
+                finite_float(source_verified_maximum_distance_m),
             )
             self._agent6_safe_actor_accepted_lap_completions = 0
             self._agent6_safe_actor_accepted_milestones_m: tuple[float, ...] = ()
@@ -4669,11 +6407,15 @@ def make_phased_continuation_td3_class(TD3: Any):
             self._agent6_safe_actor_early_rolled_back_blocks = 0
             self._agent6_safe_actor_equivalent_blocks = 0
             self._agent6_safe_actor_no_evidence_blocks = 0
+            self._agent6_safe_actor_breakthrough_candidates = 0
             self._agent6_safe_actor_invalid_updates = 0
             self._agent6_safe_actor_probe_episodes_skipped = 0
             self._agent6_safe_actor_evidence_candidate_id = 0
             self._agent6_safe_actor_evidence_distances_m: list[float] = []
             self._agent6_safe_actor_evidence_completed_lap = False
+            self._agent6_safe_actor_evidence_breakthrough_reasons: tuple[
+                str, ...
+            ] = ()
             self._agent6_safe_actor_evidence_eligible = bool(
                 self._agent6_safe_actor_min_evidence_episodes == 0
             )
@@ -4684,6 +6426,396 @@ def make_phased_continuation_td3_class(TD3: Any):
                 if not hasattr(self, "_agent6_safe_actor_robust_state"):
                     self._snapshot_safe_actor_robust_champion()
                 self._snapshot_safe_actor()
+            self._configure_discovery_recovery(
+                enabled=discovery_recovery_enabled,
+                collapse_episodes=discovery_collapse_episodes,
+                collapse_distance_m=discovery_collapse_distance_m,
+                cooldown_steps=discovery_recovery_cooldown_steps,
+                maximum_cooldown_steps=(
+                    discovery_max_recovery_cooldown_steps
+                ),
+                actor_learning_rate_backoff=discovery_actor_lr_backoff,
+                minimum_actor_learning_rate_scale=(
+                    discovery_min_actor_lr_scale
+                ),
+                maximum_policy_delay=discovery_max_policy_delay,
+                source_distance_m=source_verified_maximum_distance_m,
+            )
+            self._agent6_discovery_frontier_gate_enabled = bool(
+                discovery_frontier_gate_enabled
+            )
+            self._agent6_discovery_frontier_gate_distance_m = max(
+                0.0,
+                finite_float(discovery_frontier_gate_distance_m),
+            )
+            self._agent6_discovery_frontier_gate_open = not bool(
+                self._agent6_discovery_frontier_gate_enabled
+            )
+            self._agent6_discovery_episode_actor_eligible = not bool(
+                self._agent6_discovery_frontier_gate_enabled
+            )
+            self._agent6_discovery_frontier_preservation_fraction = clamp(
+                finite_float(discovery_frontier_preservation_fraction),
+                0.01,
+                1.0,
+            )
+
+        def _configure_discovery_recovery(
+            self,
+            *,
+            enabled: bool,
+            collapse_episodes: int,
+            collapse_distance_m: float,
+            cooldown_steps: int,
+            maximum_cooldown_steps: int,
+            actor_learning_rate_backoff: float,
+            minimum_actor_learning_rate_scale: float,
+            maximum_policy_delay: int,
+            source_distance_m: float,
+        ) -> None:
+            self._agent6_discovery_recovery_enabled = bool(enabled)
+            self._agent6_discovery_collapse_episodes = max(
+                2,
+                int(collapse_episodes),
+            )
+            self._agent6_discovery_collapse_distance_m = max(
+                0.0,
+                finite_float(collapse_distance_m),
+            )
+            self._agent6_discovery_recovery_cooldown_steps = max(
+                1,
+                int(cooldown_steps),
+            )
+            self._agent6_discovery_max_recovery_cooldown_steps = max(
+                self._agent6_discovery_recovery_cooldown_steps,
+                int(maximum_cooldown_steps),
+            )
+            self._agent6_discovery_actor_lr_backoff = clamp(
+                finite_float(actor_learning_rate_backoff),
+                0.01,
+                1.0,
+            )
+            self._agent6_discovery_min_actor_lr_scale = clamp(
+                finite_float(minimum_actor_learning_rate_scale),
+                0.001,
+                1.0,
+            )
+            self._agent6_discovery_max_policy_delay = max(
+                int(self.policy_delay),
+                int(maximum_policy_delay),
+            )
+            self._agent6_discovery_launch_failure_streak = 0
+            self._agent6_discovery_recovery_count = 0
+            self._agent6_discovery_cooldown_until = 0
+            self._agent6_discovery_actor_learning_rate_scale = 1.0
+            self._agent6_discovery_effective_policy_delay = int(
+                self.policy_delay
+            )
+            self._agent6_discovery_actor_updates_since_anchor = 0
+            self._agent6_discovery_anchor_distance_m = max(
+                0.0,
+                finite_float(source_distance_m),
+            )
+            self._agent6_discovery_last_event: dict[str, Any] | None = None
+            if self._agent6_discovery_recovery_enabled:
+                self.snapshot_discovery_recovery_anchor(
+                    self._agent6_discovery_anchor_distance_m
+                )
+
+        def snapshot_discovery_recovery_anchor(
+            self,
+            distance_m: float,
+        ) -> None:
+            if not getattr(
+                self,
+                "_agent6_discovery_recovery_enabled",
+                False,
+            ):
+                return
+            self._agent6_discovery_anchor_state = self._clone_module_state(
+                self.actor
+            )
+            self._agent6_discovery_anchor_target_state = (
+                self._clone_module_state(self.actor_target)
+            )
+            self._agent6_discovery_anchor_optimizer_state = copy.deepcopy(
+                self.actor.optimizer.state_dict()
+            )
+            self._agent6_discovery_anchor_distance_m = max(
+                self._agent6_discovery_anchor_distance_m,
+                finite_float(distance_m),
+            )
+            self._agent6_discovery_launch_failure_streak = 0
+            self._agent6_discovery_actor_updates_since_anchor = 0
+
+        def _restore_discovery_recovery_anchor(self) -> None:
+            self.actor.load_state_dict(self._agent6_discovery_anchor_state)
+            self.actor_target.load_state_dict(
+                self._agent6_discovery_anchor_target_state
+            )
+            self.actor.optimizer.load_state_dict(
+                copy.deepcopy(
+                    self._agent6_discovery_anchor_optimizer_state
+                )
+            )
+            self._agent6_discovery_actor_updates_since_anchor = 0
+
+        def record_discovery_training_episode(
+            self,
+            summary: Mapping[str, Any],
+        ) -> dict[str, Any] | None:
+            if not getattr(
+                self,
+                "_agent6_discovery_recovery_enabled",
+                False,
+            ):
+                return None
+            if bool(summary.get("deterministic_probe")) or not bool(
+                summary.get("policy_controlled")
+            ):
+                return None
+            timestep = self._training_budget_timestep()
+            if timestep <= int(self._agent6_actor_updates_start_at):
+                return None
+            if (
+                self._discovery_actor_in_cooldown(timestep)
+                or self._agent6_discovery_actor_updates_since_anchor < 1
+            ):
+                self._agent6_discovery_launch_failure_streak = 0
+                return {
+                    "triggered": False,
+                    **self.discovery_recovery_status(),
+                }
+            distance_m = max(
+                0.0,
+                finite_float(summary.get("distance_m")),
+                finite_float(summary.get("furthest_distance_m")),
+            )
+            effective_failure_distance_m = max(
+                self._agent6_discovery_collapse_distance_m,
+                self._agent6_discovery_frontier_gate_distance_m
+                * self._agent6_discovery_frontier_preservation_fraction,
+            )
+            launch_failed = distance_m < effective_failure_distance_m
+            if launch_failed:
+                self._agent6_discovery_launch_failure_streak += 1
+            else:
+                self._agent6_discovery_launch_failure_streak = 0
+
+            triggered = bool(
+                launch_failed
+                and self._agent6_discovery_launch_failure_streak
+                >= self._agent6_discovery_collapse_episodes
+            )
+            if triggered:
+                self._restore_discovery_recovery_anchor()
+                self._agent6_discovery_recovery_count += 1
+                recovery_index = self._agent6_discovery_recovery_count - 1
+                cooldown = min(
+                    self._agent6_discovery_max_recovery_cooldown_steps,
+                    self._agent6_discovery_recovery_cooldown_steps
+                    * (2 ** min(recovery_index, 16)),
+                )
+                self._agent6_discovery_cooldown_until = timestep + cooldown
+                self._agent6_discovery_actor_learning_rate_scale = max(
+                    self._agent6_discovery_min_actor_lr_scale,
+                    self._agent6_discovery_actor_lr_backoff
+                    ** self._agent6_discovery_recovery_count,
+                )
+                self._agent6_discovery_effective_policy_delay = min(
+                    self._agent6_discovery_max_policy_delay,
+                    int(self.policy_delay)
+                    * (2 ** self._agent6_discovery_recovery_count),
+                )
+                self._agent6_discovery_launch_failure_streak = 0
+                self._agent6_discovery_last_event = {
+                    "triggered_at_timestep": timestep,
+                    "recovery_count": self._agent6_discovery_recovery_count,
+                    "failed_episode_distance_m": distance_m,
+                    "effective_failure_distance_m": (
+                        effective_failure_distance_m
+                    ),
+                    "anchor_distance_m": (
+                        self._agent6_discovery_anchor_distance_m
+                    ),
+                    "cooldown_steps": cooldown,
+                    "cooldown_until": self._agent6_discovery_cooldown_until,
+                    "actor_learning_rate_scale": (
+                        self._agent6_discovery_actor_learning_rate_scale
+                    ),
+                    "effective_policy_delay": (
+                        self._agent6_discovery_effective_policy_delay
+                    ),
+                    "critic_and_replay_preserved": True,
+                }
+            return {
+                "triggered": triggered,
+                "launch_failure_streak": (
+                    self._agent6_discovery_launch_failure_streak
+                ),
+                **self.discovery_recovery_status(),
+            }
+
+        def discovery_recovery_status(self) -> dict[str, Any]:
+            return {
+                "enabled": bool(
+                    getattr(
+                        self,
+                        "_agent6_discovery_recovery_enabled",
+                        False,
+                    )
+                ),
+                "recovery_count": int(
+                    getattr(self, "_agent6_discovery_recovery_count", 0)
+                ),
+                "launch_failure_streak": int(
+                    getattr(
+                        self,
+                        "_agent6_discovery_launch_failure_streak",
+                        0,
+                    )
+                ),
+                "cooldown_until": int(
+                    getattr(self, "_agent6_discovery_cooldown_until", 0)
+                ),
+                "actor_learning_rate_scale": float(
+                    getattr(
+                        self,
+                        "_agent6_discovery_actor_learning_rate_scale",
+                        1.0,
+                    )
+                ),
+                "effective_policy_delay": int(
+                    getattr(
+                        self,
+                        "_agent6_discovery_effective_policy_delay",
+                        self.policy_delay,
+                    )
+                ),
+                "actor_updates_since_anchor": int(
+                    getattr(
+                        self,
+                        "_agent6_discovery_actor_updates_since_anchor",
+                        0,
+                    )
+                ),
+                "anchor_distance_m": float(
+                    getattr(self, "_agent6_discovery_anchor_distance_m", 0.0)
+                ),
+                "frontier_gate_enabled": bool(
+                    getattr(
+                        self,
+                        "_agent6_discovery_frontier_gate_enabled",
+                        False,
+                    )
+                ),
+                "frontier_gate_open": bool(
+                    getattr(
+                        self,
+                        "_agent6_discovery_frontier_gate_open",
+                        True,
+                    )
+                ),
+                "episode_actor_eligible": bool(
+                    getattr(
+                        self,
+                        "_agent6_discovery_episode_actor_eligible",
+                        True,
+                    )
+                ),
+                "frontier_gate_distance_m": float(
+                    getattr(
+                        self,
+                        "_agent6_discovery_frontier_gate_distance_m",
+                        0.0,
+                    )
+                ),
+                "frontier_preservation_fraction": float(
+                    getattr(
+                        self,
+                        "_agent6_discovery_frontier_preservation_fraction",
+                        DEFAULT_DISCOVERY_FRONTIER_PRESERVATION_FRACTION,
+                    )
+                ),
+                "effective_failure_distance_m": max(
+                    float(
+                        getattr(
+                            self,
+                            "_agent6_discovery_collapse_distance_m",
+                            0.0,
+                        )
+                    ),
+                    float(
+                        getattr(
+                            self,
+                            "_agent6_discovery_frontier_gate_distance_m",
+                            0.0,
+                        )
+                    )
+                    * float(
+                        getattr(
+                            self,
+                            "_agent6_discovery_frontier_preservation_fraction",
+                            DEFAULT_DISCOVERY_FRONTIER_PRESERVATION_FRACTION,
+                        )
+                    ),
+                ),
+                "last_event": copy.deepcopy(
+                    getattr(self, "_agent6_discovery_last_event", None)
+                ),
+            }
+
+        def set_discovery_frontier_gate_open(self, value: bool) -> None:
+            enabled = bool(
+                getattr(
+                    self,
+                    "_agent6_discovery_frontier_gate_enabled",
+                    False,
+                )
+            )
+            self._agent6_discovery_frontier_gate_open = bool(
+                not enabled or value
+            )
+
+        def set_discovery_episode_actor_eligible(self, value: bool) -> None:
+            enabled = bool(
+                getattr(
+                    self,
+                    "_agent6_discovery_frontier_gate_enabled",
+                    False,
+                )
+            )
+            self._agent6_discovery_episode_actor_eligible = bool(
+                not enabled or value
+            )
+
+        def _discovery_actor_in_cooldown(self, timestep: int) -> bool:
+            return bool(
+                getattr(
+                    self,
+                    "_agent6_discovery_recovery_enabled",
+                    False,
+                )
+                and int(timestep)
+                < int(getattr(self, "_agent6_discovery_cooldown_until", 0))
+            )
+
+        def _target_policy_smoothing_noise(self, actions: Any) -> Any:
+            noise = actions.clone().data.normal_(
+                0,
+                self.target_policy_noise,
+            )
+            if (
+                getattr(self, "_agent6_legacy_action_contract", False)
+                and int(noise.shape[1]) >= AGENT6_LEGACY_ACTION_SIZE
+            ):
+                longitudinal_noise = noise[:, 1].clone()
+                noise[:, 1] = 0.5 * longitudinal_noise
+                noise[:, 2] = -0.5 * longitudinal_noise
+            return noise.clamp(
+                -self.target_noise_clip,
+                self.target_noise_clip,
+            )
 
         @staticmethod
         def _clone_module_state(module: Any) -> dict[str, Any]:
@@ -4836,12 +6968,24 @@ def make_phased_continuation_td3_class(TD3: Any):
             )
 
         def safe_actor_probe_eligible(self) -> bool:
+            updates_per_probe = max(
+                1,
+                int(getattr(self, "_agent6_safe_actor_block_updates", 1))
+                * int(getattr(self, "_agent6_safe_actor_blocks_per_probe", 1)),
+            )
+            completed_candidate_block = bool(
+                int(getattr(self, "_agent6_safe_actor_candidate_updates", 0))
+                >= updates_per_probe
+            )
             return bool(
                 self.safe_actor_probe_required()
-                and getattr(
-                    self,
-                    "_agent6_safe_actor_evidence_eligible",
-                    True,
+                and (
+                    completed_candidate_block
+                    or getattr(
+                        self,
+                        "_agent6_safe_actor_evidence_eligible",
+                        True,
+                    )
                 )
             )
 
@@ -4875,6 +7019,7 @@ def make_phased_continuation_td3_class(TD3: Any):
                 self._agent6_safe_actor_evidence_candidate_id = candidate_id
                 self._agent6_safe_actor_evidence_distances_m = []
                 self._agent6_safe_actor_evidence_completed_lap = False
+                self._agent6_safe_actor_evidence_breakthrough_reasons = ()
                 self._agent6_safe_actor_evidence_eligible = bool(
                     self._agent6_safe_actor_min_evidence_episodes == 0
                 )
@@ -4895,10 +7040,38 @@ def make_phased_continuation_td3_class(TD3: Any):
                 self._agent6_safe_actor_evidence_completed_lap
                 or int(finite_float(summary.get("laps_completed"))) > 0
             )
-            if self._agent6_safe_actor_evidence_completed_lap:
-                # Preserve the exact lap-producing actor until its matched
+            breakthrough_reasons = training_breakthrough_reasons(
+                distance_m,
+                reference_maximum_distance_m=(
+                    self._agent6_safe_actor_accepted_maximum_distance_m
+                ),
+                minimum_improvement_m=(
+                    self._agent6_safe_actor_breakthrough_improvement_m
+                ),
+                completed_lap=(
+                    self._agent6_safe_actor_evidence_completed_lap
+                ),
+            )
+            new_breakthrough = bool(
+                breakthrough_reasons
+                and not self._agent6_safe_actor_evidence_breakthrough_reasons
+            )
+            if breakthrough_reasons:
+                if new_breakthrough:
+                    self._agent6_safe_actor_breakthrough_candidates += 1
+                self._agent6_safe_actor_evidence_breakthrough_reasons = tuple(
+                    sorted(
+                        {
+                            *self._agent6_safe_actor_evidence_breakthrough_reasons,
+                            *breakthrough_reasons,
+                        }
+                    )
+                )
+                # Preserve the exact frontier-producing actor until its matched
                 # internal validation can run within the probe allowance.
                 self._agent6_safe_actor_waiting_for_probe = True
+                if self._agent6_safe_actor_candidate_state is None:
+                    self._snapshot_safe_actor_candidate()
             credible = training_progress_is_credible(
                 self._agent6_safe_actor_evidence_distances_m,
                 reference_distance_m=(
@@ -4911,20 +7084,50 @@ def make_phased_continuation_td3_class(TD3: Any):
                 maximum_regression_m=(
                     self._agent6_safe_actor_evidence_max_regression_m
                 ),
-                minimum_improvement_m=(
-                    self._agent6_safe_actor_min_improvement_m
-                ),
+                # This gate asks whether the candidate is stable enough to
+                # compare. The matched probe still requires real improvement.
+                minimum_improvement_m=0.0,
                 completed_lap=(
                     self._agent6_safe_actor_evidence_completed_lap
                 ),
             )
+            updates_per_probe = max(
+                1,
+                self._agent6_safe_actor_block_updates
+                * self._agent6_safe_actor_blocks_per_probe,
+            )
+            completed_candidate_block = bool(
+                self._agent6_safe_actor_candidate_updates >= updates_per_probe
+            )
             self._agent6_safe_actor_evidence_eligible = bool(
-                credible or self._agent6_safe_actor_min_evidence_episodes == 0
+                self._agent6_safe_actor_evidence_breakthrough_reasons
+                or credible
+                or completed_candidate_block
+                or self._agent6_safe_actor_min_evidence_episodes == 0
             )
             if self._agent6_safe_actor_evidence_eligible:
+                evidence_reasons = (
+                    self._agent6_safe_actor_evidence_breakthrough_reasons
+                    or (("repeatable_progress",) if credible else ())
+                    or (
+                        ("completed_candidate_block",)
+                        if completed_candidate_block
+                        else ()
+                    )
+                )
                 return {
                     "candidate_id": candidate_id,
-                    "decision": "probe_eligible",
+                    "decision": (
+                        "probe_eligible_breakthrough"
+                        if self._agent6_safe_actor_evidence_breakthrough_reasons
+                        else (
+                            "probe_eligible"
+                            if credible
+                            else "probe_eligible_candidate_block"
+                        )
+                    ),
+                    "evidence_reasons": list(evidence_reasons),
+                    "new_breakthrough": new_breakthrough,
                     "evidence_episodes": len(
                         self._agent6_safe_actor_evidence_distances_m
                     ),
@@ -5069,6 +7272,13 @@ def make_phased_continuation_td3_class(TD3: Any):
                 ),
                 "no_evidence_blocks": int(
                     getattr(self, "_agent6_safe_actor_no_evidence_blocks", 0)
+                ),
+                "breakthrough_candidates": int(
+                    getattr(
+                        self,
+                        "_agent6_safe_actor_breakthrough_candidates",
+                        0,
+                    )
                 ),
                 "invalid_actor_updates": int(
                     getattr(self, "_agent6_safe_actor_invalid_updates", 0)
@@ -5281,6 +7491,7 @@ def make_phased_continuation_td3_class(TD3: Any):
             self._agent6_safe_actor_evidence_candidate_id = 0
             self._agent6_safe_actor_evidence_distances_m = []
             self._agent6_safe_actor_evidence_completed_lap = False
+            self._agent6_safe_actor_evidence_breakthrough_reasons = ()
             self._agent6_safe_actor_evidence_eligible = bool(
                 self._agent6_safe_actor_min_evidence_episodes == 0
             )
@@ -5316,8 +7527,9 @@ def make_phased_continuation_td3_class(TD3: Any):
                 self._agent6_safe_actor_accepted_upper_quartile_distance_m = (
                     comparison.candidate_upper_quartile_distance_m
                 )
-                self._agent6_safe_actor_accepted_maximum_distance_m = (
-                    comparison.candidate_maximum_distance_m
+                self._agent6_safe_actor_accepted_maximum_distance_m = max(
+                    self._agent6_safe_actor_accepted_maximum_distance_m,
+                    comparison.candidate_maximum_distance_m,
                 )
                 self._agent6_safe_actor_accepted_lap_completions = (
                     comparison.candidate_lap_completions
@@ -5669,6 +7881,26 @@ def make_phased_continuation_td3_class(TD3: Any):
             return self._safe_actor_action_delta(observations)
 
         def train(self, gradient_steps: int, batch_size: int = 100) -> None:
+            if getattr(self, "_agent6_standard_td3_updates", False):
+                self._apply_training_budget_progress()
+                super().train(gradient_steps, batch_size)
+                return
+
+            raw_env = getattr(self, "_agent6_episode_atomic_raw_env", None)
+            if raw_env is None:
+                self._train_from_replay(gradient_steps, batch_size)
+                return
+
+            raw_env.suspend_torcs_for_offline_updates()
+            self._train_from_replay(gradient_steps, batch_size)
+            self._agent6_episode_atomic_batches += 1
+            self._reset_after_episode_atomic_update()
+
+        def _train_from_replay(
+            self,
+            gradient_steps: int,
+            batch_size: int = 100,
+        ) -> None:
             self._apply_training_budget_progress()
             actor_schedule = getattr(
                 self,
@@ -5684,28 +7916,108 @@ def make_phased_continuation_td3_class(TD3: Any):
             critic_learning_rate = self.lr_schedule(
                 self._current_progress_remaining
             )
-            actor_learning_rate = float(actor_schedule(budget_timestep))
+            actor_learning_rate = float(actor_schedule(budget_timestep)) * float(
+                getattr(
+                    self,
+                    "_agent6_discovery_actor_learning_rate_scale",
+                    1.0,
+                )
+            )
             update_learning_rate(self.critic.optimizer, critic_learning_rate)
             update_learning_rate(self.actor.optimizer, actor_learning_rate)
             self.logger.record("train/learning_rate", critic_learning_rate)
             self.logger.record("train/critic_learning_rate", critic_learning_rate)
             self.logger.record("train/actor_learning_rate", actor_learning_rate)
 
+            episode_actor_eligible = bool(
+                getattr(
+                    self,
+                    "_agent6_discovery_episode_actor_eligible",
+                    True,
+                )
+            )
+            # Eligibility is consumed by one post-episode optimisation batch.
+            self._agent6_discovery_episode_actor_eligible = not bool(
+                getattr(
+                    self,
+                    "_agent6_discovery_frontier_gate_enabled",
+                    False,
+                )
+            )
+
+            critic_updates_since_transfer = int(
+                getattr(self, "_agent6_critic_updates_since_transfer", 0)
+            )
+            critic_warmup_updates = int(
+                getattr(self, "_agent6_critic_warmup_updates", 0)
+            )
+            critic_warmup_complete = bool(
+                critic_updates_since_transfer >= critic_warmup_updates
+            )
             actor_updates_enabled = (
                 budget_timestep
                 > int(getattr(self, "_agent6_actor_updates_start_at", 0))
+                and critic_warmup_complete
                 and actor_learning_rate > 0.0
                 and not self.safe_actor_probe_required()
+                and not self._discovery_actor_in_cooldown(budget_timestep)
+                and episode_actor_eligible
+            )
+            if actor_updates_enabled and getattr(
+                self,
+                "_agent6_actor_parameters_frozen",
+                False,
+            ):
+                self._set_module_requires_grad(self.actor, True)
+                self._agent6_actor_parameters_frozen = False
+            effective_policy_delay = int(
+                getattr(
+                    self,
+                    "_agent6_discovery_effective_policy_delay",
+                    self.policy_delay,
+                )
             )
             self.logger.record(
                 "train/actor_updates_enabled",
                 int(actor_updates_enabled),
+            )
+            self.logger.record(
+                "train/actor_parameters_frozen",
+                int(
+                    getattr(
+                        self,
+                        "_agent6_actor_parameters_frozen",
+                        False,
+                    )
+                ),
+            )
+            self.logger.record(
+                "train/critic_warmup_updates_completed",
+                critic_updates_since_transfer,
+            )
+            self.logger.record(
+                "train/effective_policy_delay",
+                effective_policy_delay,
+            )
+            self.logger.record(
+                "train/discovery_actor_cooldown",
+                int(self._discovery_actor_in_cooldown(budget_timestep)),
+            )
+            self.logger.record(
+                "train/discovery_frontier_gate_open",
+                int(episode_actor_eligible),
             )
 
             actor_losses: list[float] = []
             actor_gradient_norms: list[float] = []
             actor_action_deltas: list[float] = []
             critic_losses: list[float] = []
+            critic_gradient_norms: list[float] = []
+            q1_means: list[float] = []
+            q2_means: list[float] = []
+            target_q_means: list[float] = []
+            td_error_means: list[float] = []
+            td_error_maxima: list[float] = []
             for _ in range(gradient_steps):
                 self._n_updates += 1
                 replay_data = self.replay_buffer.sample(
@@ -5719,13 +8031,8 @@ def make_phased_continuation_td3_class(TD3: Any):
                 )
 
                 with th.no_grad():
-                    noise = replay_data.actions.clone().data.normal_(
-                        0,
-                        self.target_policy_noise,
-                    )
-                    noise = noise.clamp(
-                        -self.target_noise_clip,
-                        self.target_noise_clip,
+                    noise = self._target_policy_smoothing_noise(
+                        replay_data.actions
                     )
                     next_actions = (
                         self.actor_target(replay_data.next_observations) + noise
@@ -5751,20 +8058,100 @@ def make_phased_continuation_td3_class(TD3: Any):
                     replay_data.observations,
                     replay_data.actions,
                 )
+                huber_beta = float(
+                    getattr(
+                        self,
+                        "_agent6_critic_huber_beta",
+                        LEAN_FRONTIER_HUBER_BETA,
+                    )
+                )
                 critic_loss = sum(
-                    F.mse_loss(current_q, target_q_values)
+                    F.smooth_l1_loss(
+                        current_q,
+                        target_q_values,
+                        beta=huber_beta,
+                    )
                     for current_q in current_q_values
                 )
-                critic_losses.append(float(critic_loss.item()))
+                critic_loss_value = float(critic_loss.item())
+                critic_update_valid = math.isfinite(critic_loss_value)
                 self.critic.optimizer.zero_grad()
-                critic_loss.backward()
-                self.critic.optimizer.step()
+                if critic_update_valid:
+                    critic_loss.backward()
+                    critic_gradient_norm = th.nn.utils.clip_grad_norm_(
+                        self.critic.parameters(),
+                        float(
+                            getattr(
+                                self,
+                                "_agent6_critic_gradient_norm",
+                                LEAN_FRONTIER_GRADIENT_NORM,
+                            )
+                        ),
+                    )
+                    critic_gradient_norm_value = float(
+                        critic_gradient_norm.item()
+                    )
+                    critic_update_valid = math.isfinite(
+                        critic_gradient_norm_value
+                    )
+                else:
+                    critic_gradient_norm_value = math.nan
+                if critic_update_valid:
+                    self.critic.optimizer.step()
+                    self._agent6_critic_updates_since_transfer = int(
+                        getattr(
+                            self,
+                            "_agent6_critic_updates_since_transfer",
+                            0,
+                        )
+                    ) + 1
+                    critic_losses.append(critic_loss_value)
+                    critic_gradient_norms.append(critic_gradient_norm_value)
+                    q1_means.append(float(current_q_values[0].mean().item()))
+                    q2_means.append(float(current_q_values[1].mean().item()))
+                    target_q_means.append(float(target_q_values.mean().item()))
+                    absolute_td_errors = th.cat(
+                        [
+                            (current_q.detach() - target_q_values).abs()
+                            for current_q in current_q_values
+                        ],
+                        dim=1,
+                    )
+                    td_error_means.append(
+                        float(absolute_td_errors.mean().item())
+                    )
+                    td_error_maxima.append(
+                        float(absolute_td_errors.max().item())
+                    )
+
+                    # Keep target-Q estimates current throughout critic-only
+                    # warm-up; the target actor remains the frozen frontier.
+                    polyak_update(
+                        self.critic.parameters(),
+                        self.critic_target.parameters(),
+                        self.tau,
+                    )
+                    polyak_update(
+                        self.critic_batch_norm_stats,
+                        self.critic_batch_norm_stats_target,
+                        1.0,
+                    )
+                else:
+                    self.critic.optimizer.zero_grad()
 
                 if self._n_updates % self.policy_delay != 0:
                     continue
 
                 candidate_block_complete = False
-                if actor_updates_enabled and not self.safe_actor_probe_required():
+                actor_update_due = (
+                    self._n_updates % effective_policy_delay == 0
+                )
+                if (
+                    actor_updates_enabled
+                    and critic_update_valid
+                    and actor_update_due
+                    and not self.safe_actor_probe_required()
+                ):
                     actor_loss = -self.critic.q1_forward(
                         replay_data.observations,
                         self.actor(replay_data.observations),
@@ -5775,10 +8162,7 @@ def make_phased_continuation_td3_class(TD3: Any):
                         actor_losses.append(actor_loss_value)
                         self.actor.optimizer.zero_grad()
                         actor_loss.backward()
-                    if (
-                        actor_update_valid
-                        and getattr(self, "_agent6_safe_actor_enabled", False)
-                    ):
+                    if actor_update_valid:
                         gradient_norm = th.nn.utils.clip_grad_norm_(
                             self.actor.parameters(),
                             self._agent6_safe_actor_gradient_norm,
@@ -5793,6 +8177,12 @@ def make_phased_continuation_td3_class(TD3: Any):
                             self._agent6_safe_actor_invalid_updates += 1
                     else:
                         self.actor.optimizer.step()
+                        if getattr(
+                            self,
+                            "_agent6_discovery_recovery_enabled",
+                            False,
+                        ):
+                            self._agent6_discovery_actor_updates_since_anchor += 1
                     if (
                         actor_update_valid
                         and getattr(self, "_agent6_safe_actor_enabled", False)
@@ -5804,6 +8194,7 @@ def make_phased_continuation_td3_class(TD3: Any):
                             )
                             self._agent6_safe_actor_evidence_distances_m = []
                             self._agent6_safe_actor_evidence_completed_lap = False
+                            self._agent6_safe_actor_evidence_breakthrough_reasons = ()
                             self._agent6_safe_actor_evidence_eligible = bool(
                                 self._agent6_safe_actor_min_evidence_episodes == 0
                             )
@@ -5824,7 +8215,9 @@ def make_phased_continuation_td3_class(TD3: Any):
                             self._agent6_safe_actor_candidate_updates
                             >= updates_per_probe
                         ):
+                            self._snapshot_safe_actor_candidate()
                             self._agent6_safe_actor_waiting_for_probe = True
+                            self._agent6_safe_actor_evidence_eligible = True
                             candidate_block_complete = True
                     if actor_update_valid:
                         polyak_update(
@@ -5839,18 +8232,6 @@ def make_phased_continuation_td3_class(TD3: Any):
                         )
                     if candidate_block_complete:
                         self._resolve_policy_equivalent_candidate()
-
-                # The critic target must continue adapting while the actor is frozen.
-                polyak_update(
-                    self.critic.parameters(),
-                    self.critic_target.parameters(),
-                    self.tau,
-                )
-                polyak_update(
-                    self.critic_batch_norm_stats,
-                    self.critic_batch_norm_stats_target,
-                    1.0,
-                )
 
             self.logger.record(
                 "train/n_updates",
@@ -5871,6 +8252,26 @@ def make_phased_continuation_td3_class(TD3: Any):
                 )
             if critic_losses:
                 self.logger.record("train/critic_loss", np.mean(critic_losses))
+            if critic_gradient_norms:
+                self.logger.record(
+                    "train/critic_gradient_norm",
+                    np.mean(critic_gradient_norms),
+                )
+            if q1_means:
+                self.logger.record("train/q1_mean", np.mean(q1_means))
+                self.logger.record("train/q2_mean", np.mean(q2_means))
+                self.logger.record(
+                    "train/target_q_mean",
+                    np.mean(target_q_means),
+                )
+                self.logger.record(
+                    "train/td_error_abs_mean",
+                    np.mean(td_error_means),
+                )
+                self.logger.record(
+                    "train/td_error_abs_max",
+                    np.max(td_error_maxima),
+                )
             budget_state = getattr(self, "_agent6_training_budget_state", None)
             if budget_state is not None:
                 self.logger.record(
@@ -5958,7 +8359,11 @@ def create_td3_model(
         "gamma": args.gamma,
         "tau": args.tau,
         "learning_rate": learning_rate_schedule,
-        "train_freq": args.train_freq,
+        "train_freq": (
+            args.train_freq
+            if lean_frontier_training_enabled(args)
+            else (args.train_freq, "episode")
+        ),
         "gradient_steps": args.gradient_steps,
         "policy_delay": args.policy_delay,
         "target_policy_noise": args.target_policy_noise,
@@ -5969,9 +8374,12 @@ def create_td3_model(
     }
     if args.continuation:
         source_path = continuation_source_path(args)
+        if bool(getattr(args, "exact_resume", False)):
+            model = TD3.load(str(source_path), **model_kwargs)
+            normalise_continuation_spaces(model, env)
+            return model
         if (
-            not bool(getattr(args, "exact_resume", False))
-            and continuation_source_uses_legacy_action_contract(args)
+            continuation_source_uses_legacy_action_contract(args)
             and args.allow_legacy_action_migration
         ):
             legacy_model = TD3.load(str(source_path), device=args.device)
@@ -5988,17 +8396,73 @@ def create_td3_model(
             migration["source_model_num_timesteps"] = int(
                 getattr(legacy_model, "num_timesteps", 0)
             )
-            model.num_timesteps = int(getattr(legacy_model, "num_timesteps", 0))
+            model.num_timesteps = 0
             setattr(model, "_agent6_contract_migration", migration)
+            setattr(
+                model,
+                "_agent6_actor_only_transfer",
+                {
+                    "source_policy_path": str(source_path),
+                    "source_model_num_timesteps": migration[
+                        "source_model_num_timesteps"
+                    ],
+                    "fresh_critic": True,
+                    "fresh_critic_target": True,
+                    "fresh_actor_optimizer": True,
+                    "fresh_critic_optimizer": True,
+                    "fresh_replay_buffer": True,
+                },
+            )
             return model
-        model = TD3.load(str(source_path), **model_kwargs)
-        normalise_continuation_spaces(model, env)
+        source_model = TD3.load(str(source_path), device=args.device)
+        source_policy_kwargs = copy.deepcopy(
+            getattr(source_model, "policy_kwargs", None)
+        ) or {"net_arch": getattr(args, "net_arch", [400, 300])}
+        model = TD3(
+            "MlpPolicy",
+            policy_kwargs=source_policy_kwargs,
+            **model_kwargs,
+        )
+        transfer_frontier_actor(source_model, model)
+        model.num_timesteps = 0
+        setattr(
+            model,
+            "_agent6_actor_only_transfer",
+            {
+                "source_policy_path": str(source_path),
+                "source_model_num_timesteps": int(
+                    getattr(source_model, "num_timesteps", 0)
+                ),
+                "fresh_critic": True,
+                "fresh_critic_target": True,
+                "fresh_actor_optimizer": True,
+                "fresh_critic_optimizer": True,
+                "fresh_replay_buffer": True,
+            },
+        )
         return model
     return TD3(
         "MlpPolicy",
         policy_kwargs={"net_arch": args.net_arch},
         **model_kwargs,
     )
+
+
+def transfer_frontier_actor(source_model: Any, model: Any) -> None:
+    """Copy only the learned policy into a TD3 model with fresh value networks."""
+    source_actor = getattr(source_model, "actor", None)
+    actor = getattr(model, "actor", None)
+    actor_target = getattr(model, "actor_target", None)
+    if source_actor is None or actor is None or actor_target is None:
+        raise RuntimeError("frontier continuation requires actor networks")
+    source_state = source_actor.state_dict()
+    try:
+        actor.load_state_dict(source_state, strict=True)
+        actor_target.load_state_dict(source_state, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "frontier actor architecture does not match the continuation model"
+        ) from exc
 
 
 def migrate_legacy_actor_to_signed_longitudinal(
@@ -6079,12 +8543,17 @@ def normalise_continuation_spaces(model: Any, env: Any) -> None:
         replay_buffer.observation_space = observation_space
 
 
-def automatic_evaluation_command(args: argparse.Namespace) -> list[str]:
+def automatic_evaluation_command(
+    args: argparse.Namespace,
+    *,
+    policy_path: Path | None = None,
+) -> list[str]:
+    evaluation_policy_path = Path(policy_path or args.model_path)
     return [
         sys.executable,
         str(PROJECT_ROOT / "scripts" / "evaluate_td3_agent.py"),
         "--policy-path",
-        str(args.model_path),
+        str(evaluation_policy_path),
         "--track",
         str(args.track),
         "--output-dir",
@@ -6099,8 +8568,10 @@ def automatic_evaluation_command(args: argparse.Namespace) -> list[str]:
 
 def run_automatic_end_evaluation(
     args: argparse.Namespace,
+    *,
+    policy_path: Path | None = None,
 ) -> dict[str, Any]:
-    command = automatic_evaluation_command(args)
+    command = automatic_evaluation_command(args, policy_path=policy_path)
     started_at = datetime.now(timezone.utc).isoformat()
     try:
         completed = subprocess.run(
@@ -6171,6 +8642,39 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Resume an interrupted Patch 5 checkpoint with its replay, "
             "curriculum, probe, optimizer, and RNG state."
+        ),
+    )
+    parser.add_argument(
+        "--discovery-mode",
+        action="store_true",
+        help=(
+            "Optimise for new distance frontiers with unrestricted reward-only "
+            "TD3 updates; robust promotion remains a separate held-out decision."
+        ),
+    )
+    parser.add_argument(
+        "--resume-frontier",
+        action="store_true",
+        help=(
+            "Continue discovery from the canonical frontier, or bootstrap it "
+            "from the robust champion when no frontier exists yet."
+        ),
+    )
+    parser.add_argument(
+        "--robustify-frontier",
+        action="store_true",
+        help=(
+            "Continue from a completed-lap frontier under the strict safe-actor "
+            "protocol to improve repeatability and pace."
+        ),
+    )
+    parser.add_argument(
+        "--extend-training-steps",
+        type=int,
+        default=0,
+        help=(
+            "Additional non-probe interactions to append to an exact-resume "
+            "checkpoint's saved target. Its 80/20 probe ratio is preserved."
         ),
     )
     parser.add_argument(
@@ -6332,6 +8836,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--breakthrough-improvement-m",
+        type=float,
+        default=DEFAULT_BREAKTHROUGH_IMPROVEMENT_M,
+        help=(
+            "Single-episode frontier gain that freezes a candidate immediately "
+            "for matched validation. Crossing a curriculum milestone also "
+            "qualifies."
+        ),
+    )
+    parser.add_argument(
         "--safe-actor-median-regression-tolerance-m",
         type=float,
         default=DEFAULT_SAFE_ACTOR_MEDIAN_REGRESSION_TOLERANCE_M,
@@ -6418,6 +8932,121 @@ def parse_args() -> argparse.Namespace:
         help="Best valid completed-lap policy found during training or evaluation.",
     )
     parser.add_argument(
+        "--frontier-model-path",
+        type=Path,
+        default=DEFAULT_FRONTIER_MODEL_PATH,
+        help="Canonical greatest-distance policy, independent of robustness status.",
+    )
+    parser.add_argument(
+        "--frontier-checkpoint-dir",
+        type=Path,
+        default=DEFAULT_FRONTIER_CHECKPOINT_DIR,
+        help="Milestone snapshots for frontier discovery.",
+    )
+    parser.add_argument(
+        "--frontier-evidence-path",
+        type=Path,
+        default=DEFAULT_FRONTIER_EVIDENCE_PATH,
+        help="Audited distance evidence bound to an exact historical policy hash.",
+    )
+    parser.add_argument(
+        "--frontier-milestones-m",
+        type=float,
+        nargs="+",
+        default=list(DEFAULT_FRONTIER_MILESTONES_M),
+        help="Distances that trigger preserved frontier snapshots and evaluation.",
+    )
+    parser.add_argument(
+        "--frontier-min-improvement-m",
+        type=float,
+        default=DEFAULT_FRONTIER_MIN_IMPROVEMENT_M,
+        help="Minimum non-milestone distance gain needed to replace the frontier.",
+    )
+    parser.add_argument(
+        "--frontier-major-breakthrough-m",
+        type=float,
+        default=DEFAULT_FRONTIER_MAJOR_BREAKTHROUGH_M,
+        help="Distance gain that triggers strict held-out evaluation after discovery.",
+    )
+    parser.add_argument(
+        "--frontier-qualification-distance-m",
+        type=float,
+        default=DEFAULT_FRONTIER_QUALIFICATION_DISTANCE_M,
+        help=(
+            "Distance the frozen source actor must reproduce deterministically "
+            "before a fresh frontier-discovery continuation may train."
+        ),
+    )
+    parser.add_argument(
+        "--frontier-qualification-attempts",
+        type=int,
+        default=DEFAULT_FRONTIER_QUALIFICATION_ATTEMPTS,
+        help=(
+            "Maximum frozen deterministic source-policy attempts used by the "
+            "frontier admission gate."
+        ),
+    )
+    parser.add_argument(
+        "--frontier-exploration-start-distance-m",
+        type=float,
+        default=DEFAULT_FRONTIER_EXPLORATION_START_DISTANCE_M,
+        help=(
+            "Per-episode distance before discovery exploration and actor updates "
+            "are enabled; the critic may still learn from the preserved approach."
+        ),
+    )
+    parser.add_argument(
+        "--discovery-collapse-episodes",
+        type=int,
+        default=DEFAULT_DISCOVERY_COLLAPSE_EPISODES,
+        help="Consecutive failed launches before restoring the frontier actor.",
+    )
+    parser.add_argument(
+        "--discovery-collapse-distance-m",
+        type=float,
+        default=DEFAULT_DISCOVERY_COLLAPSE_DISTANCE_M,
+        help="Episodes below this distance count as failed discovery launches.",
+    )
+    parser.add_argument(
+        "--discovery-frontier-preservation-fraction",
+        type=float,
+        default=DEFAULT_DISCOVERY_FRONTIER_PRESERVATION_FRACTION,
+        help=(
+            "Fraction of the frontier gate that updated actors must preserve "
+            "across the collapse window before the source actor is restored."
+        ),
+    )
+    parser.add_argument(
+        "--discovery-recovery-cooldown-steps",
+        type=int,
+        default=DEFAULT_DISCOVERY_RECOVERY_COOLDOWN_STEPS,
+        help="Initial critic-only recovery window after launch collapse.",
+    )
+    parser.add_argument(
+        "--discovery-max-recovery-cooldown-steps",
+        type=int,
+        default=DEFAULT_DISCOVERY_MAX_RECOVERY_COOLDOWN_STEPS,
+        help="Maximum exponentially backed-off recovery window.",
+    )
+    parser.add_argument(
+        "--discovery-actor-lr-backoff",
+        type=float,
+        default=DEFAULT_DISCOVERY_ACTOR_LR_BACKOFF,
+        help="Actor learning-rate multiplier applied after each recovery.",
+    )
+    parser.add_argument(
+        "--discovery-min-actor-lr-scale",
+        type=float,
+        default=DEFAULT_DISCOVERY_MIN_ACTOR_LR_SCALE,
+        help="Minimum cumulative actor learning-rate scale after recoveries.",
+    )
+    parser.add_argument(
+        "--discovery-max-policy-delay",
+        type=int,
+        default=DEFAULT_DISCOVERY_MAX_POLICY_DELAY,
+        help="Largest delayed-policy-update interval after repeated collapse.",
+    )
+    parser.add_argument(
         "--lap-checkpoint-dir",
         type=Path,
         default=DEFAULT_LAP_CHECKPOINT_DIR,
@@ -6490,7 +9119,12 @@ def parse_args() -> argparse.Namespace:
         help="Final actor learning rate at the end of the training run.",
     )
     parser.add_argument("--train-freq", type=int, default=1)
-    parser.add_argument("--gradient-steps", type=int, default=1)
+    parser.add_argument(
+        "--gradient-steps",
+        type=int,
+        default=DEFAULT_EPISODE_GRADIENT_STEPS,
+        help="Replay updates performed after each completed training episode.",
+    )
     parser.add_argument("--policy-delay", type=int, default=2)
     parser.add_argument("--target-policy-noise", type=float, default=0.20)
     parser.add_argument("--target-noise-clip", type=float, default=0.50)
@@ -6529,11 +9163,65 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     args = parser.parse_args()
+    end_evaluation_was_explicit = args.end_of_run_evaluation is not None
+    compatibility_probe_was_explicit = (
+        args.continuation_compatibility_probe is not None
+    )
+    safe_actor_was_explicit = args.safe_actor_improvement is not None
+    args.lean_frontier_training = bool(args.resume_frontier)
+    args.stable_frontier_exact_resume = False
+    if args.resume_frontier and args.robustify_frontier:
+        parser.error(
+            "--resume-frontier and --robustify-frontier are mutually exclusive"
+        )
+    if args.resume_frontier or args.robustify_frontier:
+        if args.resume_from is not None or args.resume_exact_from is not None:
+            parser.error(
+                "frontier continuation flags are mutually exclusive with "
+                "--resume-from and --resume-exact-from"
+            )
+        if args.robustify_frontier:
+            if not args.frontier_model_path.is_file():
+                parser.error(
+                    "--robustify-frontier requires an existing frontier checkpoint"
+                )
+            frontier_metadata = read_policy_metadata(args.frontier_model_path)
+            frontier_champion = frontier_metadata.get("frontier_champion")
+            if not (
+                isinstance(frontier_champion, Mapping)
+                and frontier_champion.get("completed_lap")
+            ):
+                parser.error(
+                    "--robustify-frontier requires a completed-lap frontier"
+                )
+            args.resume_from = args.frontier_model_path
+        else:
+            args.discovery_mode = True
+            args.resume_from = (
+                args.frontier_model_path
+                if args.frontier_model_path.is_file()
+                else args.best_robust_evaluation_model_path
+            )
     if args.resume_from is not None and args.resume_exact_from is not None:
         parser.error("--resume-from and --resume-exact-from are mutually exclusive")
     args.exact_resume = args.resume_exact_from is not None
     args.continuation = bool(args.resume_from or args.resume_exact_from)
+    args.end_of_run_evaluation_was_explicit = end_evaluation_was_explicit
+    args.frontier_bootstrap_source = bool(
+        args.resume_frontier
+        and Path(args.resume_from).resolve()
+        != args.frontier_model_path.resolve()
+    )
+    args.frontier_training_source = bool(
+        args.resume_frontier or args.robustify_frontier
+    )
     args.exact_source_was_continuation = False
+    args.exact_resume_budget_extension = None
+    args.frontier_verified_evidence = {}
+    if args.extend_training_steps < 0:
+        parser.error("--extend-training-steps cannot be negative")
+    if args.extend_training_steps and not args.exact_resume:
+        parser.error("--extend-training-steps requires --resume-exact-from")
     if args.exact_resume:
         exact_errors = exact_training_checkpoint_errors(args.resume_exact_from)
         if exact_errors:
@@ -6545,17 +9233,21 @@ def parse_args() -> argparse.Namespace:
         budget_state = exact_state.get("training_budget")
         if not isinstance(budget_state, Mapping):
             parser.error("exact-resume state is missing its training budget")
-        args.total_timesteps = max(
-            1,
-            int(finite_float(budget_state.get("target_training_steps"), 1.0)),
+        try:
+            extended_budget = resolve_exact_resume_budget(
+                budget_state,
+                additional_training_steps=args.extend_training_steps,
+                requested_maximum_probe_steps=args.max_probe_overhead_steps,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        args.exact_resume_budget_extension = extended_budget
+        args.total_timesteps = int(extended_budget["target_training_steps"])
+        args.max_probe_overhead_steps = int(
+            extended_budget["maximum_probe_steps"]
         )
-        args.max_probe_overhead_steps = max(
-            1,
-            int(finite_float(budget_state.get("maximum_probe_steps"), 1.0)),
-        )
-        args.max_probe_fraction = finite_float(
-            budget_state.get("maximum_probe_fraction"),
-            DEFAULT_MAX_PROBE_FRACTION,
+        args.max_probe_fraction = float(
+            extended_budget["maximum_probe_fraction"]
         )
         environment_state = exact_state.get("environment")
         if isinstance(environment_state, Mapping):
@@ -6563,6 +9255,58 @@ def parse_args() -> argparse.Namespace:
                 environment_state.get("stage_id") or "sector_progression"
             )
         source_metadata = read_policy_metadata(args.resume_exact_from)
+        source_hyperparameters = source_metadata.get("td3_hyperparameters")
+        args.stable_frontier_exact_resume = bool(
+            isinstance(source_hyperparameters, Mapping)
+            and source_hyperparameters.get("optimizer_protocol")
+            == "stable_frontier_td3_v1"
+        )
+        saved_discovery = source_metadata.get("discovery")
+        saved_discovery_mode = bool(
+            isinstance(saved_discovery, Mapping)
+            and saved_discovery.get("enabled")
+        )
+        if args.discovery_mode and not saved_discovery_mode:
+            parser.error(
+                "--discovery-mode exact resume requires a discovery checkpoint"
+            )
+        args.discovery_mode = saved_discovery_mode
+        if saved_discovery_mode and not args.stable_frontier_exact_resume:
+            model_state = exact_state.get("model")
+            recovery_state = (
+                model_state.get("discovery_recovery")
+                if isinstance(model_state, Mapping)
+                else None
+            )
+            required_recovery_fields = {
+                "_agent6_discovery_anchor_state",
+                "_agent6_discovery_anchor_target_state",
+                "_agent6_discovery_anchor_optimizer_state",
+                "_agent6_discovery_recovery_enabled",
+                "_agent6_discovery_frontier_gate_enabled",
+            }
+            if not (
+                isinstance(recovery_state, Mapping)
+                and required_recovery_fields.issubset(recovery_state)
+            ):
+                parser.error(
+                    "discovery exact-resume checkpoint predates the frontier "
+                    "trajectory gate or collapse recovery; "
+                    "restart safely with --resume-frontier"
+                )
+            args.frontier_training_source = True
+            trajectory_gate = saved_discovery.get("trajectory_gate")
+            if isinstance(trajectory_gate, Mapping):
+                args.frontier_qualification_distance_m = finite_float(
+                    trajectory_gate.get("qualification_distance_m"),
+                    args.frontier_qualification_distance_m,
+                )
+                args.frontier_exploration_start_distance_m = finite_float(
+                    trajectory_gate.get("exploration_start_distance_m"),
+                    args.frontier_exploration_start_distance_m,
+                )
+        elif saved_discovery_mode:
+            args.frontier_training_source = True
         hyperparameters = source_metadata.get("td3_hyperparameters")
         if isinstance(hyperparameters, Mapping):
             exact_argument_keys = {
@@ -6631,6 +9375,9 @@ def parse_args() -> argparse.Namespace:
                     "safe_actor_probe_noise_std"
                 ),
                 "minimum_improvement_m": "safe_actor_min_improvement_m",
+                "breakthrough_improvement_m": (
+                    "breakthrough_improvement_m"
+                ),
                 "median_regression_tolerance_m": (
                     "safe_actor_median_regression_tolerance_m"
                 ),
@@ -6656,14 +9403,27 @@ def parse_args() -> argparse.Namespace:
     if args.continuation_compatibility_probe_only:
         args.continuation_compatibility_probe = True
     if args.continuation_compatibility_probe is None:
-        args.continuation_compatibility_probe = args.continuation
+        args.continuation_compatibility_probe = bool(
+            args.continuation and not args.discovery_mode
+        )
+    args.frontier_qualification_enabled = bool(
+        args.discovery_mode
+        and not args.exact_resume
+        and not lean_frontier_training_enabled(args)
+    )
     if args.end_of_run_evaluation is None:
         args.end_of_run_evaluation = bool(
             args.continuation
             and not args.continuation_compatibility_probe_only
         )
     if args.start_stage is None:
-        args.start_stage = "sector_progression" if args.continuation else "launch"
+        args.start_stage = (
+            "full_lap"
+            if args.discovery_mode or args.robustify_frontier
+            else "sector_progression"
+            if args.continuation
+            else "launch"
+        )
     if args.replay_refill_steps is None:
         args.replay_refill_steps = (
             DEFAULT_CONTINUATION_REPLAY_REFILL_STEPS if args.continuation else 0
@@ -6716,10 +9476,126 @@ def parse_args() -> argparse.Namespace:
             if args.continuation
             else 0.04
         )
+    if lean_frontier_training_enabled(args):
+        # Preserve the frontier policy while rebuilding the value side under the
+        # current reward contract before any actor gradient is allowed through.
+        args.replay_refill_steps = LEAN_FRONTIER_REPLAY_REFILL_STEPS
+        args.critic_warmup_steps = LEAN_FRONTIER_CRITIC_WARMUP_STEPS
+        args.actor_unfreeze_steps = 0
+        args.learning_rate = LEAN_FRONTIER_CRITIC_LEARNING_RATE
+        args.learning_rate_final = LEAN_FRONTIER_CRITIC_LEARNING_RATE
+        args.actor_learning_rate = LEAN_FRONTIER_ACTOR_LEARNING_RATE
+        args.actor_learning_rate_final = LEAN_FRONTIER_ACTOR_LEARNING_RATE
+        args.action_noise_sigma = LEAN_FRONTIER_ACTION_NOISE_SIGMA
+        args.action_noise_final_sigma = LEAN_FRONTIER_FINAL_ACTION_NOISE_SIGMA
+        args.target_policy_noise = LEAN_FRONTIER_TARGET_POLICY_NOISE
+        args.target_noise_clip = LEAN_FRONTIER_TARGET_NOISE_CLIP
+        args.gradient_steps = LEAN_FRONTIER_GRADIENT_STEPS
+    elif args.stable_frontier_exact_resume:
+        # Exact resume restores these values and optimizer counters from the
+        # checkpoint; enable the compact class without resetting its phases.
+        args.lean_frontier_training = True
     if args.save_best_replay_buffer is None:
         args.save_best_replay_buffer = args.continuation
     if args.safe_actor_improvement is None:
         args.safe_actor_improvement = args.continuation
+    if args.discovery_mode:
+        if safe_actor_was_explicit and args.safe_actor_improvement:
+            parser.error(
+                "--discovery-mode cannot use --safe-actor-improvement; frontier "
+                "checkpoints protect breakthroughs without rolling actors back"
+            )
+        args.safe_actor_improvement = False
+    if args.discovery_mode and not args.continuation:
+        parser.error("--discovery-mode requires --resume-frontier or --resume-from")
+    if (
+        not math.isfinite(args.frontier_min_improvement_m)
+        or args.frontier_min_improvement_m < 0.0
+    ):
+        parser.error("--frontier-min-improvement-m must be finite and non-negative")
+    if (
+        not math.isfinite(args.frontier_major_breakthrough_m)
+        or args.frontier_major_breakthrough_m < args.frontier_min_improvement_m
+    ):
+        parser.error(
+            "--frontier-major-breakthrough-m must be finite and no smaller than "
+            "--frontier-min-improvement-m"
+        )
+    if (
+        not math.isfinite(args.frontier_qualification_distance_m)
+        or args.frontier_qualification_distance_m <= 0.0
+    ):
+        parser.error(
+            "--frontier-qualification-distance-m must be positive and finite"
+        )
+    if args.frontier_qualification_attempts < 1:
+        parser.error("--frontier-qualification-attempts must be at least 1")
+    if (
+        not math.isfinite(args.frontier_exploration_start_distance_m)
+        or args.frontier_exploration_start_distance_m <= 0.0
+    ):
+        parser.error(
+            "--frontier-exploration-start-distance-m must be positive and finite"
+        )
+    if (
+        args.frontier_exploration_start_distance_m
+        > args.frontier_qualification_distance_m
+    ):
+        parser.error(
+            "--frontier-exploration-start-distance-m cannot exceed the "
+            "qualification distance"
+        )
+    if args.discovery_collapse_episodes < 2:
+        parser.error("--discovery-collapse-episodes must be at least 2")
+    if (
+        not math.isfinite(args.discovery_collapse_distance_m)
+        or args.discovery_collapse_distance_m <= 0.0
+    ):
+        parser.error(
+            "--discovery-collapse-distance-m must be positive and finite"
+        )
+    if not 0.0 < args.discovery_frontier_preservation_fraction <= 1.0:
+        parser.error(
+            "--discovery-frontier-preservation-fraction must be in (0, 1]"
+        )
+    if args.discovery_recovery_cooldown_steps < 1:
+        parser.error(
+            "--discovery-recovery-cooldown-steps must be at least 1"
+        )
+    if (
+        args.discovery_max_recovery_cooldown_steps
+        < args.discovery_recovery_cooldown_steps
+    ):
+        parser.error(
+            "--discovery-max-recovery-cooldown-steps cannot be smaller than "
+            "--discovery-recovery-cooldown-steps"
+        )
+    if not 0.0 < args.discovery_actor_lr_backoff <= 1.0:
+        parser.error("--discovery-actor-lr-backoff must be in (0, 1]")
+    if not 0.0 < args.discovery_min_actor_lr_scale <= 1.0:
+        parser.error("--discovery-min-actor-lr-scale must be in (0, 1]")
+    if args.policy_delay < 1:
+        parser.error("--policy-delay must be at least 1")
+    if args.discovery_max_policy_delay < args.policy_delay:
+        parser.error(
+            "--discovery-max-policy-delay cannot be smaller than --policy-delay"
+        )
+    if args.discovery_max_policy_delay % args.policy_delay != 0:
+        parser.error(
+            "--discovery-max-policy-delay must be a multiple of --policy-delay"
+        )
+    if not args.frontier_milestones_m or any(
+        not math.isfinite(value) or value <= 0.0
+        for value in args.frontier_milestones_m
+    ):
+        parser.error("--frontier-milestones-m must contain positive finite values")
+    args.frontier_milestones_m = tuple(
+        sorted({float(value) for value in args.frontier_milestones_m})
+    )
+    if compatibility_probe_was_explicit and args.discovery_mode:
+        args.continuation_compatibility_probe = bool(
+            args.continuation_compatibility_probe
+        )
     if (
         not math.isfinite(args.max_probe_fraction)
         or not 0.0 < args.max_probe_fraction <= DEFAULT_MAX_PROBE_FRACTION
@@ -6756,23 +9632,57 @@ def parse_args() -> argparse.Namespace:
         args.best_reward_model_path.resolve(),
         args.best_robust_evaluation_model_path.resolve(),
         args.best_completed_lap_model_path.resolve(),
+        args.frontier_model_path.resolve(),
         args.emergency_checkpoint_path.resolve(),
     )
     if len(set(managed_policy_paths)) != len(managed_policy_paths):
         parser.error(
-            "working, distance, reward, robust, completed-lap, and emergency "
+            "working, distance, reward, robust, completed-lap, frontier, and emergency "
             "policy "
             "paths must be distinct"
         )
     if args.continuation:
         if not args.exact_resume:
-            source_errors = continuation_source_errors(
-                args.resume_from,
-                track=args.track,
-                start_stage=args.start_stage,
+            if args.frontier_training_source:
+                (
+                    args.frontier_verified_evidence,
+                    frontier_evidence_errors,
+                ) = load_verified_frontier_evidence(
+                    args.resume_from,
+                    args.frontier_evidence_path,
+                )
+                if frontier_evidence_errors:
+                    parser.error(frontier_evidence_errors[0])
+            source_errors = (
+                frontier_continuation_source_errors(
+                    args.resume_from,
+                    track=args.track,
+                    start_stage=args.start_stage,
+                    external_evidence=args.frontier_verified_evidence,
+                )
+                if args.frontier_training_source
+                else continuation_source_errors(
+                    args.resume_from,
+                    track=args.track,
+                    start_stage=args.start_stage,
+                )
             )
             if source_errors:
                 parser.error(source_errors[0])
+            if args.frontier_qualification_enabled:
+                source_frontier_distance_m = frontier_evidence_distance_m(
+                    read_policy_metadata(args.resume_from),
+                    args.frontier_verified_evidence,
+                )
+                if (
+                    source_frontier_distance_m
+                    < args.frontier_qualification_distance_m
+                ):
+                    parser.error(
+                        "frontier qualification requires source evidence of at "
+                        f"least {args.frontier_qualification_distance_m:.1f}m; "
+                        f"the exact policy has {source_frontier_distance_m:.1f}m"
+                    )
         if (
             args.allow_legacy_action_migration
             and not continuation_source_uses_legacy_action_contract(args)
@@ -6783,6 +9693,7 @@ def parse_args() -> argparse.Namespace:
         source_path = continuation_source_path(args).resolve()
         if (
             not args.exact_resume
+            and not args.frontier_training_source
             and not args.allow_non_champion_source
             and source_path != DEFAULT_BEST_EVALUATION_MODEL_PATH.resolve()
         ):
@@ -6873,6 +9784,13 @@ def parse_args() -> argparse.Namespace:
     ):
         parser.error(
             "--safe-actor-min-improvement-m must be finite and non-negative"
+        )
+    if (
+        not math.isfinite(args.breakthrough_improvement_m)
+        or args.breakthrough_improvement_m < 0.0
+    ):
+        parser.error(
+            "--breakthrough-improvement-m must be finite and non-negative"
         )
     if (
         not math.isfinite(args.safe_actor_median_regression_tolerance_m)
@@ -6968,7 +9886,11 @@ def parse_args() -> argparse.Namespace:
     if args.policy_probe_interval < 1:
         parser.error("--policy-probe-interval must be at least 1")
     if args.train_freq != 1:
-        parser.error("--train-freq must be 1 when deterministic probes are enabled")
+        parser.error(
+            "--train-freq must be 1 so optimisation remains episode-atomic"
+        )
+    if args.gradient_steps < 1:
+        parser.error("--gradient-steps must be at least 1")
     return args
 
 
@@ -6987,9 +9909,12 @@ def main() -> None:
         CheckpointCallback,
         Monitor,
         check_env,
-        NormalActionNoise,
     ) = import_training_dependencies()
-    TrainingTD3 = make_phased_continuation_td3_class(TD3)
+    TrainingTD3 = (
+        make_stable_frontier_td3_class(TD3)
+        if lean_frontier_training_enabled(args)
+        else make_phased_continuation_td3_class(TD3)
+    )
 
     run_dir = args.run_dir if args.run_dir is not None else make_default_run_dir()
     args.run_dir = run_dir
@@ -7005,6 +9930,8 @@ def main() -> None:
         parents=True,
         exist_ok=True,
     )
+    args.frontier_model_path.parent.mkdir(parents=True, exist_ok=True)
+    args.frontier_checkpoint_dir.mkdir(parents=True, exist_ok=True)
     args.lap_checkpoint_dir.mkdir(parents=True, exist_ok=True)
     args.automatic_evaluation_output_dir.mkdir(parents=True, exist_ok=True)
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -7067,6 +9994,8 @@ def main() -> None:
             "curriculum_eligible",
             "training_phase",
             "action_noise_sigma",
+            "discovery_frontier_gate_open",
+            "discovery_frontier_gate_distance_m",
             "stage_id",
             "distance_m",
             "furthest_distance_m",
@@ -7083,12 +10012,34 @@ def main() -> None:
         disable_tensorboard=args.no_tensorboard,
     )
     action_size = training_action_size(args)
+    uses_legacy_action_contract = training_uses_legacy_action_contract(args)
+
+    action_noise_generation = 0
+
+    def next_action_noise_seed() -> int:
+        nonlocal action_noise_generation
+        seed = training_action_noise_seed(args.seed, action_noise_generation)
+        action_noise_generation += 1
+        return seed
 
     def make_action_noise(sigma: float):
-        return NormalActionNoise(
-            mean=np.zeros(action_size, dtype=np.float32),
-            sigma=np.ones(action_size, dtype=np.float32)
-            * max(0.0, float(sigma)),
+        seed = next_action_noise_seed()
+        if uses_legacy_action_contract:
+            return SeededLegacyActionNoise(
+                seed=seed,
+                standard_deviation=max(0.0, float(sigma)),
+            )
+        return SeededGaussianActionNoise(
+            seed=seed,
+            standard_deviation=max(0.0, float(sigma)),
+            action_size=action_size,
+        )
+
+    def make_pre_actor_noise(sigma: float):
+        return SeededSteeringActionNoise(
+            seed=next_action_noise_seed(),
+            steering_noise_std=max(0.0, float(sigma)),
+            action_size=action_size,
         )
 
     def make_safe_probe_noise(seed: int, steering_noise_std: float):
@@ -7115,6 +10066,8 @@ def main() -> None:
     )
     model.configure_training_budget(training_budget_state)
     if args.continuation:
+        if not lean_frontier_training_enabled(args):
+            model.configure_episode_atomic_updates(raw_env)
         actor_learning_rate_schedule = gradual_actor_learning_rate_schedule(
             args.actor_learning_rate,
             args.actor_learning_rate_final,
@@ -7157,6 +10110,9 @@ def main() -> None:
             safe_actor_evidence_max_regression_m=(
                 args.probe_evidence_max_regression_m
             ),
+            safe_actor_breakthrough_improvement_m=(
+                args.breakthrough_improvement_m
+            ),
             source_verified_distance_m=finite_float(
                 metadata["continuation"].get(
                     "source_verified_evaluation_progress_m"
@@ -7167,15 +10123,105 @@ def main() -> None:
                     "source_verified_evaluation_minimum_progress_m"
                 )
             ),
+            source_verified_maximum_distance_m=finite_float(
+                max(
+                    finite_float(
+                        metadata["continuation"].get(
+                            "source_verified_evaluation_maximum_progress_m"
+                        )
+                    ),
+                    finite_float(
+                        metadata["discovery"].get(
+                            "source_frontier_evidence_distance_m"
+                        )
+                    ),
+                )
+            ),
+            legacy_action_contract=uses_legacy_action_contract,
+            discovery_recovery_enabled=(
+                args.discovery_mode
+                and not lean_frontier_training_enabled(args)
+            ),
+            discovery_collapse_episodes=args.discovery_collapse_episodes,
+            discovery_collapse_distance_m=args.discovery_collapse_distance_m,
+            discovery_recovery_cooldown_steps=(
+                args.discovery_recovery_cooldown_steps
+            ),
+            discovery_max_recovery_cooldown_steps=(
+                args.discovery_max_recovery_cooldown_steps
+            ),
+            discovery_actor_lr_backoff=args.discovery_actor_lr_backoff,
+            discovery_min_actor_lr_scale=args.discovery_min_actor_lr_scale,
+            discovery_max_policy_delay=args.discovery_max_policy_delay,
+            discovery_frontier_gate_enabled=(
+                args.discovery_mode
+                and not lean_frontier_training_enabled(args)
+            ),
+            discovery_frontier_gate_distance_m=(
+                args.frontier_exploration_start_distance_m
+            ),
+            discovery_frontier_preservation_fraction=(
+                args.discovery_frontier_preservation_fraction
+            ),
+            critic_warmup_updates=(
+                args.critic_warmup_steps
+                if lean_frontier_training_enabled(args)
+                else 0
+            ),
+            critic_gradient_norm=LEAN_FRONTIER_GRADIENT_NORM,
+            critic_huber_beta=LEAN_FRONTIER_HUBER_BETA,
+            freeze_actor_before_updates=bool(
+                lean_frontier_training_enabled(args)
+            ),
+        )
+        actor_transfer = getattr(model, "_agent6_actor_only_transfer", None)
+        metadata["continuation"]["actor_only_transfer_result"] = (
+            dict(actor_transfer) if isinstance(actor_transfer, Mapping) else None
         )
         metadata["continuation"]["source_model_num_timesteps"] = int(
-            getattr(model, "num_timesteps", 0)
+            finite_float(
+                actor_transfer.get("source_model_num_timesteps")
+                if isinstance(actor_transfer, Mapping)
+                else getattr(model, "num_timesteps", 0)
+            )
         )
         contract_migration = getattr(model, "_agent6_contract_migration", None)
         if isinstance(contract_migration, Mapping):
             metadata["continuation"][
                 "source_policy_contract_migration"
             ] = dict(contract_migration)
+        if args.frontier_qualification_enabled:
+            print(
+                "Qualifying frozen frontier actor before training; "
+                f"required distance={args.frontier_qualification_distance_m:.1f}m, "
+                f"attempts={args.frontier_qualification_attempts}."
+            )
+            try:
+                qualification_result = run_frontier_source_qualification(
+                    model,
+                    raw_env,
+                    minimum_distance_m=(
+                        args.frontier_qualification_distance_m
+                    ),
+                    maximum_attempts=args.frontier_qualification_attempts,
+                    training_budget_state=training_budget_state,
+                    base_seed=args.seed,
+                )
+            except Exception:
+                env.close()
+                raise
+            metadata["discovery"]["trajectory_gate"][
+                "qualification_result"
+            ] = qualification_result
+            write_json(
+                run_dir / "frontier_source_qualification.json",
+                qualification_result,
+            )
+            print(
+                "Frozen frontier actor qualified: "
+                f"{qualification_result['best_distance_m']:.1f}m; "
+                "replay and gradient training may now begin."
+            )
         if args.continuation_compatibility_probe:
             minimum_distance_m = continuation_compatibility_minimum_distance_m(
                 args
@@ -7214,10 +10260,44 @@ def main() -> None:
             )
             env.close()
             return
+        protocol_description = (
+            "stable frontier fine-tuning=on; actor-only checkpoint transfer; "
+            "fresh critics and replay; Smooth L1 critic loss; clipped actor/critic "
+            "gradients; actor frozen through critic warm-up; qualification, "
+            "trajectory gate, probes, rollback, and recovery controller=off; "
+            f"frontier={args.frontier_model_path}; milestones="
+            + ",".join(f"{value:.0f}m" for value in args.frontier_milestones_m)
+            if lean_frontier_training_enabled(args)
+            else "discovery mode=on; frozen source qualification=on; "
+            "noise/actor gate="
+            f"{args.frontier_exploration_start_distance_m:.0f}m; "
+            "routine robustness probes=off; actor rollback=off; "
+            f"frontier={args.frontier_model_path}; milestones="
+            + ",".join(f"{value:.0f}m" for value in args.frontier_milestones_m)
+            if args.discovery_mode
+            else (
+                f"safe actor blocks={'on' if args.safe_actor_improvement else 'off'}; "
+                "actor updates per robustness probe="
+                f"{args.safe_actor_block_updates * args.safe_actor_blocks_per_probe:,}; "
+                f"robust probes={args.safe_actor_probe_repeats} seeds x "
+                f"{args.safe_actor_trials_per_seed} trials x 2 policies per candidate, "
+                f"with a {args.safe_actor_screening_trials_per_seed}-trial staged screen"
+            )
+        )
+        update_description = (
+            f"live phased updates={args.gradient_steps:,} gradient/environment step"
+            if lean_frontier_training_enabled(args)
+            else "offline episode-atomic updates="
+            f"{args.gradient_steps:,} gradients/episode"
+        )
         print(
             (
                 "Resuming exact Agent 6 training state from "
                 if args.exact_resume
+                else "Continuing Agent 6 frontier discovery from "
+                if args.discovery_mode
+                else "Robustifying Agent 6 completed-lap frontier from "
+                if args.robustify_frontier
                 else "Continuing verified Agent 6 policy from "
             )
             + f"{continuation_source_path(args)} at stage={args.start_stage}; "
@@ -7225,13 +10305,8 @@ def main() -> None:
             f"replay refill={args.replay_refill_steps:,}, "
             f"critic warm-up={args.critic_warmup_steps:,}, "
             f"actor unfreeze={args.actor_unfreeze_steps:,} steps; "
-            f"safe actor blocks={'on' if args.safe_actor_improvement else 'off'}; "
-            f"actor updates per robustness probe="
-            f"{args.safe_actor_block_updates * args.safe_actor_blocks_per_probe:,}; "
-            f"robust probes={args.safe_actor_probe_repeats} seeds x "
-            f"{args.safe_actor_trials_per_seed} trials x 2 policies "
-            "per candidate, with a "
-            f"{args.safe_actor_screening_trials_per_seed}-trial staged screen; "
+            f"{update_description}; "
+            f"{protocol_description}; "
             f"training budget={args.total_timesteps:,} non-probe steps, "
             "effective probe ceiling="
             f"{training_budget_state.effective_maximum_probe_steps:,} steps "
@@ -7244,8 +10319,19 @@ def main() -> None:
         BaseCallback
     )
     LapCheckpointCallback = make_lap_checkpoint_callback_class(BaseCallback)
+    FrontierCheckpointCallback = make_frontier_checkpoint_callback_class(
+        BaseCallback
+    )
     EpisodeSummaryCallback = make_episode_summary_callback_class(BaseCallback)
     BestModelCallback = make_best_model_callback_class(BaseCallback)
+    qualification_metadata = metadata["discovery"]["trajectory_gate"].get(
+        "qualification_result"
+    )
+    frozen_policy_baseline_distance_m = (
+        finite_float(qualification_metadata.get("best_distance_m"))
+        if isinstance(qualification_metadata, Mapping)
+        else 0.0
+    )
     exploration_callback = ExplorationScheduleCallback(
         raw_env,
         make_action_noise,
@@ -7264,6 +10350,11 @@ def main() -> None:
         ),
         actor_update_start=actor_update_start_timestep(args),
         actor_full_unfreeze=actor_full_unfreeze_timestep(args),
+        pre_actor_noise_factory=(
+            make_pre_actor_noise
+            if args.continuation and not lean_frontier_training_enabled(args)
+            else None
+        ),
         safe_probe_noise_factory=make_safe_probe_noise,
         safe_probe_noise_std=args.safe_actor_probe_noise_std,
         training_budget_state=training_budget_state,
@@ -7276,6 +10367,19 @@ def main() -> None:
         probe_min_evidence_episodes=args.probe_min_evidence_episodes,
         probe_evidence_max_regression_m=(
             args.probe_evidence_max_regression_m
+        ),
+        regular_probes_enabled=(
+            not lean_frontier_training_enabled(args) and not args.discovery_mode
+        ),
+        frontier_exploration_start_distance_m=(
+            args.frontier_exploration_start_distance_m
+            if args.discovery_mode and not lean_frontier_training_enabled(args)
+            else 0.0
+        ),
+        frozen_policy_baseline_distance_m=(
+            frozen_policy_baseline_distance_m
+            if args.discovery_mode and not lean_frontier_training_enabled(args)
+            else 0.0
         ),
     )
 
@@ -7298,6 +10402,25 @@ def main() -> None:
             args.best_completed_lap_model_path,
             metadata,
         ),
+    ]
+    frontier_callback = None
+    if args.discovery_mode:
+        frontier_callback = FrontierCheckpointCallback(
+            args.frontier_model_path,
+            args.frontier_checkpoint_dir,
+            metadata,
+            source_policy_path=continuation_source_path(args),
+            source_evidence=args.frontier_verified_evidence,
+            milestones_m=args.frontier_milestones_m,
+            minimum_improvement_m=args.frontier_min_improvement_m,
+            major_breakthrough_improvement_m=(
+                args.frontier_major_breakthrough_m
+            ),
+            progress_state=progress_state,
+        )
+        callbacks.append(frontier_callback)
+    callbacks.extend(
+        [
         exploration_callback,
         make_checkpoint_callback(
             CheckpointCallback,
@@ -7316,14 +10439,22 @@ def main() -> None:
             save_best_replay_buffer=args.save_best_replay_buffer,
             training_budget_state=training_budget_state,
         ),
-    ]
+        ]
+    )
     if args.exact_resume:
+        budget_extension = args.exact_resume_budget_extension or {}
+        allow_budget_extension = bool(
+            int(budget_extension.get("additional_training_steps", 0)) > 0
+            or int(budget_extension.get("maximum_probe_steps", 0))
+            > int(budget_extension.get("saved_maximum_probe_steps", 0))
+        )
         restored_checkpoint = restore_exact_training_checkpoint(
             model,
             raw_env,
             exploration_callback,
             training_budget_state,
             args.resume_exact_from,
+            allow_budget_extension=allow_budget_extension,
         )
         metadata["continuation"]["exact_resume_checkpoint"] = (
             restored_checkpoint
@@ -7346,6 +10477,14 @@ def main() -> None:
             f"{raw_env.current_stage.stage_id}, milestones="
             f"{len(raw_env.sector_milestone_history):,}."
         )
+        if allow_budget_extension:
+            print(
+                "Exact-resume budget extended: +"
+                f"{int(budget_extension['additional_training_steps']):,} training "
+                "steps; new target="
+                f"{training_budget_state.target_training_steps:,}, probe ceiling="
+                f"{training_budget_state.effective_maximum_probe_steps:,}."
+            )
     if not args.no_progress_bar and not args.verbose_training:
         ConsoleProgressCallback = make_console_progress_callback_class(BaseCallback)
         callbacks.append(
@@ -7356,6 +10495,41 @@ def main() -> None:
             )
         )
     callback = CallbackList(callbacks)
+
+    def record_frontier_run_state() -> None:
+        if frontier_callback is not None:
+            metadata["discovery"]["run_state"] = frontier_callback.status()
+
+    def record_learning_controller_state() -> None:
+        safe_actor_status = getattr(model, "safe_actor_status", None)
+        if callable(safe_actor_status):
+            metadata["safe_actor_improvement"]["run_state"] = (
+                safe_actor_status()
+            )
+        discovery_recovery_status = getattr(
+            model,
+            "discovery_recovery_status",
+            None,
+        )
+        if callable(discovery_recovery_status):
+            metadata["discovery"]["recovery_run_state"] = (
+                discovery_recovery_status()
+            )
+        metadata["discovery"]["trajectory_gate"]["health_run_state"] = {
+            "baseline_distance_m": (
+                exploration_callback.frozen_policy_baseline_distance_m
+            ),
+            "threshold_m": (
+                exploration_callback.frozen_policy_baseline_distance_m
+                * exploration_callback.frozen_policy_health_fraction
+            ),
+            "failure_streak": (
+                exploration_callback.frozen_policy_health_failure_streak
+            ),
+            "failure_reason": (
+                exploration_callback.frozen_policy_health_failure_reason
+            ),
+        }
 
     training_completed = False
     training_interrupted = False
@@ -7382,6 +10556,10 @@ def main() -> None:
             reset_num_timesteps=not args.exact_resume,
             log_interval=10,
         )
+        if exploration_callback.frozen_policy_health_failure_reason is not None:
+            raise RuntimeError(
+                exploration_callback.frozen_policy_health_failure_reason
+            )
         end_summary = raw_env.write_end_of_run_summary(
             training_budget_state.stop_reason or "environment_step_limit_reached"
         )
@@ -7392,9 +10570,8 @@ def main() -> None:
         metadata["milestone_history"] = copy.deepcopy(
             raw_env.sector_milestone_history
         )
-        safe_actor_status = getattr(model, "safe_actor_status", None)
-        if callable(safe_actor_status):
-            metadata["safe_actor_improvement"]["run_state"] = safe_actor_status()
+        record_learning_controller_state()
+        record_frontier_run_state()
         if end_summary is not None:
             metadata["end_of_run_summary"] = end_summary
         final_checkpoint = save_training_checkpoint(
@@ -7435,6 +10612,8 @@ def main() -> None:
         metadata["milestone_history"] = copy.deepcopy(
             raw_env.sector_milestone_history
         )
+        record_learning_controller_state()
+        record_frontier_run_state()
         if end_summary is not None:
             metadata["end_of_run_summary"] = end_summary
         emergency = save_training_checkpoint(
@@ -7460,6 +10639,8 @@ def main() -> None:
         metadata["milestone_history"] = copy.deepcopy(
             raw_env.sector_milestone_history
         )
+        record_learning_controller_state()
+        record_frontier_run_state()
         try:
             emergency = save_training_checkpoint(
                 args.emergency_checkpoint_path,
@@ -7489,12 +10670,35 @@ def main() -> None:
     if training_interrupted:
         return
 
-    if training_completed and args.end_of_run_evaluation:
+    frontier_requires_evaluation = bool(
+        frontier_callback is not None
+        and frontier_callback.requires_strict_evaluation
+    )
+    forced_end_evaluation = bool(
+        args.end_of_run_evaluation_was_explicit
+        and args.end_of_run_evaluation
+    )
+    should_run_end_evaluation = bool(
+        training_completed
+        and args.end_of_run_evaluation
+        and (
+            not args.discovery_mode
+            or forced_end_evaluation
+            or frontier_requires_evaluation
+        )
+    )
+    if should_run_end_evaluation:
+        evaluation_policy_path = (
+            args.frontier_model_path if args.discovery_mode else args.model_path
+        )
         print(
             "Starting one held-out end-of-run evaluation after closing the "
-            "training TORCS instance..."
+            f"training TORCS instance for {evaluation_policy_path}..."
         )
-        evaluation_result = run_automatic_end_evaluation(args)
+        evaluation_result = run_automatic_end_evaluation(
+            args,
+            policy_path=evaluation_policy_path,
+        )
         metadata["automatic_evaluation"]["run_state"] = evaluation_result
         write_json(run_dir / "training_metadata.json", metadata)
         write_json(metadata_path_for_policy(args.model_path), metadata)
@@ -7505,6 +10709,18 @@ def main() -> None:
                 "Warning: training completed, but automatic held-out evaluation "
                 f"failed with exit code {evaluation_result['return_code']}."
             )
+    elif training_completed and args.discovery_mode:
+        metadata["automatic_evaluation"]["run_state"] = {
+            "skipped": True,
+            "reason": "no_new_frontier_milestone_or_completed_lap",
+            "frontier_model_path": str(args.frontier_model_path),
+        }
+        write_json(run_dir / "training_metadata.json", metadata)
+        write_json(metadata_path_for_policy(args.model_path), metadata)
+        print(
+            "Skipped strict held-out evaluation: discovery produced no new "
+            "distance milestone or completed lap."
+        )
 
 
 if __name__ == "__main__":

@@ -195,6 +195,52 @@ class Td3ScratchAgentTests(unittest.TestCase):
             0.09,
         )
 
+    def test_training_action_noise_is_reproducible_and_rng_isolated(self):
+        first = train_td3_agent.SeededGaussianActionNoise(
+            seed=12345,
+            standard_deviation=0.006,
+            action_size=3,
+        )
+        second = train_td3_agent.SeededGaussianActionNoise(
+            seed=12345,
+            standard_deviation=0.006,
+            action_size=3,
+        )
+
+        for _ in range(5):
+            expected = first()
+            np.random.seed(999)
+            np.random.random(10_000)
+            np.testing.assert_array_equal(second(), expected)
+
+        before_reset = first()
+        first.reset()
+        self.assertFalse(np.array_equal(first(), before_reset))
+        self.assertNotEqual(
+            train_td3_agent.training_action_noise_seed(42, 0),
+            train_td3_agent.training_action_noise_seed(42, 1),
+        )
+
+    def test_legacy_training_noise_preserves_signed_pedal_perturbation(self):
+        first = train_td3_agent.SeededLegacyActionNoise(
+            seed=12345,
+            standard_deviation=0.006,
+        )
+        second = train_td3_agent.SeededLegacyActionNoise(
+            seed=12345,
+            standard_deviation=0.006,
+        )
+
+        for _ in range(10):
+            sample = first()
+            np.testing.assert_array_equal(second(), sample)
+            self.assertEqual(sample.shape, (3,))
+            self.assertAlmostEqual(float(sample[2]), -float(sample[1]))
+
+        before_reset = first()
+        first.reset()
+        self.assertFalse(np.array_equal(first(), before_reset))
+
     def test_rate_limiter_smooths_actuator_changes(self):
         limited = rate_limit_td3_action(
             {"steer": 0.90, "accel": 1.0, "brake": 0.0},
@@ -296,6 +342,17 @@ class Td3ScratchAgentTests(unittest.TestCase):
 
 
 class Td3ScratchTrainingUtilityTests(unittest.TestCase):
+    def test_training_progress_best_metrics_are_monotonic(self):
+        progress = train_td3_agent.TrainingProgressState()
+
+        progress.record_best_distance(1_922.96)
+        progress.record_best_distance(1_437.0)
+        progress.record_best_reward(4_664.0)
+        progress.record_best_reward(4_028.0)
+
+        self.assertEqual(progress.best_distance_m, 1_922.96)
+        self.assertEqual(progress.best_reward, 4_664.0)
+
     def test_reward_prefers_forward_progress_and_new_distance(self):
         previous = _telemetry(distance=100.0, raced=100.0, speed=60.0)
         progressed = _telemetry(distance=108.0, raced=108.0, speed=76.0)
@@ -322,7 +379,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
         self.assertGreater(good_reward, stuck_reward)
 
-    def test_reward_penalises_late_braking_into_sensor_danger(self):
+    def test_streamlined_reward_is_independent_of_actuator_choice(self):
         stage = train_td3_agent.CURRICULUM[1]
         previous = _telemetry(distance=300.0, raced=300.0, speed=140.0)
         danger = _telemetry(distance=306.0, raced=306.0, speed=142.0)
@@ -343,7 +400,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             episode_distance_m=306.0,
         )
 
-        self.assertLess(throttle_reward, braking_reward)
+        self.assertEqual(throttle_reward, braking_reward)
 
     def test_reward_heavily_penalises_off_track_failure(self):
         stage = train_td3_agent.CURRICULUM[0]
@@ -360,23 +417,25 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             terminal_failure=True,
         )
 
-        self.assertLess(reward, -120.0)
+        self.assertEqual(reward, -25.0)
 
-    def test_reward_penalises_high_speed_oversteer(self):
+    def test_reward_uses_heading_aligned_speed(self):
         stage = train_td3_agent.CURRICULUM[1]
         previous = _telemetry(distance=260.0, raced=260.0, speed=112.0)
-        telemetry = _telemetry(distance=266.0, raced=266.0, speed=112.0)
+        aligned = _telemetry(distance=266.0, raced=266.0, speed=112.0)
+        misaligned = _telemetry(distance=266.0, raced=266.0, speed=112.0)
+        misaligned["angle"] = 0.9
 
-        smooth_reward = train_td3_agent.calculate_td3_reward(
-            telemetry,
+        aligned_reward = train_td3_agent.calculate_td3_reward(
+            aligned,
             {"steer": 0.10, "accel": 0.4, "brake": 0.0},
             previous_telemetry=previous,
             stage=stage,
             episode_distance_m=266.0,
             previous_furthest_distance_m=260.0,
         )
-        oversteer_reward = train_td3_agent.calculate_td3_reward(
-            telemetry,
+        misaligned_reward = train_td3_agent.calculate_td3_reward(
+            misaligned,
             {"steer": 0.90, "accel": 0.4, "brake": 0.0},
             previous_telemetry=previous,
             stage=stage,
@@ -384,9 +443,9 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             previous_furthest_distance_m=260.0,
         )
 
-        self.assertLess(oversteer_reward, smooth_reward - 4.0)
+        self.assertLess(misaligned_reward, aligned_reward)
 
-    def test_reward_components_penalise_clear_track_stalling_without_creep_bonus(self):
+    def test_reward_components_are_streamlined_and_unit_correct(self):
         stage = train_td3_agent.CURRICULUM[2]
         previous = _telemetry(distance=1400.0, raced=1400.0, speed=16.0)
         slow = _telemetry(distance=1400.04, raced=1400.04, speed=12.0)
@@ -401,8 +460,19 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             previous_furthest_distance_m=1400.0,
         )
 
-        self.assertNotIn("low_speed_creep_bonus", components)
-        self.assertLess(components["clear_track_anti_stall_penalty"], 0.0)
+        self.assertEqual(
+            set(components),
+            {
+                "forward_speed",
+                "track_edge_penalty",
+                "terminal_failure",
+                "total_unclipped",
+                "total",
+            },
+        )
+        self.assertAlmostEqual(components["forward_speed"], 12.0 / 3.6 * 0.1)
+        self.assertEqual(components["track_edge_penalty"], 0.0)
+        self.assertEqual(components["terminal_failure"], 0.0)
         self.assertAlmostEqual(
             components["total"],
             train_td3_agent.calculate_td3_reward(
@@ -414,6 +484,24 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                 previous_furthest_distance_m=1400.0,
             ),
         )
+
+    def test_streamlined_reward_applies_soft_normalized_track_edge_penalty(self):
+        centered = _telemetry(speed=72.0, track_pos=0.0)
+        near_edge = _telemetry(speed=72.0, track_pos=0.9)
+
+        centered_components = train_td3_agent.calculate_td3_reward_components(
+            centered,
+            {},
+        )
+        edge_components = train_td3_agent.calculate_td3_reward_components(
+            near_edge,
+            {},
+        )
+
+        self.assertEqual(centered_components["forward_speed"], 2.0)
+        self.assertEqual(centered_components["track_edge_penalty"], 0.0)
+        self.assertAlmostEqual(edge_components["track_edge_penalty"], -0.375)
+        self.assertLess(edge_components["total"], centered_components["total"])
 
     def test_sector_milestones_are_discovered_once_in_distance_order(self):
         first = train_td3_agent.sector_milestones_crossed(
@@ -433,13 +521,13 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             (1450.0, 1550.0, 1750.0),
         )
 
-    def test_sector_milestone_bonus_is_explicit_and_does_not_remove_anti_stall(self):
+    def test_sector_milestones_do_not_change_streamlined_reward(self):
         stage = train_td3_agent.CURRICULUM[2]
         previous = _telemetry(distance=1449.95, raced=1449.95, speed=12.0)
         current = _telemetry(distance=1450.1, raced=1450.1, speed=10.0)
         current["track"] = [60.0] * 19
 
-        components = train_td3_agent.calculate_td3_reward_components(
+        with_milestone = train_td3_agent.calculate_td3_reward_components(
             current,
             {"accel": 0.0, "brake": 0.1},
             previous_telemetry=previous,
@@ -448,10 +536,16 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             previous_furthest_distance_m=1449.95,
             newly_achieved_sector_milestones_m=(1450.0,),
         )
+        without_milestone = train_td3_agent.calculate_td3_reward_components(
+            current,
+            {"accel": 0.0, "brake": 0.1},
+            previous_telemetry=previous,
+            stage=stage,
+            episode_distance_m=1450.1,
+            previous_furthest_distance_m=1449.95,
+        )
 
-        self.assertEqual(components["sector_milestone_bonus"], 120.0)
-        self.assertLess(components["clear_track_anti_stall_penalty"], 0.0)
-        self.assertNotIn("low_speed_creep_bonus", components)
+        self.assertEqual(with_milestone, without_milestone)
 
     def test_curriculum_stages_progress_from_launch_to_full_lap(self):
         stages = train_td3_agent.CURRICULUM
@@ -915,7 +1009,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         callback._on_step()
 
         self.assertIsNotNone(callback.model.action_noise)
-        self.assertEqual(callback.model.gradient_steps, 1)
+        self.assertEqual(callback.model.gradient_steps, 0)
         self.assertFalse(env.modes[-1]["deterministic_probe"])
         self.assertEqual(env.modes[-1]["training_phase"], "learning")
 
@@ -975,6 +1069,159 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         callback.num_timesteps = 50_000
         callback._on_step()
         self.assertEqual(env.modes[-1]["training_phase"], "learning")
+
+    def test_discovery_callback_preserves_approach_until_frontier_gate(self):
+        class FakeBaseCallback:
+            def __init__(self, verbose=0):
+                self.locals = {}
+                self.model = None
+                self.num_timesteps = 0
+
+        class FakeModel:
+            def __init__(self):
+                self.action_noise = "unconfigured"
+                self.gradient_steps = 1
+                self.frontier_gate_values = []
+                self.episode_actor_eligibility = []
+
+            def set_discovery_frontier_gate_open(self, value):
+                self.frontier_gate_values.append(bool(value))
+
+            def set_discovery_episode_actor_eligible(self, value):
+                self.episode_actor_eligibility.append(bool(value))
+
+        class FakeEnv:
+            def __init__(self):
+                self.modes = []
+
+            def set_policy_mode(self, **mode):
+                self.modes.append(mode)
+
+        env = FakeEnv()
+        Callback = train_td3_agent.make_exploration_schedule_callback_class(
+            FakeBaseCallback
+        )
+        callback = Callback(
+            env,
+            lambda sigma: ("noise", sigma),
+            learning_starts=20,
+            initial_sigma=0.006,
+            final_sigma=0.002,
+            decay_steps=100_000,
+            probe_interval=10,
+            training_gradient_steps=1,
+            pre_update_training_phase="replay_refill",
+            actor_update_start=40,
+            actor_full_unfreeze=80,
+            frontier_exploration_start_distance_m=1_900.0,
+            regular_probes_enabled=False,
+        )
+        callback.model = FakeModel()
+
+        callback._on_training_start()
+        self.assertIsNone(callback.model.action_noise)
+        self.assertFalse(callback.model.frontier_gate_values[-1])
+        self.assertEqual(env.modes[-1]["action_noise_sigma"], 0.0)
+
+        callback.num_timesteps = 39
+        callback.locals = {
+            "infos": [{"distance_m": 1_905.0, "deterministic_probe": False}]
+        }
+        callback._on_step()
+        self.assertIsNone(callback.model.action_noise)
+        self.assertFalse(callback.frontier_gate_open)
+
+        callback.num_timesteps = 40
+        callback._on_step()
+        self.assertTrue(callback.frontier_gate_open)
+        self.assertEqual(callback.model.action_noise[0], "noise")
+        self.assertAlmostEqual(env.modes[-1]["action_noise_sigma"], 0.006, places=5)
+        self.assertTrue(callback.model.frontier_gate_values[-1])
+
+        callback.locals = {
+            "infos": [
+                {
+                    "distance_m": 1_920.0,
+                    "deterministic_probe": False,
+                    "episode_summary": {
+                        "policy_controlled": True,
+                        "deterministic_probe": False,
+                        "distance_m": 1_920.0,
+                    },
+                }
+            ]
+        }
+        callback._on_step()
+        self.assertFalse(callback.frontier_gate_open)
+        self.assertIsNone(callback.model.action_noise)
+        self.assertEqual(env.modes[-1]["action_noise_sigma"], 0.0)
+        self.assertTrue(callback.model.episode_actor_eligibility[-1])
+
+    def test_frozen_policy_health_guard_stops_before_actor_updates(self):
+        class FakeBaseCallback:
+            def __init__(self, verbose=0):
+                self.locals = {}
+                self.model = None
+                self.num_timesteps = 25
+
+        class FakeModel:
+            def __init__(self):
+                self.action_noise = None
+                self.gradient_steps = 1
+
+            def set_discovery_frontier_gate_open(self, _value):
+                return None
+
+            def set_discovery_episode_actor_eligible(self, _value):
+                return None
+
+        class FakeEnv:
+            def __init__(self):
+                self.modes = []
+
+            def set_policy_mode(self, **mode):
+                self.modes.append(mode)
+
+        callback_class = train_td3_agent.make_exploration_schedule_callback_class(
+            FakeBaseCallback
+        )
+        callback = callback_class(
+            FakeEnv(),
+            lambda sigma: ("noise", sigma),
+            learning_starts=20,
+            initial_sigma=0.006,
+            final_sigma=0.002,
+            decay_steps=100_000,
+            probe_interval=10,
+            training_gradient_steps=1,
+            actor_update_start=40,
+            frontier_exploration_start_distance_m=1_300.0,
+            frozen_policy_baseline_distance_m=1_422.0,
+        )
+        callback.model = FakeModel()
+        first_summary = {
+            "policy_controlled": True,
+            "deterministic_probe": False,
+            "distance_m": 100.0,
+            "furthest_distance_m": 100.0,
+            "action_noise_sigma": 0.0,
+        }
+        callback.locals = {"infos": [{"episode_summary": first_summary}]}
+
+        self.assertTrue(callback._on_step())
+        self.assertEqual(first_summary["frozen_policy_health_decision"], "degraded")
+        self.assertEqual(callback.frozen_policy_health_failure_streak, 1)
+
+        second_summary = dict(first_summary)
+        callback.locals = {"infos": [{"episode_summary": second_summary}]}
+
+        self.assertFalse(callback._on_step())
+        self.assertEqual(
+            second_summary["frozen_policy_health_decision"],
+            "abort_before_actor_updates",
+        )
+        self.assertIsNotNone(callback.frozen_policy_health_failure_reason)
+        self.assertEqual(callback.model.gradient_steps, 0)
 
     def test_safe_actor_candidate_forces_repeated_probes_then_rolls_back(self):
         class FakeBaseCallback:
@@ -1092,6 +1339,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             callback.model.action_noise,
             train_td3_agent.SeededSteeringActionNoise,
         )
+        self.assertEqual(callback.model.gradient_steps, 0)
 
         second_summary = {
             "policy_controlled": True,
@@ -1106,6 +1354,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(second_summary["safe_actor_decision"], "rolled_back")
         self.assertFalse(env.modes[-1]["deterministic_probe"])
         self.assertFalse(env.modes[-1]["safe_actor_candidate_probe"])
+        self.assertEqual(callback.model.gradient_steps, 0)
 
     def test_accepted_safe_actor_probe_is_committed_to_curriculum(self):
         class FakeBaseCallback:
@@ -1256,6 +1505,84 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(summary["probe_overhead_timestep"], 0)
         self.assertFalse(env.modes[-1]["deterministic_probe"])
 
+    def test_pending_safe_actor_probe_drains_after_training_budget_boundary(self):
+        class FakeBaseCallback:
+            def __init__(self, verbose=0):
+                self.locals = {}
+                self.num_timesteps = 1
+
+        class FakeModel:
+            action_noise = None
+            gradient_steps = 1
+
+            def safe_actor_probe_required(self):
+                return True
+
+            def safe_actor_probe_eligible(self):
+                return True
+
+            def safe_actor_next_probe_stage(self):
+                return "screening"
+
+            def safe_actor_probe_context(self):
+                return {
+                    "mode": "candidate",
+                    "seed": 123,
+                    "trial_index": 0,
+                    "trials_per_seed": 2,
+                    "probe_stage": "screening",
+                    "order_position": 0,
+                }
+
+        class FakeEnv:
+            current_stage = types.SimpleNamespace(max_episode_steps=10_000)
+            safe_actor_screening_max_episode_steps = 1_200
+
+            def __init__(self):
+                self.modes = []
+
+            def set_policy_mode(self, **mode):
+                self.modes.append(mode)
+
+        budget = train_td3_agent.ProbeBudgetController(10_000, 2_500)
+        budget.training_steps = 9_999
+        budget.environment_steps = 9_999
+        env = FakeEnv()
+        Callback = train_td3_agent.make_exploration_schedule_callback_class(
+            FakeBaseCallback
+        )
+        callback = Callback(
+            env,
+            lambda sigma: ("noise", sigma),
+            learning_starts=0,
+            initial_sigma=0.02,
+            final_sigma=0.006,
+            decay_steps=100_000,
+            probe_interval=10,
+            training_gradient_steps=1,
+            training_budget_state=budget,
+        )
+        callback.model = FakeModel()
+        callback.locals = {
+            "infos": [
+                {
+                    "deterministic_probe": False,
+                    "episode_summary": {
+                        "policy_controlled": True,
+                        "deterministic_probe": False,
+                        "training_budget_boundary_reached": True,
+                    },
+                }
+            ]
+        }
+
+        keep_training = callback._on_step()
+
+        self.assertTrue(keep_training)
+        self.assertTrue(budget.training_budget_reached)
+        self.assertTrue(env.modes[-1]["deterministic_probe"])
+        self.assertEqual(callback.model.gradient_steps, 1)
+
     def test_exhausted_probe_capacity_defers_candidate_and_keeps_learning(self):
         class FakeBaseCallback:
             def __init__(self, verbose=0):
@@ -1341,6 +1668,10 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(args.critic_warmup_steps, 0)
         self.assertEqual(args.actor_unfreeze_steps, 0)
         self.assertEqual(args.buffer_size, 1_000_000)
+        self.assertEqual(
+            args.gradient_steps,
+            train_td3_agent.DEFAULT_EPISODE_GRADIENT_STEPS,
+        )
         self.assertEqual(args.learning_rate, 3e-4)
         self.assertEqual(args.learning_rate_final, 1e-4)
         self.assertEqual(args.actor_learning_rate, 3e-4)
@@ -1354,13 +1685,14 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(args.safe_actor_max_action_delta, 0.01)
         self.assertEqual(args.safe_actor_gradient_norm, 1.0)
         self.assertEqual(args.safe_actor_block_updates, 100)
-        self.assertEqual(args.safe_actor_blocks_per_probe, 25)
+        self.assertEqual(args.safe_actor_blocks_per_probe, 1)
         self.assertEqual(args.safe_actor_probe_repeats, 3)
         self.assertEqual(args.safe_actor_trials_per_seed, 2)
         self.assertEqual(args.safe_actor_screening_trials_per_seed, 2)
         self.assertEqual(args.safe_actor_probe_base_seed, 20260820)
         self.assertEqual(args.safe_actor_probe_noise_std, 0.006)
         self.assertEqual(args.safe_actor_min_improvement_m, 5.0)
+        self.assertEqual(args.breakthrough_improvement_m, 25.0)
         self.assertEqual(args.safe_actor_median_regression_tolerance_m, 25.0)
         self.assertEqual(args.safe_actor_minimum_regression_tolerance_m, 150.0)
         self.assertEqual(args.safe_actor_max_paired_regression_m, 200.0)
@@ -1371,6 +1703,23 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(args.probe_evidence_window, 8)
         self.assertEqual(args.probe_min_evidence_episodes, 3)
         self.assertEqual(args.probe_evidence_max_regression_m, 150.0)
+        self.assertFalse(args.discovery_mode)
+        self.assertFalse(args.resume_frontier)
+        self.assertFalse(args.robustify_frontier)
+        self.assertEqual(args.frontier_min_improvement_m, 5.0)
+        self.assertEqual(args.frontier_major_breakthrough_m, 25.0)
+        self.assertEqual(args.frontier_qualification_distance_m, 1_400.0)
+        self.assertEqual(args.frontier_qualification_attempts, 3)
+        self.assertEqual(args.frontier_exploration_start_distance_m, 1_300.0)
+        self.assertFalse(args.frontier_qualification_enabled)
+        self.assertEqual(args.discovery_collapse_episodes, 8)
+        self.assertEqual(args.discovery_collapse_distance_m, 5.0)
+        self.assertEqual(args.discovery_frontier_preservation_fraction, 1.0)
+        self.assertEqual(args.discovery_recovery_cooldown_steps, 10_000)
+        self.assertEqual(args.discovery_max_recovery_cooldown_steps, 40_000)
+        self.assertEqual(args.discovery_actor_lr_backoff, 0.5)
+        self.assertEqual(args.discovery_min_actor_lr_scale, 0.125)
+        self.assertEqual(args.discovery_max_policy_delay, 8)
         self.assertEqual(args.safe_actor_anchor_batch_size, 256)
         self.assertFalse(args.allow_non_champion_source)
         self.assertFalse(args.allow_legacy_action_migration)
@@ -1380,6 +1729,70 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertFalse(args.end_of_run_evaluation)
         self.assertEqual(args.warmup_steer_std, 0.18)
         self.assertFalse(args.save_best_replay_buffer)
+
+    def test_resume_frontier_restores_lean_standard_td3_protocol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frontier = root / "frontier.zip"
+            frontier.write_bytes(b"historical-frontier")
+            metadata_path_for_policy(frontier).write_text(
+                json.dumps(
+                    {
+                        "model_family": AGENT6_MODEL_FAMILY,
+                        "observation_version": AGENT6_OBSERVATION_VERSION,
+                        "action_version": AGENT6_ACTION_VERSION,
+                        "feature_names": FEATURE_NAMES,
+                        "action_shape": AGENT6_ACTION_SHAPE,
+                        "learning_source": "reward_only",
+                        "track": "g-track-3",
+                        "frontier_champion": {
+                            "distance_m": 1_922.96,
+                            "completed_lap": False,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            argv = [
+                str(SCRIPT_PATH),
+                "--resume-frontier",
+                "--frontier-model-path",
+                str(frontier),
+                "--frontier-evidence-path",
+                str(root / "missing-evidence.json"),
+                "--total-timesteps",
+                "50000",
+            ]
+            with mock.patch.object(sys, "argv", argv):
+                args = train_td3_agent.parse_args()
+
+        self.assertTrue(args.lean_frontier_training)
+        self.assertTrue(args.discovery_mode)
+        self.assertFalse(args.frontier_qualification_enabled)
+        self.assertFalse(args.safe_actor_improvement)
+        self.assertEqual(args.replay_refill_steps, 5_000)
+        self.assertEqual(args.critic_warmup_steps, 10_000)
+        self.assertEqual(args.actor_unfreeze_steps, 0)
+        self.assertEqual(args.gradient_steps, 1)
+        self.assertEqual(args.learning_rate, 3e-4)
+        self.assertEqual(args.learning_rate_final, 3e-4)
+        self.assertEqual(args.actor_learning_rate, 3e-5)
+        self.assertEqual(args.actor_learning_rate_final, 3e-5)
+        self.assertEqual(args.action_noise_sigma, 0.05)
+        self.assertEqual(args.action_noise_final_sigma, 0.05)
+        self.assertEqual(args.target_policy_noise, 0.10)
+        self.assertEqual(args.target_noise_clip, 0.20)
+        self.assertEqual(
+            train_td3_agent.policy_action_start_timestep(args),
+            5_000,
+        )
+        self.assertEqual(
+            train_td3_agent.actor_update_start_timestep(args),
+            15_000,
+        )
+        self.assertFalse(args.continuation_compatibility_probe)
+        self.assertTrue(args.end_of_run_evaluation)
+        self.assertTrue(args.save_best_replay_buffer)
 
     def test_continuation_defaults_are_conservative_and_policy_controlled(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1436,20 +1849,21 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(args.learning_rate_final, 1e-5)
         self.assertEqual(args.actor_learning_rate, 1e-5)
         self.assertEqual(args.actor_learning_rate_final, 3e-6)
-        self.assertEqual(args.action_noise_sigma, 0.02)
-        self.assertEqual(args.action_noise_final_sigma, 0.006)
+        self.assertEqual(args.action_noise_sigma, 0.006)
+        self.assertEqual(args.action_noise_final_sigma, 0.002)
         self.assertTrue(args.save_best_replay_buffer)
         self.assertTrue(args.safe_actor_improvement)
         self.assertEqual(args.safe_actor_max_action_delta, 0.01)
         self.assertEqual(args.safe_actor_gradient_norm, 1.0)
         self.assertEqual(args.safe_actor_block_updates, 100)
-        self.assertEqual(args.safe_actor_blocks_per_probe, 25)
+        self.assertEqual(args.safe_actor_blocks_per_probe, 1)
         self.assertEqual(args.safe_actor_probe_repeats, 3)
         self.assertEqual(args.safe_actor_trials_per_seed, 2)
         self.assertEqual(args.safe_actor_screening_trials_per_seed, 2)
         self.assertEqual(args.safe_actor_probe_base_seed, 20260820)
         self.assertEqual(args.safe_actor_probe_noise_std, 0.006)
         self.assertEqual(args.safe_actor_min_improvement_m, 5.0)
+        self.assertEqual(args.breakthrough_improvement_m, 25.0)
         self.assertEqual(args.safe_actor_median_regression_tolerance_m, 25.0)
         self.assertEqual(args.safe_actor_minimum_regression_tolerance_m, 150.0)
         self.assertEqual(args.safe_actor_max_paired_regression_m, 200.0)
@@ -1556,27 +1970,135 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         )
 
     def test_continuation_model_loads_verified_weights_with_fresh_replay(self):
+        import gymnasium as gym
+        import torch
+        from stable_baselines3 import TD3
+
+        class TinyEnv(gym.Env):
+            observation_space = gym.spaces.Box(
+                -1.0, 1.0, shape=(4,), dtype=np.float32
+            )
+            action_space = gym.spaces.Box(
+                -1.0, 1.0, shape=(2,), dtype=np.float32
+            )
+
+            def reset(self, *, seed=None, options=None):
+                super().reset(seed=seed)
+                return np.zeros(4, dtype=np.float32), {}
+
+            def step(self, action):
+                return np.zeros(4, dtype=np.float32), 0.0, False, False, {}
+
+        TrainingTD3 = train_td3_agent.make_stable_frontier_td3_class(TD3)
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "frontier.zip"
+            source = TrainingTD3(
+                "MlpPolicy",
+                TinyEnv(),
+                policy_kwargs={"net_arch": [8, 8]},
+                learning_starts=0,
+                buffer_size=64,
+                batch_size=4,
+                seed=7,
+                device="cpu",
+            )
+            with torch.no_grad():
+                next(source.actor.parameters()).add_(0.25)
+                next(source.critic.parameters()).add_(0.75)
+            source_actor = {
+                name: value.detach().clone()
+                for name, value in source.actor.state_dict().items()
+            }
+            source_critic = {
+                name: value.detach().clone()
+                for name, value in source.critic.state_dict().items()
+            }
+            source.num_timesteps = 35_226
+            source.save(checkpoint)
+            args = types.SimpleNamespace(
+                continuation=True,
+                exact_resume=False,
+                lean_frontier_training=True,
+                resume_from=checkpoint,
+                allow_legacy_action_migration=False,
+                verbose_training=False,
+                buffer_size=64,
+                learning_starts=20_000,
+                replay_refill_steps=10_000,
+                batch_size=4,
+                gamma=0.995,
+                tau=0.005,
+                train_freq=1,
+                gradient_steps=1,
+                policy_delay=2,
+                target_policy_noise=0.2,
+                target_noise_clip=0.5,
+                seed=42,
+                device="cpu",
+                net_arch=[8, 8],
+            )
+            model = train_td3_agent.create_td3_model(
+                TrainingTD3,
+                args=args,
+                env=TinyEnv(),
+                tensorboard_log=None,
+                action_noise=None,
+                learning_rate_schedule=lambda _: 3e-4,
+            )
+
+        self.assertEqual(model.num_timesteps, 0)
+        self.assertEqual(model.replay_buffer.size(), 0)
+        for name, value in model.actor.state_dict().items():
+            self.assertTrue(torch.equal(value, source_actor[name]))
+            self.assertTrue(
+                torch.equal(model.actor_target.state_dict()[name], source_actor[name])
+            )
+        self.assertTrue(
+            any(
+                not torch.equal(value, source_critic[name])
+                for name, value in model.critic.state_dict().items()
+            )
+        )
+        transfer = model._agent6_actor_only_transfer
+        self.assertEqual(transfer["source_model_num_timesteps"], 35_226)
+        self.assertTrue(transfer["fresh_critic"])
+        self.assertTrue(transfer["fresh_replay_buffer"])
+
+    def test_lean_frontier_model_uses_standard_step_train_frequency(self):
+        class FakeModule:
+            def __init__(self):
+                self.state = {"weight": np.asarray([1.0], dtype=np.float32)}
+
+            def state_dict(self):
+                return dict(self.state)
+
+            def load_state_dict(self, state, strict=True):
+                self.state = dict(state)
+
         class FakeTD3:
             load_call = None
+            init_kwargs = None
+
+            def __init__(self, *_args, **kwargs):
+                type(self).init_kwargs = kwargs
+                self.actor = FakeModule()
+                self.actor_target = FakeModule()
+                self.num_timesteps = 0
 
             @classmethod
             def load(cls, path, **kwargs):
                 cls.load_call = (path, kwargs)
                 return types.SimpleNamespace(
-                    num_timesteps=35_226,
-                    policy=types.SimpleNamespace(
-                        action_space="dynamic_action_space",
-                        observation_space="dynamic_observation_space",
-                    ),
-                    replay_buffer=types.SimpleNamespace(
-                        action_space="dynamic_action_space",
-                        observation_space="dynamic_observation_space",
-                    ),
+                    num_timesteps=58_641,
+                    actor=FakeModule(),
+                    policy_kwargs={"net_arch": [8, 8]},
                 )
 
         args = types.SimpleNamespace(
             continuation=True,
-            resume_from=Path("verified.zip"),
+            exact_resume=False,
+            lean_frontier_training=True,
+            resume_from=Path("frontier.zip"),
             verbose_training=False,
             buffer_size=300_000,
             learning_starts=20_000,
@@ -1591,42 +2113,62 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             target_noise_clip=0.5,
             seed=42,
             device="cpu",
+            allow_legacy_action_migration=False,
+            net_arch=[8, 8],
         )
-        schedule = lambda _: 1e-4
         env = types.SimpleNamespace(
             action_space="standard_action_space",
             observation_space="standard_observation_space",
         )
-        model = train_td3_agent.create_td3_model(
+
+        train_td3_agent.create_td3_model(
             FakeTD3,
             args=args,
             env=env,
             tensorboard_log=None,
             action_noise="noise",
-            learning_rate_schedule=schedule,
+            learning_rate_schedule=lambda _: 1e-4,
         )
 
-        self.assertEqual(model.num_timesteps, 35_226)
-        path, kwargs = FakeTD3.load_call
-        self.assertEqual(path, "verified.zip")
-        self.assertEqual(kwargs["learning_starts"], 0)
-        self.assertEqual(kwargs["buffer_size"], 300_000)
-        self.assertIs(kwargs["learning_rate"], schedule)
-        self.assertEqual(model.action_space, "standard_action_space")
-        self.assertEqual(model.policy.action_space, "standard_action_space")
-        self.assertEqual(model.replay_buffer.action_space, "standard_action_space")
+        self.assertEqual(FakeTD3.init_kwargs["train_freq"], 1)
+        self.assertEqual(FakeTD3.load_call[1], {"device": "cpu"})
 
-    def test_legacy_continuation_loads_original_model_without_migration(self):
+    def test_legacy_continuation_transfers_actor_without_contract_migration(self):
+        class FakeModule:
+            def __init__(self):
+                self.state = {"weight": np.asarray([2.0], dtype=np.float32)}
+
+            def state_dict(self):
+                return dict(self.state)
+
+            def load_state_dict(self, state, strict=True):
+                self.state = dict(state)
+
         class FakeTD3:
             load_call = None
+
+            def __init__(self, *_args, **kwargs):
+                env = kwargs["env"]
+                self.actor = FakeModule()
+                self.actor_target = FakeModule()
+                self.num_timesteps = 0
+                self.action_space = env.action_space
+                self.policy = types.SimpleNamespace(
+                    action_space=env.action_space,
+                    observation_space=env.observation_space,
+                )
+                self.replay_buffer = types.SimpleNamespace(
+                    action_space=env.action_space,
+                    observation_space=env.observation_space,
+                )
 
             @classmethod
             def load(cls, path, **kwargs):
                 cls.load_call = (path, kwargs)
                 return types.SimpleNamespace(
                     num_timesteps=91_000,
-                    policy=types.SimpleNamespace(),
-                    replay_buffer=types.SimpleNamespace(),
+                    actor=FakeModule(),
+                    policy_kwargs={"net_arch": [8, 8]},
                 )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1661,6 +2203,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                 target_noise_clip=0.5,
                 seed=42,
                 device="cpu",
+                net_arch=[8, 8],
             )
             env = types.SimpleNamespace(
                 action_space="legacy_three_head_action_space",
@@ -1677,6 +2220,8 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             )
 
         self.assertEqual(FakeTD3.load_call[0], str(checkpoint))
+        self.assertEqual(FakeTD3.load_call[1], {"device": "cpu"})
+        self.assertEqual(model.num_timesteps, 0)
         self.assertEqual(model.action_space, "legacy_three_head_action_space")
         self.assertEqual(model.policy.action_space, "legacy_three_head_action_space")
         self.assertEqual(
@@ -2238,6 +2783,7 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         model._agent6_safe_actor_min_evidence_episodes = 2
         model._agent6_safe_actor_evidence_max_regression_m = 100.0
         model._agent6_safe_actor_accepted_distance_m = 1_400.0
+        model._agent6_safe_actor_accepted_maximum_distance_m = 1_400.0
         with torch.no_grad():
             next(model.actor.parameters()).add_(0.5)
         model._agent6_safe_actor_candidate_id = 4
@@ -2252,11 +2798,20 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                 }
             )
 
-        self.assertEqual(evidence_result["decision"], "rolled_back_no_evidence")
-        self.assertFalse(model.safe_actor_probe_required())
-        for name, value in model.actor.state_dict().items():
-            self.assertTrue(torch.equal(value, accepted_actor[name]))
-        self.assertEqual(model.safe_actor_status()["no_evidence_blocks"], 1)
+        self.assertEqual(
+            evidence_result["decision"],
+            "probe_eligible_candidate_block",
+        )
+        self.assertEqual(
+            evidence_result["evidence_reasons"],
+            ["completed_candidate_block"],
+        )
+        self.assertTrue(model.safe_actor_probe_required())
+        self.assertTrue(model.safe_actor_probe_eligible())
+        self.assertIsNotNone(model.safe_actor_probe_context())
+        self.assertEqual(model.safe_actor_status()["no_evidence_blocks"], 0)
+        model._restore_safe_actor()
+        model._reset_safe_actor_probe_runtime()
 
         with torch.no_grad():
             next(model.actor.parameters()).add_(0.01)
@@ -2271,8 +2826,23 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(lap_evidence["decision"], "probe_eligible")
+        self.assertEqual(
+            lap_evidence["decision"],
+            "probe_eligible_breakthrough",
+        )
+        self.assertEqual(lap_evidence["evidence_reasons"], ["lap_completion"])
         self.assertTrue(model.safe_actor_probe_required())
+        self.assertIsNotNone(model._agent6_safe_actor_candidate_state)
+        self.assertEqual(model.safe_actor_status()["breakthrough_candidates"], 1)
+        candidate_actor = {
+            name: value.detach().clone()
+            for name, value in model.actor.state_dict().items()
+        }
+        exact_state = model.exact_training_state_dict()
+        model._restore_safe_actor()
+        model.restore_exact_training_state(exact_state)
+        for name, value in model.actor.state_dict().items():
+            self.assertTrue(torch.equal(value, candidate_actor[name]))
 
     def test_safe_actor_projection_enforces_action_space_limit(self):
         import gymnasium as gym
@@ -2357,9 +2927,479 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         status = model.safe_actor_status()
         self.assertEqual(status["candidate_updates"], 2)
         self.assertTrue(status["waiting_for_probe"])
+        self.assertTrue(status["probe_eligible"])
         self.assertEqual(status["accepted_blocks"], 0)
         self.assertEqual(status["rolled_back_blocks"], 0)
         self.assertGreater(model._n_updates, status["candidate_updates"])
+
+    def test_critic_only_warmup_keeps_actor_parameters_frozen(self):
+        import gymnasium as gym
+        import torch
+        from stable_baselines3 import TD3
+
+        class TinyEnv(gym.Env):
+            observation_space = gym.spaces.Box(
+                -1.0,
+                1.0,
+                shape=(4,),
+                dtype=np.float32,
+            )
+            action_space = gym.spaces.Box(
+                -1.0,
+                1.0,
+                shape=(2,),
+                dtype=np.float32,
+            )
+
+            def reset(self, *, seed=None, options=None):
+                super().reset(seed=seed)
+                return np.zeros(4, dtype=np.float32), {}
+
+            def step(self, action):
+                observation = np.full(4, 0.25, dtype=np.float32)
+                return observation, 1.0, False, False, {}
+
+        SafeTD3 = train_td3_agent.make_phased_continuation_td3_class(TD3)
+        model = SafeTD3(
+            "MlpPolicy",
+            TinyEnv(),
+            policy_kwargs={"net_arch": [8, 8]},
+            learning_starts=0,
+            buffer_size=64,
+            batch_size=4,
+            train_freq=1,
+            gradient_steps=1,
+            policy_delay=1,
+            device="cpu",
+        )
+        model.configure_continuation_updates(
+            actor_learning_rate_schedule=lambda _: 1e-4,
+            actor_updates_start_at=100,
+            safe_actor_improvement=True,
+            safe_actor_block_updates=2,
+        )
+        actor_before = {
+            name: value.detach().clone()
+            for name, value in model.actor.state_dict().items()
+        }
+        critic_before = {
+            name: value.detach().clone()
+            for name, value in model.critic.state_dict().items()
+        }
+
+        model.learn(total_timesteps=10)
+
+        for name, value in model.actor.state_dict().items():
+            self.assertTrue(torch.equal(value, actor_before[name]))
+        self.assertTrue(
+            any(
+                not torch.equal(value, critic_before[name])
+                for name, value in model.critic.state_dict().items()
+            )
+        )
+
+    def test_frontier_finetuning_unfreezes_only_after_successful_critic_updates(self):
+        import gymnasium as gym
+        import torch
+        from stable_baselines3 import TD3
+
+        class TinyEnv(gym.Env):
+            observation_space = gym.spaces.Box(
+                -1.0, 1.0, shape=(4,), dtype=np.float32
+            )
+            action_space = gym.spaces.Box(
+                -1.0, 1.0, shape=(2,), dtype=np.float32
+            )
+
+            def reset(self, *, seed=None, options=None):
+                super().reset(seed=seed)
+                return np.zeros(4, dtype=np.float32), {}
+
+            def step(self, action):
+                return np.full(4, 0.25, dtype=np.float32), 1.0, False, False, {}
+
+        StableTD3 = train_td3_agent.make_stable_frontier_td3_class(TD3)
+        model = StableTD3(
+            "MlpPolicy",
+            TinyEnv(),
+            policy_kwargs={"net_arch": [8, 8]},
+            learning_starts=0,
+            buffer_size=64,
+            batch_size=4,
+            train_freq=1,
+            gradient_steps=1,
+            policy_delay=2,
+            device="cpu",
+        )
+        model.configure_continuation_updates(
+            actor_learning_rate_schedule=lambda _: 1e-3,
+            actor_updates_start_at=0,
+            safe_actor_improvement=False,
+            critic_warmup_updates=4,
+            critic_gradient_norm=1.0,
+            critic_huber_beta=1.0,
+            freeze_actor_before_updates=True,
+        )
+        actor_before = {
+            name: value.detach().clone()
+            for name, value in model.actor.state_dict().items()
+        }
+
+        original_huber = torch.nn.functional.smooth_l1_loss
+        with mock.patch(
+            "torch.nn.functional.smooth_l1_loss",
+            wraps=original_huber,
+        ) as huber:
+            model.learn(total_timesteps=4)
+
+        self.assertEqual(model._agent6_critic_updates_since_transfer, 4)
+        self.assertTrue(model._agent6_actor_parameters_frozen)
+        self.assertTrue(all(not parameter.requires_grad for parameter in model.actor.parameters()))
+        for name, value in model.actor.state_dict().items():
+            self.assertTrue(torch.equal(value, actor_before[name]))
+        self.assertGreater(huber.call_count, 0)
+        self.assertTrue(all(call.kwargs["beta"] == 1.0 for call in huber.call_args_list))
+
+        model.learn(total_timesteps=2, reset_num_timesteps=False)
+
+        self.assertFalse(model._agent6_actor_parameters_frozen)
+        self.assertTrue(all(parameter.requires_grad for parameter in model.actor.parameters()))
+        self.assertTrue(
+            any(
+                not torch.equal(value, actor_before[name])
+                for name, value in model.actor.state_dict().items()
+            )
+        )
+
+    def test_replay_bootstraps_timeouts_but_not_physical_failures(self):
+        import gymnasium as gym
+        from stable_baselines3.common.buffers import ReplayBuffer
+
+        observation_space = gym.spaces.Box(
+            -1.0, 1.0, shape=(2,), dtype=np.float32
+        )
+        action_space = gym.spaces.Box(
+            -1.0, 1.0, shape=(1,), dtype=np.float32
+        )
+        replay = ReplayBuffer(
+            8,
+            observation_space,
+            action_space,
+            device="cpu",
+            handle_timeout_termination=True,
+        )
+        observation = np.zeros((1, 2), dtype=np.float32)
+        action = np.zeros((1, 1), dtype=np.float32)
+        reward = np.ones(1, dtype=np.float32)
+        done = np.ones(1, dtype=np.float32)
+        replay.add(
+            observation,
+            observation,
+            action,
+            reward,
+            done,
+            [{"TimeLimit.truncated": True, "physical_failure": False}],
+        )
+        replay.add(
+            observation,
+            observation,
+            action,
+            reward,
+            done,
+            [{"TimeLimit.truncated": False, "physical_failure": True}],
+        )
+
+        timeout_sample = replay._get_samples(np.asarray([0]))
+        failure_sample = replay._get_samples(np.asarray([1]))
+
+        self.assertEqual(float(timeout_sample.dones.item()), 0.0)
+        self.assertEqual(float(failure_sample.dones.item()), 1.0)
+
+    def test_episode_atomic_update_runs_offline_then_resynchronizes_sb3(self):
+        import gymnasium as gym
+        from stable_baselines3 import TD3
+
+        class TinyEnv(gym.Env):
+            observation_space = gym.spaces.Box(
+                -1.0,
+                1.0,
+                shape=(4,),
+                dtype=np.float32,
+            )
+            action_space = gym.spaces.Box(
+                -1.0,
+                1.0,
+                shape=(2,),
+                dtype=np.float32,
+            )
+
+            def reset(self, *, seed=None, options=None):
+                super().reset(seed=seed)
+                return np.zeros(4, dtype=np.float32), {}
+
+            def step(self, action):
+                return np.zeros(4, dtype=np.float32), 0.0, False, False, {}
+
+        AtomicTD3 = train_td3_agent.make_phased_continuation_td3_class(TD3)
+        model = AtomicTD3(
+            "MlpPolicy",
+            TinyEnv(),
+            policy_kwargs={"net_arch": [8, 8]},
+            learning_starts=0,
+            buffer_size=32,
+            batch_size=4,
+            device="cpu",
+        )
+        lifecycle_events = []
+        raw_env = types.SimpleNamespace(
+            suspend_torcs_for_offline_updates=mock.Mock(
+                side_effect=lambda: lifecycle_events.append("suspend")
+            )
+        )
+        fresh_observation = np.full((1, 4), 0.75, dtype=np.float32)
+        model.env.reset = mock.Mock(
+            side_effect=lambda: (
+                lifecycle_events.append("reset") or fresh_observation
+            )
+        )
+        model._train_from_replay = mock.Mock(
+            side_effect=lambda *_: lifecycle_events.append("train")
+        )
+        model._last_obs = np.zeros((1, 4), dtype=np.float32)
+        model._last_episode_starts = np.zeros((1,), dtype=bool)
+        model.configure_episode_atomic_updates(raw_env)
+
+        model.train(7, batch_size=4)
+
+        self.assertEqual(lifecycle_events, ["suspend", "train", "reset"])
+        model._train_from_replay.assert_called_once_with(7, 4)
+        self.assertIs(model._last_obs, fresh_observation)
+        np.testing.assert_array_equal(model._last_episode_starts, [True])
+        self.assertEqual(model._agent6_episode_atomic_batches, 1)
+        self.assertIn(
+            "_agent6_episode_atomic_raw_env",
+            model._excluded_save_params(),
+        )
+
+    def test_standard_td3_mode_bypasses_continuation_actor_freeze(self):
+        import gymnasium as gym
+        import torch
+        from stable_baselines3 import TD3
+
+        class TinyEnv(gym.Env):
+            observation_space = gym.spaces.Box(
+                -1.0,
+                1.0,
+                shape=(4,),
+                dtype=np.float32,
+            )
+            action_space = gym.spaces.Box(
+                -1.0,
+                1.0,
+                shape=(2,),
+                dtype=np.float32,
+            )
+
+            def reset(self, *, seed=None, options=None):
+                super().reset(seed=seed)
+                return np.zeros(4, dtype=np.float32), {}
+
+            def step(self, action):
+                return np.full(4, 0.25, dtype=np.float32), 1.0, False, False, {}
+
+        StandardTD3 = train_td3_agent.make_phased_continuation_td3_class(TD3)
+        model = StandardTD3(
+            "MlpPolicy",
+            TinyEnv(),
+            policy_kwargs={"net_arch": [8, 8]},
+            learning_starts=0,
+            buffer_size=64,
+            batch_size=4,
+            train_freq=1,
+            gradient_steps=1,
+            policy_delay=2,
+            device="cpu",
+        )
+        model.configure_continuation_updates(
+            actor_learning_rate_schedule=lambda _: 0.0,
+            actor_updates_start_at=10_000,
+            safe_actor_improvement=False,
+        )
+        model.configure_standard_td3_updates()
+        actor_before = {
+            name: value.detach().clone()
+            for name, value in model.actor.state_dict().items()
+        }
+
+        model.learn(total_timesteps=10)
+
+        self.assertEqual(model._n_updates, 10)
+        self.assertTrue(
+            any(
+                not torch.equal(value, actor_before[name])
+                for name, value in model.actor.state_dict().items()
+            )
+        )
+
+    def test_episode_atomic_update_does_not_restart_after_optimizer_failure(self):
+        import gymnasium as gym
+        from stable_baselines3 import TD3
+
+        class TinyEnv(gym.Env):
+            observation_space = gym.spaces.Box(
+                -1.0,
+                1.0,
+                shape=(4,),
+                dtype=np.float32,
+            )
+            action_space = gym.spaces.Box(
+                -1.0,
+                1.0,
+                shape=(2,),
+                dtype=np.float32,
+            )
+
+            def reset(self, *, seed=None, options=None):
+                super().reset(seed=seed)
+                return np.zeros(4, dtype=np.float32), {}
+
+            def step(self, action):
+                return np.zeros(4, dtype=np.float32), 0.0, False, False, {}
+
+        AtomicTD3 = train_td3_agent.make_phased_continuation_td3_class(TD3)
+        model = AtomicTD3(
+            "MlpPolicy",
+            TinyEnv(),
+            policy_kwargs={"net_arch": [8, 8]},
+            learning_starts=0,
+            buffer_size=32,
+            batch_size=4,
+            device="cpu",
+        )
+        raw_env = types.SimpleNamespace(
+            suspend_torcs_for_offline_updates=mock.Mock()
+        )
+        model.configure_episode_atomic_updates(raw_env)
+        model.env.reset = mock.Mock()
+        model._train_from_replay = mock.Mock(
+            side_effect=RuntimeError("optimizer failed")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "optimizer failed"):
+            model.train(7, batch_size=4)
+
+        raw_env.suspend_torcs_for_offline_updates.assert_called_once_with()
+        model.env.reset.assert_not_called()
+        self.assertEqual(model._agent6_episode_atomic_batches, 0)
+
+    def test_discovery_collapse_restores_frontier_actor_and_retains_critic(self):
+        import gymnasium as gym
+        import torch
+        from stable_baselines3 import TD3
+
+        class TinyEnv(gym.Env):
+            observation_space = gym.spaces.Box(
+                -1.0,
+                1.0,
+                shape=(4,),
+                dtype=np.float32,
+            )
+            action_space = gym.spaces.Box(
+                -1.0,
+                1.0,
+                shape=(3,),
+                dtype=np.float32,
+            )
+
+            def reset(self, *, seed=None, options=None):
+                super().reset(seed=seed)
+                return np.zeros(4, dtype=np.float32), {}
+
+            def step(self, action):
+                return np.zeros(4, dtype=np.float32), 0.0, False, False, {}
+
+        RecoveryTD3 = train_td3_agent.make_phased_continuation_td3_class(TD3)
+        model = RecoveryTD3(
+            "MlpPolicy",
+            TinyEnv(),
+            policy_kwargs={"net_arch": [8, 8]},
+            learning_starts=0,
+            buffer_size=32,
+            batch_size=4,
+            policy_delay=2,
+            device="cpu",
+        )
+        model.configure_continuation_updates(
+            actor_learning_rate_schedule=lambda _: 1e-4,
+            actor_updates_start_at=0,
+            safe_actor_improvement=False,
+            legacy_action_contract=True,
+            discovery_recovery_enabled=True,
+            discovery_collapse_episodes=3,
+            discovery_collapse_distance_m=5.0,
+            discovery_recovery_cooldown_steps=10_000,
+            discovery_max_recovery_cooldown_steps=40_000,
+            discovery_actor_lr_backoff=0.5,
+            discovery_min_actor_lr_scale=0.125,
+            discovery_max_policy_delay=8,
+            discovery_frontier_gate_enabled=True,
+            discovery_frontier_gate_distance_m=1_900.0,
+            discovery_frontier_preservation_fraction=1.0,
+            source_verified_maximum_distance_m=1_922.96,
+        )
+        actor_anchor = {
+            name: value.detach().clone()
+            for name, value in model.actor.state_dict().items()
+        }
+        actor_target_anchor = {
+            name: value.detach().clone()
+            for name, value in model.actor_target.state_dict().items()
+        }
+        with torch.no_grad():
+            next(model.actor.parameters()).add_(0.5)
+            next(model.actor_target.parameters()).sub_(0.5)
+            next(model.critic.parameters()).add_(0.25)
+        retained_critic = {
+            name: value.detach().clone()
+            for name, value in model.critic.state_dict().items()
+        }
+        model._agent6_discovery_actor_updates_since_anchor = 1
+        model.num_timesteps = 50
+        failed_episode = {
+            "policy_controlled": True,
+            "deterministic_probe": False,
+            "distance_m": 1_400.0,
+            "furthest_distance_m": 1_400.0,
+        }
+
+        self.assertFalse(
+            model.record_discovery_training_episode(failed_episode)["triggered"]
+        )
+        self.assertFalse(
+            model.record_discovery_training_episode(failed_episode)["triggered"]
+        )
+        result = model.record_discovery_training_episode(failed_episode)
+
+        self.assertTrue(result["triggered"])
+        self.assertEqual(result["recovery_count"], 1)
+        self.assertEqual(result["cooldown_until"], 10_050)
+        self.assertEqual(result["actor_learning_rate_scale"], 0.5)
+        self.assertEqual(result["effective_policy_delay"], 4)
+        self.assertAlmostEqual(result["anchor_distance_m"], 1_922.96)
+        self.assertEqual(result["effective_failure_distance_m"], 1_900.0)
+        for name, value in model.actor.state_dict().items():
+            self.assertTrue(torch.equal(value, actor_anchor[name]))
+        for name, value in model.actor_target.state_dict().items():
+            self.assertTrue(torch.equal(value, actor_target_anchor[name]))
+        for name, value in model.critic.state_dict().items():
+            self.assertTrue(torch.equal(value, retained_critic[name]))
+
+        smoothing_noise = model._target_policy_smoothing_noise(
+            torch.zeros((16, 3), dtype=torch.float32)
+        )
+        self.assertTrue(
+            torch.equal(smoothing_noise[:, 2], -smoothing_noise[:, 1])
+        )
 
     def test_continuation_stage_requires_verified_prerequisite_progress(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2454,6 +3494,77 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
             )
         self.assertFalse(failing_env.modes[-1]["deterministic_probe"])
 
+    def test_frontier_source_qualification_retries_frozen_actor_before_training(self):
+        class FakeModel:
+            def predict(self, observation, deterministic=True):
+                self.deterministic = deterministic
+                return np.asarray([0.0, 0.6, 0.0], dtype=np.float32), None
+
+        class FakeEnv:
+            current_stage = types.SimpleNamespace(max_episode_steps=4)
+
+            def __init__(self, distances_m):
+                self.distances_m = list(distances_m)
+                self.attempt_index = -1
+                self.steps = 0
+                self.modes = []
+
+            def set_policy_mode(self, **kwargs):
+                self.modes.append(kwargs)
+
+            def reset(self, *, seed=None):
+                self.attempt_index += 1
+                self.steps = 0
+                return np.zeros(4, dtype=np.float32), {}
+
+            def step(self, action):
+                self.steps += 1
+                terminated = self.steps == 2
+                info = {"deterministic_probe": True}
+                if terminated:
+                    distance_m = self.distances_m[self.attempt_index]
+                    info["episode_summary"] = {
+                        "distance_m": distance_m,
+                        "furthest_distance_m": distance_m,
+                        "steps": self.steps,
+                        "termination_reason": "stuck",
+                    }
+                return np.zeros(4, dtype=np.float32), 0.0, terminated, False, info
+
+        budget = train_td3_agent.TrainingBudgetState(100, 100)
+        env = FakeEnv([1_500.0, 1_921.0])
+
+        result = train_td3_agent.run_frontier_source_qualification(
+            FakeModel(),
+            env,
+            minimum_distance_m=1_900.0,
+            maximum_attempts=3,
+            training_budget_state=budget,
+            base_seed=42,
+        )
+
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["attempts_completed"], 2)
+        self.assertEqual(result["successful_attempt"], 2)
+        self.assertEqual(result["best_distance_m"], 1_921.0)
+        self.assertTrue(result["actor_frozen"])
+        self.assertEqual(result["gradient_updates"], 0)
+        self.assertEqual(budget.probe_steps, 4)
+        self.assertEqual(budget.training_steps, 0)
+        self.assertEqual(
+            env.modes[0]["training_phase"],
+            "frontier_source_qualification",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "No replay or gradient"):
+            train_td3_agent.run_frontier_source_qualification(
+                FakeModel(),
+                FakeEnv([1_500.0, 1_600.0]),
+                minimum_distance_m=1_900.0,
+                maximum_attempts=2,
+                base_seed=42,
+            )
+
     def test_replay_snapshot_failure_is_reported_without_partial_temp_file(self):
         model = mock.Mock()
         model.save_replay_buffer.side_effect = RuntimeError("disk unavailable")
@@ -2523,6 +3634,285 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                 }
             )
         )
+
+    def test_frontier_evidence_prefers_historical_maximum_over_robust_median(self):
+        metadata = {
+            "best_evaluation": {
+                "median_progress_m": 1_430.05,
+                "maximum_progress_m": 1_435.62,
+            },
+            "continuation": {
+                "source_verified_evaluation_progress_m": 1_859.65,
+            },
+        }
+
+        self.assertEqual(
+            train_td3_agent.frontier_evidence_distance_m(metadata),
+            1_859.65,
+        )
+
+    def test_frontier_source_accepts_reward_only_historical_distance_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            policy = Path(directory) / "historical-frontier.zip"
+            policy.write_bytes(b"policy")
+            metadata_path_for_policy(policy).write_text(
+                json.dumps(
+                    {
+                        "model_family": AGENT6_MODEL_FAMILY,
+                        "observation_version": AGENT6_OBSERVATION_VERSION,
+                        "action_version": AGENT6_ACTION_VERSION,
+                        "feature_names": FEATURE_NAMES,
+                        "action_shape": AGENT6_ACTION_SHAPE,
+                        "learning_source": "reward_only",
+                        "track": "g-track-3",
+                        "continuation": {
+                            "source_verified_evaluation_progress_m": 1_859.65,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            errors = train_td3_agent.frontier_continuation_source_errors(
+                policy,
+                track="g-track-3",
+                start_stage="full_lap",
+            )
+
+        self.assertEqual(errors, [])
+
+    def test_external_frontier_evidence_is_bound_to_the_exact_policy_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = root / "frontier-source.zip"
+            policy.write_bytes(b"exact-policy")
+            digest = train_td3_agent.hashlib.sha256(b"exact-policy").hexdigest()
+            evidence_path = root / "evidence.json"
+            evidence_path.write_text(
+                json.dumps(
+                    {
+                        "policy_path": str(policy),
+                        "policy_sha256": digest,
+                        "distance_m": 1_922.96,
+                        "race_run_id": 95,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            evidence, errors = train_td3_agent.load_verified_frontier_evidence(
+                policy,
+                evidence_path,
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(evidence["distance_m"], 1_922.96)
+
+            policy.write_bytes(b"different-policy")
+            evidence, errors = train_td3_agent.load_verified_frontier_evidence(
+                policy,
+                evidence_path,
+            )
+
+        self.assertEqual(evidence, {})
+        self.assertTrue(any("hash mismatch" in error for error in errors))
+
+    def test_completed_lap_frontier_can_enter_strict_robustification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frontier = root / "frontier.zip"
+            frontier.write_bytes(b"completed-lap-policy")
+            metadata_path_for_policy(frontier).write_text(
+                json.dumps(
+                    {
+                        "model_family": AGENT6_MODEL_FAMILY,
+                        "observation_version": AGENT6_OBSERVATION_VERSION,
+                        "action_version": AGENT6_ACTION_VERSION,
+                        "feature_names": FEATURE_NAMES,
+                        "action_shape": AGENT6_ACTION_SHAPE,
+                        "learning_source": "reward_only",
+                        "track": "g-track-3",
+                        "frontier_champion": {
+                            "distance_m": train_td3_agent.G_TRACK_3_LENGTH_METRES,
+                            "completed_lap": True,
+                            "best_lap_time_seconds": 95.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            argv = [
+                str(SCRIPT_PATH),
+                "--robustify-frontier",
+                "--frontier-model-path",
+                str(frontier),
+                "--frontier-evidence-path",
+                str(root / "missing-evidence.json"),
+                "--total-timesteps",
+                "100000",
+            ]
+            with mock.patch.object(sys, "argv", argv):
+                args = train_td3_agent.parse_args()
+
+        self.assertTrue(args.robustify_frontier)
+        self.assertFalse(args.discovery_mode)
+        self.assertEqual(args.resume_from, frontier)
+        self.assertEqual(args.start_stage, "full_lap")
+        self.assertTrue(args.safe_actor_improvement)
+        self.assertTrue(args.continuation_compatibility_probe)
+        self.assertTrue(args.end_of_run_evaluation)
+
+    def test_frontier_callback_bootstraps_and_preserves_major_breakthroughs(self):
+        class FakeBaseCallback:
+            def __init__(self, verbose=0):
+                self.locals = {}
+                self.num_timesteps = 0
+
+        class FakeModel:
+            def __init__(self):
+                self.version = b"historical-policy"
+
+            def save_runtime_policy(self, path):
+                Path(path).write_bytes(self.version)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.zip"
+            source.write_bytes(b"historical-policy")
+            metadata_path_for_policy(source).write_text(
+                json.dumps(
+                    {
+                        "continuation": {
+                            "source_verified_evaluation_progress_m": 1_859.65,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            frontier = root / "frontier.zip"
+            milestone_dir = root / "milestones"
+            Callback = train_td3_agent.make_frontier_checkpoint_callback_class(
+                FakeBaseCallback
+            )
+            callback = Callback(
+                frontier,
+                milestone_dir,
+                {"learning_source": "reward_only", "track": "g-track-3"},
+                source_policy_path=source,
+                source_evidence={"distance_m": 1_922.96, "race_run_id": 95},
+                milestones_m=(1_500.0, 1_700.0, 1_900.0),
+                minimum_improvement_m=5.0,
+                major_breakthrough_improvement_m=25.0,
+            )
+            model = FakeModel()
+            callback.model = model
+
+            callback._on_training_start()
+
+            self.assertEqual(frontier.read_bytes(), b"historical-policy")
+            self.assertTrue(
+                (milestone_dir / "agent6_td3_frontier_1500m.zip").is_file()
+            )
+            self.assertTrue(
+                (milestone_dir / "agent6_td3_frontier_1700m.zip").is_file()
+            )
+            self.assertTrue(
+                (milestone_dir / "agent6_td3_frontier_1900m.zip").is_file()
+            )
+            self.assertFalse(callback.requires_strict_evaluation)
+            bootstrap = json.loads(
+                metadata_path_for_policy(frontier).read_text(encoding="utf-8")
+            )["frontier_champion"]
+            self.assertEqual(
+                bootstrap["evidence_source"],
+                "source_checkpoint_metadata",
+            )
+            self.assertFalse(bootstrap["strict_evaluation_required"])
+
+            model.version = b"1950m-policy"
+            callback.num_timesteps = 12_345
+            callback.locals = {
+                "infos": [
+                    {
+                        "episode_summary": {
+                            "policy_controlled": True,
+                            "deterministic_probe": False,
+                            "distance_m": 1_950.0,
+                            "furthest_distance_m": 1_950.0,
+                            "laps_completed": 0,
+                        }
+                    }
+                ]
+            }
+
+            self.assertTrue(callback._on_step())
+            self.assertEqual(frontier.read_bytes(), b"1950m-policy")
+            self.assertEqual(
+                (milestone_dir / "agent6_td3_frontier_1900m.zip").read_bytes(),
+                b"historical-policy",
+            )
+            self.assertTrue(callback.requires_strict_evaluation)
+            self.assertEqual(callback.records_saved_this_run, 1)
+
+    def test_completed_lap_frontier_cannot_be_replaced_by_a_non_lap(self):
+        class FakeBaseCallback:
+            def __init__(self, verbose=0):
+                self.locals = {}
+                self.num_timesteps = 1
+
+        class FakeModel:
+            def save_runtime_policy(self, path):
+                Path(path).write_bytes(b"later-non-lap-policy")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frontier = root / "frontier.zip"
+            frontier.write_bytes(b"lap-policy")
+            metadata_path_for_policy(frontier).write_text(
+                json.dumps(
+                    {
+                        "frontier_champion": {
+                            "distance_m": train_td3_agent.G_TRACK_3_LENGTH_METRES,
+                            "completed_lap": True,
+                            "best_lap_time_seconds": 95.0,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            Callback = train_td3_agent.make_frontier_checkpoint_callback_class(
+                FakeBaseCallback
+            )
+            callback = Callback(
+                frontier,
+                root / "milestones",
+                {},
+                source_policy_path=frontier,
+                source_evidence={},
+                milestones_m=(1_500.0, 1_700.0, 1_900.0),
+                minimum_improvement_m=5.0,
+                major_breakthrough_improvement_m=25.0,
+            )
+            callback.model = FakeModel()
+            callback.locals = {
+                "infos": [
+                    {
+                        "episode_summary": {
+                            "policy_controlled": True,
+                            "distance_m": (
+                                train_td3_agent.G_TRACK_3_LENGTH_METRES + 100.0
+                            ),
+                            "furthest_distance_m": (
+                                train_td3_agent.G_TRACK_3_LENGTH_METRES + 100.0
+                            ),
+                            "laps_completed": 0,
+                        }
+                    }
+                ]
+            }
+
+            self.assertTrue(callback._on_step())
+            self.assertEqual(frontier.read_bytes(), b"lap-policy")
+            self.assertEqual(callback.records_saved_this_run, 0)
 
     def test_automatic_evaluation_uses_separate_held_out_process(self):
         args = types.SimpleNamespace(
@@ -2812,6 +4202,116 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(restored.deferred_probe_requests, 3)
         self.assertAlmostEqual(restored.as_dict()["training_fraction"], 0.8)
 
+    def test_exact_resume_budget_extension_is_monotonic_and_ratio_bounded(self):
+        saved = train_td3_agent.ProbeBudgetController(100_000, 25_000)
+        saved.record_infos([{"deterministic_probe": False}] * 100)
+        saved.record_infos([{"deterministic_probe": True}] * 20)
+        extension = train_td3_agent.resolve_exact_resume_budget(
+            saved.as_dict(),
+            additional_training_steps=200_000,
+            requested_maximum_probe_steps=None,
+        )
+
+        self.assertEqual(extension["target_training_steps"], 300_000)
+        self.assertEqual(extension["maximum_probe_steps"], 75_000)
+        self.assertEqual(extension["maximum_probe_fraction"], 0.20)
+
+        restored = train_td3_agent.ProbeBudgetController(300_000, 75_000)
+        restored.restore(saved.as_dict(), allow_budget_extension=True)
+        self.assertEqual(restored.training_steps, 100)
+        self.assertEqual(restored.probe_steps, 20)
+        self.assertFalse(restored.should_stop())
+        self.assertEqual(restored.effective_maximum_probe_steps, 75_000)
+
+        with self.assertRaisesRegex(ValueError, "budget mismatch"):
+            train_td3_agent.ProbeBudgetController(90_000, 25_000).restore(
+                saved.as_dict(),
+                allow_budget_extension=True,
+            )
+
+    def test_exact_resume_restores_discovery_mode_only_with_recovery_anchor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "emergency.zip"
+            checkpoint.write_bytes(b"policy")
+            train_td3_agent.replay_buffer_path_for_policy(checkpoint).write_bytes(
+                b"replay"
+            )
+            budget = train_td3_agent.ProbeBudgetController(100, 25)
+            metadata = {
+                "model_family": AGENT6_MODEL_FAMILY,
+                "observation_version": AGENT6_OBSERVATION_VERSION,
+                "action_version": AGENT6_ACTION_VERSION,
+                "feature_names": FEATURE_NAMES,
+                "action_shape": AGENT6_ACTION_SHAPE,
+                "track": "g-track-3",
+                "discovery": {"enabled": True},
+                "continuation": {
+                    "enabled": True,
+                    "replay_refill_steps": 0,
+                },
+                "td3_hyperparameters": {
+                    "critic_warmup_steps": 0,
+                    "actor_unfreeze_steps": 0,
+                },
+                "exact_resume_checkpoint": {
+                    "version": train_td3_agent.EXACT_TRAINING_STATE_VERSION,
+                },
+            }
+            metadata_path_for_policy(checkpoint).write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+            state = {
+                "version": train_td3_agent.EXACT_TRAINING_STATE_VERSION,
+                "training_budget": budget.as_dict(),
+                "environment": {"stage_id": "full_lap"},
+                "model": {
+                    "discovery_recovery": {
+                        "_agent6_discovery_anchor_state": {},
+                        "_agent6_discovery_anchor_target_state": {},
+                        "_agent6_discovery_anchor_optimizer_state": {},
+                        "_agent6_discovery_recovery_enabled": True,
+                        "_agent6_discovery_frontier_gate_enabled": True,
+                    }
+                },
+            }
+            train_td3_agent.save_torch_payload_atomically(
+                state,
+                train_td3_agent.training_state_path_for_policy(checkpoint),
+            )
+            argv = [
+                str(SCRIPT_PATH),
+                "--resume-exact-from",
+                str(checkpoint),
+                "--extend-training-steps",
+                "100",
+            ]
+            with mock.patch.object(sys, "argv", argv):
+                args = train_td3_agent.parse_args()
+
+            self.assertTrue(args.exact_resume)
+            self.assertTrue(args.discovery_mode)
+            self.assertTrue(args.frontier_training_source)
+            self.assertFalse(args.safe_actor_improvement)
+            self.assertEqual(args.start_stage, "full_lap")
+            self.assertEqual(args.total_timesteps, 200)
+
+            state["model"]["discovery_recovery"] = {}
+            train_td3_agent.save_torch_payload_atomically(
+                state,
+                train_td3_agent.training_state_path_for_policy(checkpoint),
+            )
+            with mock.patch.object(sys, "argv", argv):
+                with self.assertRaises(SystemExit):
+                    train_td3_agent.parse_args()
+
+    def test_probe_budget_marks_exact_non_probe_boundary(self):
+        budget = train_td3_agent.ProbeBudgetController(10, 2)
+        budget.training_steps = 9
+
+        self.assertTrue(budget.reaches_training_boundary())
+        self.assertFalse(budget.training_budget_reached)
+
     def test_exact_checkpoint_round_trips_all_external_training_state(self):
         class FakeModel:
             device = "cpu"
@@ -2894,6 +4394,10 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                 train_td3_agent.exact_training_checkpoint_errors(policy_path),
                 [],
             )
+            persisted_state = train_td3_agent.load_exact_training_state(
+                policy_path
+            )
+            self.assertNotIn("rng", persisted_state)
             self.assertTrue(record["episode_restart_required"])
 
             restored_budget = train_td3_agent.ProbeBudgetController(20_000, 5_000)
@@ -2945,6 +4449,43 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
                 minimum_improvement_m=5.0,
             )
         )
+        self.assertTrue(
+            train_td3_agent.training_progress_is_credible(
+                [1_427.0, 1_400.0, 1_410.0],
+                reference_distance_m=1_427.0,
+                minimum_episodes=3,
+                maximum_regression_m=150.0,
+                minimum_improvement_m=0.0,
+            )
+        )
+
+    def test_training_breakthrough_detects_frontier_milestone_or_lap(self):
+        reasons = train_td3_agent.training_breakthrough_reasons(
+            1_451.0,
+            reference_maximum_distance_m=1_435.0,
+            minimum_improvement_m=25.0,
+            progress_milestones_m=(1_450.0, 1_550.0),
+        )
+        larger_gain = train_td3_agent.training_breakthrough_reasons(
+            1_461.0,
+            reference_maximum_distance_m=1_435.0,
+            minimum_improvement_m=25.0,
+            progress_milestones_m=(1_450.0, 1_550.0),
+        )
+
+        self.assertEqual(reasons, ("new_sector_milestone",))
+        self.assertEqual(
+            larger_gain,
+            ("furthest_distance", "new_sector_milestone"),
+        )
+        self.assertEqual(
+            train_td3_agent.training_breakthrough_reasons(
+                100.0,
+                reference_maximum_distance_m=1_435.0,
+                completed_lap=True,
+            ),
+            ("lap_completion",),
+        )
 
     def test_safe_actor_screening_uses_short_matched_horizon(self):
         stage = next(
@@ -2970,9 +4511,12 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
     def test_step_telemetry_logs_reward_components_pedal_conflict_and_all_sensors(self):
         self.assertIn("pedal_conflict", train_td3_agent.STEP_COLUMNS)
         self.assertIn(
-            "reward_clear_track_anti_stall_penalty",
+            "reward_forward_speed",
             train_td3_agent.STEP_COLUMNS,
         )
+        self.assertIn("reward_track_edge_penalty", train_td3_agent.STEP_COLUMNS)
+        self.assertIn("reward_terminal_failure", train_td3_agent.STEP_COLUMNS)
+        self.assertNotIn("reward_new_distance", train_td3_agent.STEP_COLUMNS)
         self.assertIn("track_sensor_0", train_td3_agent.STEP_COLUMNS)
         self.assertIn("track_sensor_18", train_td3_agent.STEP_COLUMNS)
 
@@ -3010,6 +4554,67 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
 
         self.assertEqual(env.action_space.shape, (3,))
         self.assertTrue(env.use_legacy_action_contract)
+
+    def test_torcs_cleanup_closes_udp_client_before_releasing_environment(self):
+        fake_gym = types.SimpleNamespace(Env=object)
+        client = types.SimpleNamespace(shutdown=mock.Mock())
+        torcs_env = types.SimpleNamespace(client=client, end=mock.Mock())
+        runner = types.SimpleNamespace(env=torcs_env)
+        with mock.patch.object(
+            train_td3_agent,
+            "make_torcs_runner",
+            return_value=runner,
+        ):
+            Env = train_td3_agent.make_training_env_class(fake_gym, _FakeSpaces)
+            env = Env(use_custom_warmup_action_space=False)
+
+        env._close_torcs_env()
+
+        client.shutdown.assert_called_once_with()
+        torcs_env.end.assert_called_once_with()
+        self.assertIsNone(runner.env)
+
+    def test_offline_update_suspension_releases_client_and_process(self):
+        fake_gym = types.SimpleNamespace(Env=object)
+        client = types.SimpleNamespace(shutdown=mock.Mock())
+        torcs_env = types.SimpleNamespace(client=client, end=mock.Mock())
+        runner = types.SimpleNamespace(
+            env=torcs_env,
+            shutdown=mock.Mock(),
+        )
+        with mock.patch.object(
+            train_td3_agent,
+            "make_torcs_runner",
+            return_value=runner,
+        ):
+            Env = train_td3_agent.make_training_env_class(fake_gym, _FakeSpaces)
+            env = Env(use_custom_warmup_action_space=False)
+
+        env.suspend_torcs_for_offline_updates()
+
+        client.shutdown.assert_called_once_with()
+        torcs_env.end.assert_called_once_with()
+        runner.shutdown.assert_called_once_with()
+        self.assertIsNone(runner.env)
+
+    def test_managed_relaunch_does_not_delegate_to_legacy_wrapper(self):
+        fake_gym = types.SimpleNamespace(Env=object)
+        torcs_env = types.SimpleNamespace(reset=mock.Mock(return_value="observation"))
+        runner = types.SimpleNamespace(env=torcs_env)
+        with mock.patch.object(
+            train_td3_agent,
+            "make_torcs_runner",
+            return_value=runner,
+        ):
+            Env = train_td3_agent.make_training_env_class(fake_gym, _FakeSpaces)
+            env = Env(use_custom_warmup_action_space=False)
+        env._restart_torcs = mock.Mock()
+
+        observation = env._reset_torcs_env(relaunch=True)
+
+        self.assertEqual(observation, "observation")
+        env._restart_torcs.assert_called_once_with()
+        torcs_env.reset.assert_called_once_with(relaunch=False)
 
     def test_concrete_environment_and_exploration_serializers_own_their_fields(self):
         fake_gym = types.SimpleNamespace(Env=object)
@@ -3056,6 +4661,104 @@ class Td3ScratchTrainingUtilityTests(unittest.TestCase):
         self.assertEqual(exploration_state["initial_sigma"], 0.02)
         self.assertEqual(exploration_state["learning_starts"], 20_000)
         self.assertNotIn("stage_success_windows", exploration_state)
+
+    def test_continuation_uses_steering_only_noise_before_actor_updates(self):
+        class FakeBaseCallback:
+            def __init__(self, verbose=0):
+                self.locals = {}
+                self.num_timesteps = 0
+
+        class FakeEnvironment:
+            def set_policy_mode(self, **_kwargs):
+                return None
+
+        regular_calls = []
+        pre_actor_calls = []
+        Callback = train_td3_agent.make_exploration_schedule_callback_class(
+            FakeBaseCallback
+        )
+        callback = Callback(
+            FakeEnvironment(),
+            lambda sigma: regular_calls.append(sigma) or ("regular", sigma),
+            learning_starts=0,
+            initial_sigma=0.02,
+            final_sigma=0.006,
+            decay_steps=100_000,
+            probe_interval=10,
+            training_gradient_steps=1,
+            actor_update_start=100,
+            pre_actor_noise_factory=(
+                lambda sigma: pre_actor_calls.append(sigma) or ("pre", sigma)
+            ),
+        )
+        callback.model = types.SimpleNamespace(
+            action_noise=None,
+            gradient_steps=1,
+        )
+
+        callback.num_timesteps = 99
+        callback._apply_policy_mode(deterministic_probe=False, force=True)
+        self.assertEqual(callback.model.action_noise[0], "pre")
+        self.assertEqual(len(pre_actor_calls), 1)
+        self.assertEqual(regular_calls, [])
+
+        callback.num_timesteps = 100
+        callback._apply_policy_mode(deterministic_probe=False, force=True)
+        self.assertEqual(callback.model.action_noise[0], "regular")
+        self.assertEqual(len(regular_calls), 1)
+
+    def test_windows_udp_timeout_is_bounded_without_shell_relaunch(self):
+        snakeoil_path = (
+            PROJECT_ROOT
+            / "torcs-wrapper"
+            / "gym_torcs"
+            / "snakeoil3_gym.py"
+        )
+        snakeoil_spec = importlib.util.spec_from_file_location(
+            "agent6_test_snakeoil",
+            snakeoil_path,
+        )
+        snakeoil = importlib.util.module_from_spec(snakeoil_spec)
+        assert snakeoil_spec is not None and snakeoil_spec.loader is not None
+        snakeoil_spec.loader.exec_module(snakeoil)
+
+        class TimeoutSocket:
+            def __init__(self):
+                self.closed = False
+
+            def settimeout(self, _timeout):
+                return None
+
+            def sendto(self, _payload, _address):
+                return None
+
+            def recvfrom(self, _size):
+                raise snakeoil.socket.timeout()
+
+            def close(self):
+                self.closed = True
+
+        socket_instance = TimeoutSocket()
+        client = snakeoil.Client.__new__(snakeoil.Client)
+        client.host = "localhost"
+        client.port = 3001
+        client.sid = "SCR"
+        client.vision = False
+        with (
+            mock.patch.object(snakeoil.os, "name", "nt"),
+            mock.patch.object(
+                snakeoil.socket,
+                "socket",
+                return_value=socket_instance,
+            ),
+            mock.patch.object(snakeoil.os, "system") as system,
+            mock.patch("builtins.print"),
+        ):
+            with self.assertRaises(TimeoutError):
+                client.setup_connection()
+
+        self.assertTrue(socket_instance.closed)
+        system.assert_not_called()
 
 
 class _FakeBox:

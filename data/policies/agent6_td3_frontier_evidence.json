@@ -1,0 +1,11 @@
+{
+  "association_basis": "Race run 95 was executed through the Agent 6 GUI after this verified checkpoint was written; the GUI selects the verified best-evaluation policy first.",
+  "distance_m": 1922.96,
+  "policy_path": "models/agent6_td3_scratch_racer_best_evaluation.zip",
+  "policy_sha256": "f2a7f33d27de1d3e48434158e618e8ebb2805b07bf81a9860e66295228984c6a",
+  "race_run_id": 95,
+  "race_started_at": "2026-08-19T17:47:43.685769+00:00",
+  "schema_version": "agent6_td3_frontier_evidence_v1",
+  "source": "data/generated/race_results.db:run_telemetry.max(dist_raced)",
+  "track": "g-track-3"
+}

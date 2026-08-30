@@ -29,6 +29,9 @@ DEFAULT_BEST_ROBUST_EVALUATION_MODEL_PATH = (
 DEFAULT_BEST_COMPLETED_LAP_MODEL_PATH = (
     PROJECT_ROOT / "models" / "agent6_td3_scratch_racer_best_completed_lap.zip"
 )
+DEFAULT_FRONTIER_MODEL_PATH = (
+    PROJECT_ROOT / "models" / "agent6_td3_scratch_racer_frontier.zip"
+)
 
 AGENT6_MODEL_FAMILY = "agent6_td3_scratch_racer"
 AGENT6_OBSERVATION_VERSION = "agent6_td3_raw_telemetry_v2"
@@ -625,6 +628,101 @@ class SeededSteeringActionNoise:
     def reset(self) -> None:
         self._random.seed(self.seed)
         self._steering_noise = 0.0
+
+
+class SeededGaussianActionNoise:
+    """Gaussian exploration backed by an RNG isolated from replay sampling."""
+
+    def __init__(
+        self,
+        *,
+        seed: int,
+        standard_deviation: float,
+        action_size: int = AGENT6_ACTION_SIZE,
+    ) -> None:
+        if not 0 <= int(seed) <= MAX_REPRODUCIBLE_SEED:
+            raise ValueError(
+                f"seed must be between 0 and {MAX_REPRODUCIBLE_SEED}"
+            )
+        if (
+            not math.isfinite(standard_deviation)
+            or standard_deviation < 0.0
+        ):
+            raise ValueError(
+                "standard_deviation must be finite and non-negative"
+            )
+        if int(action_size) < 1:
+            raise ValueError("action_size must be at least 1")
+        self.seed = int(seed)
+        self.standard_deviation = float(standard_deviation)
+        self.action_size = int(action_size)
+        self._random = np.random.default_rng(self.seed)
+
+    def __call__(self) -> np.ndarray:
+        return self._random.normal(
+            loc=0.0,
+            scale=self.standard_deviation,
+            size=self.action_size,
+        ).astype(np.float32)
+
+    def reset(self) -> None:
+        # Keep one independent stream across episodes. Rewinding here would
+        # repeat the same exploratory actions after every TORCS reset.
+        return None
+
+
+class SeededLegacyActionNoise:
+    """Correlated exploration that respects the legacy competing-pedal contract."""
+
+    def __init__(
+        self,
+        *,
+        seed: int,
+        standard_deviation: float,
+        correlation: float = STEERING_ACTION_NOISE_CORRELATION,
+    ) -> None:
+        if not 0 <= int(seed) <= MAX_REPRODUCIBLE_SEED:
+            raise ValueError(
+                f"seed must be between 0 and {MAX_REPRODUCIBLE_SEED}"
+            )
+        if (
+            not math.isfinite(standard_deviation)
+            or standard_deviation < 0.0
+        ):
+            raise ValueError(
+                "standard_deviation must be finite and non-negative"
+            )
+        if not math.isfinite(correlation) or not 0.0 <= correlation < 1.0:
+            raise ValueError("correlation must be finite and in [0, 1)")
+        self.seed = int(seed)
+        self.standard_deviation = float(standard_deviation)
+        self.correlation = float(correlation)
+        self.action_size = AGENT6_LEGACY_ACTION_SIZE
+        self._random = np.random.default_rng(self.seed)
+        self._state = np.zeros(2, dtype=np.float64)
+
+    def __call__(self) -> np.ndarray:
+        innovation_scale = self.standard_deviation * math.sqrt(
+            1.0 - (self.correlation**2)
+        )
+        innovation = self._random.normal(
+            loc=0.0,
+            scale=innovation_scale,
+            size=2,
+        )
+        self._state = self.correlation * self._state + innovation
+        steer_noise, longitudinal_noise = self._state
+        return np.asarray(
+            [
+                steer_noise,
+                0.5 * longitudinal_noise,
+                -0.5 * longitudinal_noise,
+            ],
+            dtype=np.float32,
+        )
+
+    def reset(self) -> None:
+        return None
 
 
 def metadata_path_for_policy(policy_path: Path) -> Path:
