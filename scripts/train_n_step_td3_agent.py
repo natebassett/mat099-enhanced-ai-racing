@@ -6,7 +6,7 @@ import json
 import math
 import statistics
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -22,13 +22,16 @@ if str(SRC_ROOT) not in sys.path:
 from n_step_td3.environment import EpisodeSummary, NstepTorcsEnvironment
 from n_step_td3.contracts import (
     ACTION_VERSION,
+    DEFAULT_STEERING_RATE_COST_COEFFICIENT,
     OBSERVATION_VERSION,
     REWARD_VERSION,
 )
 from n_step_td3.learner import (
+    FINE_TUNE_ACTOR_LEARNING_RATE,
     NstepTd3Config,
     NstepTd3Learner,
     UpdateMetrics,
+    load_actor_checkpoint,
     load_checkpoint,
 )
 from n_step_td3.replay import NstepTransitionAccumulator
@@ -38,10 +41,23 @@ MODEL_DIR = PROJECT_ROOT / "models" / "agent7_n_step_td3_v3"
 RUNS_DIR = PROJECT_ROOT / "models" / "training_runs" / "agent7_n_step_td3_v3"
 BEST_EVALUATION_PATH = MODEL_DIR / "best_evaluation.pt"
 BEST_PACE_PATH = MODEL_DIR / "best_pace.pt"
+STEERING_RATE_V4_MODEL_DIR = (
+    PROJECT_ROOT / "models" / "agent7_n_step_td3_v4"
+)
+STEERING_RATE_V4_RUNS_DIR = (
+    PROJECT_ROOT / "models" / "training_runs" / "agent7_n_step_td3_v4"
+)
 DEFAULT_TRAIN_FREQUENCY = 4
 FINE_TUNE_TRAIN_FREQUENCY = 8
 FINE_TUNE_REPLAY_WARMUP_SIZE = 30_000
 FINE_TUNE_CRITIC_WARMUP_UPDATES = 2_000
+STEERING_RATE_V4_TOTAL_TIMESTEPS = 1_280
+STEERING_RATE_V4_TRAIN_FREQUENCY = 32
+STEERING_RATE_V4_ACTOR_LEARNING_RATE = 1e-6
+STEERING_RATE_V4_CRITIC_WARMUP_UPDATES = 5_000
+STEERING_RATE_V4_MAX_ACTOR_UPDATES = 10
+STEERING_RATE_V4_EVALUATION_REPEATS = 10
+STEERING_RATE_V4_PROMOTION_MEDIAN_SECONDS = 103.953
 EPISODE_COLUMNS = (
     "mode",
     "policy_controlled",
@@ -79,6 +95,20 @@ class EvaluationScore:
     median_distance_m: float
     mean_off_track_steps: float
     mean_damage_delta: float
+
+
+@dataclass(frozen=True)
+class EvaluationPromotionGate:
+    required_completion_rate: float
+    maximum_median_lap_time_seconds: float
+
+    def permits(self, score: EvaluationScore) -> bool:
+        lap_time = score.median_lap_time_seconds
+        return (
+            score.completion_rate >= self.required_completion_rate
+            and lap_time is not None
+            and lap_time < self.maximum_median_lap_time_seconds
+        )
 
 
 def summarise_evaluations(
@@ -255,6 +285,51 @@ def synchronise_recorded_pace(
         learner.best_lap_time_seconds = recorded_lap
 
 
+def synchronise_recorded_evaluation(
+    learner: NstepTd3Learner,
+    model_dir: Path,
+) -> None:
+    """Protect an existing same-protocol champion across independent runs."""
+    evaluation_path = model_dir / "best_evaluation.pt"
+    if not evaluation_path.is_file():
+        return
+    checkpoint = load_checkpoint(evaluation_path, device="cpu")
+    completion_rate = checkpoint.get("best_evaluation_completion_rate")
+    if completion_rate is None:
+        return
+    median_lap_time = checkpoint.get(
+        "best_evaluation_median_lap_time_seconds"
+    )
+    fastest_lap_time = checkpoint.get("best_lap_time_seconds")
+    incumbent = EvaluationScore(
+        completion_rate=float(completion_rate),
+        median_lap_time_seconds=(
+            None if median_lap_time is None else float(median_lap_time)
+        ),
+        fastest_lap_time_seconds=(
+            None if fastest_lap_time is None else float(fastest_lap_time)
+        ),
+        median_distance_m=float(
+            checkpoint.get("best_evaluation_median_m") or 0.0
+        ),
+        mean_off_track_steps=float(
+            checkpoint.get("best_evaluation_mean_off_track_steps") or 0.0
+        ),
+        mean_damage_delta=float(
+            checkpoint.get("best_evaluation_mean_damage_delta") or 0.0
+        ),
+    )
+    if evaluation_score_is_better(
+        incumbent,
+        current_best_evaluation_score(learner),
+    ):
+        record_best_evaluation_score(learner, incumbent)
+    learner.best_evaluation_distance_m = max(
+        learner.best_evaluation_distance_m,
+        float(checkpoint.get("best_evaluation_distance_m", 0.0)),
+    )
+
+
 class CsvRunLogger:
     def __init__(self, run_dir: Path) -> None:
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -335,7 +410,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train the independent Agent 7 N-step TD3 racer."
     )
-    parser.add_argument("--total-timesteps", type=int, default=500_000)
+    parser.add_argument("--total-timesteps", type=int)
     parser.add_argument("--track", default="g-track-3")
     parser.add_argument("--racing-line-path", type=Path)
     parser.add_argument(
@@ -364,9 +439,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--fine-tune",
         action="store_true",
         help=(
-            "Refine a resumed policy with actor learning rate 3e-5, "
+            "Refine a resumed policy with a conservative actor learning rate, "
             "exploration noise 0.01, and policy delay 4; requires a "
             "resume checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--steering-rate-v4",
+        action="store_true",
+        help=(
+            "Initialize a v4 learner from --resume-best actor weights only, "
+            "with a fresh critic/replay and steering-rate reward cost."
+        ),
+    )
+    parser.add_argument(
+        "--fine-tune-actor-learning-rate",
+        type=float,
+        default=None,
+        help=(
+            "Actor learning rate used by conservative modes "
+            f"(default: {FINE_TUNE_ACTOR_LEARNING_RATE:g}, or "
+            f"{STEERING_RATE_V4_ACTOR_LEARNING_RATE:g} for v4)."
         ),
     )
     parser.add_argument(
@@ -381,10 +474,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fine-tune-critic-warmup-updates",
         type=int,
-        default=FINE_TUNE_CRITIC_WARMUP_UPDATES,
+        default=None,
         help=(
             "Critic-only gradient updates before pace actor updates "
-            "(default: 2000)."
+            f"(default: {FINE_TUNE_CRITIC_WARMUP_UPDATES}, or "
+            f"{STEERING_RATE_V4_CRITIC_WARMUP_UPDATES} for v4)."
+        ),
+    )
+    parser.add_argument(
+        "--steering-rate-cost-coefficient",
+        type=float,
+        default=DEFAULT_STEERING_RATE_COST_COEFFICIENT,
+        help=(
+            "Squared normalized steering-change cost used by v4 "
+            f"(default: {DEFAULT_STEERING_RATE_COST_COEFFICIENT:g})."
+        ),
+    )
+    parser.add_argument(
+        "--steering-rate-max-actor-updates",
+        type=int,
+        default=STEERING_RATE_V4_MAX_ACTOR_UPDATES,
+        help=(
+            "Hard ceiling on v4 actor updates; critic updates continue after "
+            f"the ceiling (default: {STEERING_RATE_V4_MAX_ACTOR_UPDATES})."
+        ),
+    )
+    parser.add_argument(
+        "--steering-rate-promotion-median-seconds",
+        type=float,
+        default=STEERING_RATE_V4_PROMOTION_MEDIAN_SECONDS,
+        help=(
+            "Strict v4 median-lap promotion threshold "
+            f"(default: {STEERING_RATE_V4_PROMOTION_MEDIAN_SECONDS:g}s)."
         ),
     )
     parser.add_argument("--replay-buffer-path", type=Path)
@@ -403,7 +524,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--evaluation-repeats",
         type=int,
-        default=3,
+        default=None,
         help="Deterministic rollouts used for passive median model selection.",
     )
     parser.add_argument("--checkpoint-interval", type=int, default=10_000)
@@ -435,7 +556,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Run gradient batches every N simulator interactions "
-            "(default: 4, or 8 with --fine-tune)."
+            "(default: 4, 8 with --fine-tune, or 32 for v4)."
         ),
     )
     parser.add_argument("--manual-start", action="store_true")
@@ -446,17 +567,44 @@ def build_parser() -> argparse.ArgumentParser:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.fine_tune and args.steering_rate_v4:
+        parser.error("--fine-tune and --steering-rate-v4 are mutually exclusive")
+    if args.total_timesteps is None:
+        args.total_timesteps = (
+            STEERING_RATE_V4_TOTAL_TIMESTEPS
+            if args.steering_rate_v4
+            else 500_000
+        )
+    if args.evaluation_repeats is None:
+        args.evaluation_repeats = (
+            STEERING_RATE_V4_EVALUATION_REPEATS
+            if args.steering_rate_v4
+            else 3
+        )
+    if args.fine_tune_actor_learning_rate is None:
+        args.fine_tune_actor_learning_rate = (
+            STEERING_RATE_V4_ACTOR_LEARNING_RATE
+            if args.steering_rate_v4
+            else FINE_TUNE_ACTOR_LEARNING_RATE
+        )
+    if args.fine_tune_critic_warmup_updates is None:
+        args.fine_tune_critic_warmup_updates = (
+            STEERING_RATE_V4_CRITIC_WARMUP_UPDATES
+            if args.steering_rate_v4
+            else FINE_TUNE_CRITIC_WARMUP_UPDATES
+        )
     args.seed_was_explicit = args.seed is not None
     if args.seed is None:
         args.seed = 0
     elif args.seed < 0:
         parser.error("--seed must be non-negative")
     if args.train_frequency is None:
-        args.train_frequency = (
-            FINE_TUNE_TRAIN_FREQUENCY
-            if args.fine_tune
-            else DEFAULT_TRAIN_FREQUENCY
-        )
+        if args.steering_rate_v4:
+            args.train_frequency = STEERING_RATE_V4_TRAIN_FREQUENCY
+        elif args.fine_tune:
+            args.train_frequency = FINE_TUNE_TRAIN_FREQUENCY
+        else:
+            args.train_frequency = DEFAULT_TRAIN_FREQUENCY
     positive = (
         "total_timesteps",
         "max_episode_steps",
@@ -470,6 +618,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "policy_delay",
         "gradient_steps",
         "train_frequency",
+        "steering_rate_max_actor_updates",
     )
     for name in positive:
         if int(getattr(args, name)) < 1:
@@ -481,6 +630,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     for name in non_negative:
         if int(getattr(args, name)) < 0:
             parser.error(f"--{name.replace('_', '-')} must be non-negative")
+    if (
+        not math.isfinite(args.fine_tune_actor_learning_rate)
+        or args.fine_tune_actor_learning_rate <= 0.0
+    ):
+        parser.error(
+            "--fine-tune-actor-learning-rate must be positive and finite"
+        )
     if args.resume_best:
         args.resume = BEST_EVALUATION_PATH
     elif args.resume_pace:
@@ -488,6 +644,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.fine_tune and args.resume is None:
         parser.error(
             "--fine-tune requires --resume, --resume-best, or --resume-pace"
+        )
+    if args.steering_rate_v4 and not args.resume_best:
+        parser.error("--steering-rate-v4 requires --resume-best")
+    if args.steering_rate_v4 and args.evaluation_repeats < 10:
+        parser.error("--steering-rate-v4 requires at least 10 evaluation repeats")
+    if (
+        not math.isfinite(args.steering_rate_cost_coefficient)
+        or args.steering_rate_cost_coefficient <= 0.0
+    ):
+        parser.error(
+            "--steering-rate-cost-coefficient must be positive and finite"
+        )
+    if (
+        not math.isfinite(args.steering_rate_promotion_median_seconds)
+        or args.steering_rate_promotion_median_seconds <= 0.0
+    ):
+        parser.error(
+            "--steering-rate-promotion-median-seconds must be positive and finite"
         )
     if args.resume is not None and not args.resume.is_file():
         parser.error(f"--resume checkpoint does not exist: {args.resume}")
@@ -527,8 +701,47 @@ def config_from_args(args: argparse.Namespace) -> NstepTd3Config:
         target_noise_clip=args.target_noise_clip,
         policy_delay=args.policy_delay,
         gradient_steps_per_interaction=args.gradient_steps,
+        steering_rate_cost_coefficient=(
+            args.steering_rate_cost_coefficient
+            if args.steering_rate_v4
+            else 0.0
+        ),
         seed=args.seed,
     )
+
+
+def initialize_steering_rate_v4_learner(
+    args: argparse.Namespace,
+) -> NstepTd3Learner:
+    if not args.steering_rate_v4 or args.resume is None:
+        raise ValueError("v4 actor transfer requires an explicit source checkpoint")
+    source_checkpoint = load_actor_checkpoint(args.resume, device="cpu")
+    if source_checkpoint.get("reward_version") != REWARD_VERSION:
+        raise ValueError("v4 actor transfer requires a v3 reward checkpoint")
+
+    source_config = NstepTd3Config(**source_checkpoint["config"])
+    target_config = replace(
+        source_config,
+        actor_learning_rate=args.fine_tune_actor_learning_rate,
+        critic_learning_rate=args.critic_learning_rate,
+        exploration_noise=0.01,
+        longitudinal_exploration_noise=0.01,
+        policy_delay=4,
+        gradient_steps_per_interaction=args.gradient_steps,
+        steering_rate_cost_coefficient=(
+            args.steering_rate_cost_coefficient
+        ),
+        seed=args.seed,
+    )
+    learner = NstepTd3Learner.from_actor_checkpoint(
+        args.resume,
+        config=target_config,
+        device=args.device,
+    )
+    learner.enable_fine_tuning(
+        actor_learning_rate=args.fine_tune_actor_learning_rate,
+    )
+    return learner
 
 
 def evaluate_once(
@@ -559,6 +772,7 @@ def evaluate_and_record(
     repeats: int,
     mode: str = "evaluation",
     allow_promotion: bool = True,
+    promotion_gate: EvaluationPromotionGate | None = None,
 ) -> tuple[list[EpisodeSummary], float]:
     if repeats < 1:
         raise ValueError("evaluation repeats must be positive")
@@ -616,13 +830,24 @@ def evaluate_and_record(
         f"max={maximum_distance:.1f}m "
         f"laps={completed_runs}/{repeats}{lap_summary}"
     )
-    reliability_improved = allow_promotion and evaluation_score_is_better(
-        score,
-        current_best_evaluation_score(learner),
+    promotion_permitted = (
+        promotion_gate is None or promotion_gate.permits(score)
     )
-    pace_improved = allow_promotion and pace_score_is_better(
-        score,
-        learner.best_lap_time_seconds,
+    reliability_improved = (
+        allow_promotion
+        and promotion_permitted
+        and evaluation_score_is_better(
+            score,
+            current_best_evaluation_score(learner),
+        )
+    )
+    pace_improved = (
+        allow_promotion
+        and promotion_permitted
+        and pace_score_is_better(
+            score,
+            learner.best_lap_time_seconds,
+        )
     )
     if reliability_improved:
         record_best_evaluation_score(learner, score)
@@ -647,6 +872,15 @@ def evaluate_and_record(
         print(
             "New Agent 7 pace champion: fastest clean evaluation lap="
             f"{score.fastest_lap_time_seconds:.3f}s"
+        )
+    elif allow_promotion and not promotion_permitted:
+        print(
+            "Evaluation candidate rejected by the strict promotion gate: "
+            f"completion={score.completion_rate:.0%}, "
+            "median_lap="
+            f"{score.median_lap_time_seconds}, required completion="
+            f"{promotion_gate.required_completion_rate:.0%}, median below "
+            f"{promotion_gate.maximum_median_lap_time_seconds:.3f}s."
         )
     return evaluations, median_distance
 
@@ -792,11 +1026,22 @@ def _record_tensorboard_episode(writer: Any, summary: EpisodeSummary, step: int,
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = RUNS_DIR / timestamp
-    model_dir = MODEL_DIR
+    run_dir = (
+        STEERING_RATE_V4_RUNS_DIR if args.steering_rate_v4 else RUNS_DIR
+    ) / timestamp
+    model_dir = (
+        STEERING_RATE_V4_MODEL_DIR if args.steering_rate_v4 else MODEL_DIR
+    )
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.resume is not None:
+    if args.steering_rate_v4:
+        learner = initialize_steering_rate_v4_learner(args)
+        print(
+            "Initialized Agent 7 v4 from protected v3 actor parameters only: "
+            f"{args.resume}. Critic, target critic, optimizers, replay, counters, "
+            "and source evaluation records were not inherited."
+        )
+    elif args.resume is not None:
         learner = NstepTd3Learner.load(args.resume, device=args.device)
         print(f"Resuming Agent 7 from {args.resume}")
         if args.seed_was_explicit:
@@ -806,7 +1051,9 @@ def main(argv: list[str] | None = None) -> None:
                 "checkpoint weights and optimizer state are unchanged."
             )
         if args.fine_tune:
-            learner.enable_fine_tuning()
+            learner.enable_fine_tuning(
+                actor_learning_rate=args.fine_tune_actor_learning_rate,
+            )
             print(
                 "Enabled Agent 7 pace fine-tuning: actor learning rate="
                 f"{learner.config.actor_learning_rate:g}, action noise="
@@ -817,6 +1064,7 @@ def main(argv: list[str] | None = None) -> None:
     else:
         learner = NstepTd3Learner(config_from_args(args), device=args.device)
         print("Starting Agent 7 N-step TD3 from random network weights.")
+    synchronise_recorded_evaluation(learner, model_dir)
     synchronise_recorded_pace(learner, model_dir)
     if args.replay_buffer_path is not None:
         learner.load_replay(args.replay_buffer_path)
@@ -829,9 +1077,10 @@ def main(argv: list[str] | None = None) -> None:
             "the protected checkpoint remains unchanged unless evaluation improves."
         )
 
+    conservative_mode = bool(args.fine_tune or args.steering_rate_v4)
     replay_warmup_size = learner.config.replay_start_size
     critic_warmup_updates = 0
-    if args.fine_tune:
+    if conservative_mode:
         replay_warmup_size = max(
             learner.config.replay_start_size,
             args.fine_tune_replay_warmup_size,
@@ -839,7 +1088,7 @@ def main(argv: list[str] | None = None) -> None:
         critic_warmup_updates = args.fine_tune_critic_warmup_updates
     if args.resume is None:
         replay_warmup_action_mode = "random"
-    elif args.fine_tune:
+    elif conservative_mode:
         replay_warmup_action_mode = "deterministic_policy"
     else:
         replay_warmup_action_mode = "noisy_policy"
@@ -854,6 +1103,28 @@ def main(argv: list[str] | None = None) -> None:
             args.resume is not None and args.seed_was_explicit
         ),
         "fine_tune": bool(args.fine_tune),
+        "steering_rate_v4": bool(args.steering_rate_v4),
+        "actor_initialization": (
+            "v3_actor_only" if args.steering_rate_v4 else "checkpoint_resume"
+            if args.resume is not None
+            else "random"
+        ),
+        "fine_tune_actor_learning_rate": (
+            args.fine_tune_actor_learning_rate if conservative_mode else None
+        ),
+        "maximum_actor_updates": (
+            args.steering_rate_max_actor_updates
+            if args.steering_rate_v4
+            else None
+        ),
+        "promotion_completion_rate": (
+            1.0 if args.steering_rate_v4 else None
+        ),
+        "promotion_median_lap_time_seconds": (
+            args.steering_rate_promotion_median_seconds
+            if args.steering_rate_v4
+            else None
+        ),
         "replay_warmup_size": replay_warmup_size,
         "replay_warmup_action_mode": replay_warmup_action_mode,
         "critic_only_warmup_updates": critic_warmup_updates,
@@ -864,7 +1135,7 @@ def main(argv: list[str] | None = None) -> None:
         "algorithm": "N-step TD3",
         "observation_version": OBSERVATION_VERSION,
         "action_version": ACTION_VERSION,
-        "reward_version": REWARD_VERSION,
+        "reward_version": learner.reward_version,
         "source_design": "https://github.com/raphaelsenn/torcsRL",
         "source_revision_reviewed": "043e806e260507d1d5eef161004bc350f9d7f471",
         "source_code_copied": False,
@@ -897,6 +1168,9 @@ def main(argv: list[str] | None = None) -> None:
         observation_noise_std=args.observation_noise_std,
         seed=args.seed,
         racing_line_path=args.racing_line_path,
+        steering_rate_cost_coefficient=(
+            learner.config.steering_rate_cost_coefficient
+        ),
     )
     accumulator = NstepTransitionAccumulator(
         learner.config.n_steps,
@@ -914,6 +1188,22 @@ def main(argv: list[str] | None = None) -> None:
     pending_metrics: list[UpdateMetrics] = []
     observation: Any = None
     last_evaluation_step: int | None = None
+    actor_updates_at_start = learner.actor_updates
+    actor_update_limit = (
+        args.steering_rate_max_actor_updates
+        if args.steering_rate_v4
+        else None
+    )
+    promotion_gate = (
+        EvaluationPromotionGate(
+            required_completion_rate=1.0,
+            maximum_median_lap_time_seconds=(
+                args.steering_rate_promotion_median_seconds
+            ),
+        )
+        if args.steering_rate_v4
+        else None
+    )
 
     print(
         "Agent 7 protocol: torcsRL-aligned N-step TD3 core, full track, "
@@ -929,6 +1219,9 @@ def main(argv: list[str] | None = None) -> None:
         f"{learner.config.gradient_steps_per_interaction} gradient batch(es) "
         f"every {args.train_frequency} interactions, no curriculum, "
         "no actor rollback, "
+        f"reward={learner.reward_version}, steering-rate coefficient="
+        f"{learner.config.steering_rate_cost_coefficient:g}, "
+        f"actor-update ceiling={actor_update_limit}, "
         f"critic-only warm-up={critic_warmup_updates:,} updates, "
         f"automatic {args.evaluation_repeats}-run median evaluation every "
         f"{args.evaluation_interval:,} steps."
@@ -937,6 +1230,7 @@ def main(argv: list[str] | None = None) -> None:
         if (
             args.resume is not None
             and current_best_evaluation_score(learner) is None
+            and not args.steering_rate_v4
         ):
             print(
                 "Establishing a passive lap-aware evaluation baseline for this "
@@ -969,7 +1263,7 @@ def main(argv: list[str] | None = None) -> None:
             logger,
             writer,
             use_random_actions=args.resume is None,
-            deterministic_policy_actions=args.fine_tune,
+            deterministic_policy_actions=conservative_mode,
             target_replay_size=replay_warmup_size,
         )
         if warmup_interactions:
@@ -1019,7 +1313,18 @@ def main(argv: list[str] | None = None) -> None:
                 learner.environment_steps,
                 args.train_frequency,
             ):
-                pending_metrics.extend(learner.train_for_interaction())
+                actor_updates_used = (
+                    learner.actor_updates - actor_updates_at_start
+                )
+                allow_actor_update = (
+                    actor_update_limit is None
+                    or actor_updates_used < actor_update_limit
+                )
+                pending_metrics.extend(
+                    learner.train_for_interaction(
+                        allow_actor_update=allow_actor_update,
+                    )
+                )
             observation = next_observation
 
             if learner.environment_steps % 1_000 == 0:
@@ -1072,6 +1377,7 @@ def main(argv: list[str] | None = None) -> None:
                     writer,
                     model_dir,
                     repeats=args.evaluation_repeats,
+                    promotion_gate=promotion_gate,
                 )
                 last_evaluation_step = learner.environment_steps
                 while learner.environment_steps >= next_evaluation:
@@ -1096,6 +1402,7 @@ def main(argv: list[str] | None = None) -> None:
                 writer,
                 model_dir,
                 repeats=args.evaluation_repeats,
+                promotion_gate=promotion_gate,
             )
             last_evaluation_step = learner.environment_steps
 

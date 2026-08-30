@@ -75,17 +75,28 @@ class NstepTorcsEnvironment:
         seed: int = 0,
         racing_line_path: str | Path | None = None,
         racing_line: RacingLineFeatureMap | None = None,
+        steering_rate_cost_coefficient: float = 0.0,
         runner: TorcsRunner | None = None,
     ) -> None:
         if max_episode_steps < 1:
             raise ValueError("max_episode_steps must be positive")
         if not math.isfinite(observation_noise_std) or observation_noise_std < 0.0:
             raise ValueError("observation_noise_std must be finite and non-negative")
+        if (
+            not math.isfinite(steering_rate_cost_coefficient)
+            or steering_rate_cost_coefficient < 0.0
+        ):
+            raise ValueError(
+                "steering-rate cost coefficient must be finite and non-negative"
+            )
         self.track_name = str(track_name)
         self.max_episode_steps = int(max_episode_steps)
         self.manual_start = bool(manual_start)
         self.reset_retries = max(0, int(reset_retries))
         self.observation_noise_std = float(observation_noise_std)
+        self.steering_rate_cost_coefficient = float(
+            steering_rate_cost_coefficient
+        )
         self._observation_random = np.random.default_rng(seed)
         if runner is None:
             from runner.torcs_runner import TorcsRunner
@@ -124,6 +135,7 @@ class NstepTorcsEnvironment:
         self.speed_sum = 0.0
         self.max_speed = 0.0
         self.off_track_steps = 0
+        self.previous_steer = 0.0
         self.lap_tracker: LapTracker | None = None
         self.last_summary: EpisodeSummary | None = None
 
@@ -148,6 +160,7 @@ class NstepTorcsEnvironment:
         self.speed_sum = 0.0
         self.max_speed = finite_float(telemetry.get("speedX"))
         self.off_track_steps = 0
+        self.previous_steer = 0.0
         self.lap_tracker = LapTracker(telemetry.get("lastLapTime", 0.0))
         self.last_summary = None
         observation = self.history.reset(self._base_observation(telemetry))
@@ -212,9 +225,16 @@ class NstepTorcsEnvironment:
             telemetry,
             physical_failure=physical_failure,
             target_track_position=line_sample.target_track_position,
+            previous_steer=self.previous_steer,
+            current_steer=float(action_values[0]),
+            steering_rate_cost_coefficient=(
+                self.steering_rate_cost_coefficient
+            ),
         )
+        steering_delta = float(action_values[0]) - self.previous_steer
 
         self.history.record_action(action_values)
+        self.previous_steer = float(action_values[0])
         observation = self.history.observe(
             self._base_observation(
                 telemetry,
@@ -276,7 +296,11 @@ class NstepTorcsEnvironment:
             "termination_reason": reason,
             "reward_forward_velocity": reward_result.forward_velocity,
             "reward_racing_line_factor": reward_result.racing_line_factor,
+            "reward_steering_rate_penalty": (
+                reward_result.steering_rate_penalty
+            ),
             "reward_terminal_penalty": reward_result.terminal_penalty,
+            "steering_delta": steering_delta,
             "target_track_position": line_sample.target_track_position,
             "racing_line_error": (
                 track_position - line_sample.target_track_position

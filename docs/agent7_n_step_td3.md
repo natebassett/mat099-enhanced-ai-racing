@@ -71,6 +71,9 @@ Agent 7 writes only beneath:
 models/agent7_n_step_td3_v3/
 models/training_runs/agent7_n_step_td3_v3/
 data/evaluation/agent7_n_step_td3_v3/
+models/agent7_n_step_td3_v4/
+models/training_runs/agent7_n_step_td3_v4/
+data/evaluation/agent7_n_step_td3_v4/
 ```
 
 It does not load or overwrite any Agent 6 model or earlier Agent 7 checkpoint.
@@ -114,15 +117,57 @@ python scripts\train_n_step_td3_agent.py --resume-best --total-timesteps 100000 
 
 For short pace refinement after a reliable lap champion exists, use the explicit
 fine-tuning mode. It preserves the loaded actor, critic, target networks, and
-optimizer moments while reducing the actor learning rate to `3e-5`, both
+optimizer moments while reducing the actor learning rate to `3e-6` by default, both
 action-noise scales to `0.01`, updating the actor every fourth critic update,
-and running one gradient batch every eight simulator interactions. Pace
+and running one gradient batch every eight simulator interactions by default. Pace
 continuations first collect 30,000 transitions with deterministic actions from
 the fixed actor, perform 2,000 critic-only updates, and only then enable `0.01`
 action exploration and resume low-rate actor learning:
 
 ```powershell
-python scripts\train_n_step_td3_agent.py --resume-best --fine-tune --total-timesteps 2500 --seed 6 --no-tensorboard
+python scripts\train_n_step_td3_agent.py --resume-best --fine-tune --fine-tune-actor-learning-rate 3e-6 --total-timesteps 2500 --train-frequency 32 --seed 15 --no-tensorboard
+```
+
+With 2,500 learning interactions, train frequency 32, and policy delay 4, this
+ultra-conservative profile permits roughly 20 actor updates before the final
+passive evaluation. Use it only for refinement of a mature validated policy;
+the learning-rate option must be positive and finite.
+
+### Steering-rate v4 experiment
+
+The v4 experiment addresses the observed full-scale left/right switching with
+one deliberately small reward change:
+
+```text
+reward_v4 = reward_v3 - 0.0025 * (steer_t - steer_t-1)^2
+```
+
+Forward-velocity and racing-line terms are unchanged. There is no steering
+filter, straight detector, speed target, teacher action, actor rollback, or
+hardcoded driving intervention. The actor still controls the car directly.
+
+V4 starts from the protected v3 `best_evaluation.pt` actor parameters only. It
+creates a fresh critic, target critic, optimizers, replay buffer, counters, and
+source-evaluation state. The default run collects 30,000 deterministic
+transitions, adapts the critic for 5,000 updates with the actor frozen, then
+allows at most 10 actor updates at learning rate `1e-6`. Critic learning can
+continue after the actor ceiling. A candidate is promoted only after 10/10
+internal lap completions with median lap time strictly below `103.953 s`.
+
+Run one bounded v4 seed with:
+
+```powershell
+python scripts\train_n_step_td3_agent.py --resume-best --steering-rate-v4 --seed 19 --racing-line-path data\racing_lines\g-track-3-agent7-smooth-v1.json --no-tensorboard
+```
+
+V4 artifacts are isolated under the v4 paths above. Existing v3 checkpoints
+are never overwritten, and an existing v4 champion is retained unless a later
+seed passes the same gate and improves its evaluation score.
+
+Evaluate a promoted v4 candidate independently with:
+
+```powershell
+python scripts\evaluate_n_step_td3_agent.py --policy-path models\agent7_n_step_td3_v4\best_evaluation.pt --repeats 10 --racing-line-path data\racing_lines\g-track-3-agent7-smooth-v1.json
 ```
 
 Evaluation keeps two independent full checkpoints. `best_evaluation.pt` is the

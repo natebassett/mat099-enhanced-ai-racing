@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 import random
 from dataclasses import asdict, dataclass, replace
@@ -13,18 +14,19 @@ import torch.nn.functional as functional
 
 from .contracts import (
     ACTION_SIZE,
+    ACTION_VERSION,
     MODEL_FAMILY,
     OBSERVATION_SIZE,
     OBSERVATION_VERSION,
-    ACTION_VERSION,
     REWARD_VERSION,
+    STEERING_RATE_REWARD_VERSION,
 )
 from .networks import Actor, TwinCritic
 from .replay import NstepReplayBuffer, ReplayTransition
 
 
 CHECKPOINT_VERSION = "agent7_n_step_td3_checkpoint_v2"
-FINE_TUNE_ACTOR_LEARNING_RATE = 3e-5
+FINE_TUNE_ACTOR_LEARNING_RATE = 3e-6
 FINE_TUNE_EXPLORATION_NOISE = 0.01
 FINE_TUNE_POLICY_DELAY = 4
 ACTOR_COMPATIBLE_OBSERVATION_VERSIONS = frozenset(
@@ -55,6 +57,7 @@ class NstepTd3Config:
     target_noise_clip: float = 0.2
     policy_delay: int = 2
     gradient_steps_per_interaction: int = 1
+    steering_rate_cost_coefficient: float = 0.0
     seed: int = 0
 
     def validate(self) -> None:
@@ -81,6 +84,13 @@ class NstepTd3Config:
             self.target_noise_clip,
         ) < 0.0:
             raise ValueError("noise values must be non-negative")
+        if (
+            not math.isfinite(self.steering_rate_cost_coefficient)
+            or self.steering_rate_cost_coefficient < 0.0
+        ):
+            raise ValueError(
+                "steering-rate cost coefficient must be finite and non-negative"
+            )
 
 
 @dataclass(frozen=True)
@@ -118,6 +128,11 @@ class NstepTd3Learner:
     ) -> None:
         config.validate()
         self.config = config
+        self.reward_version = (
+            STEERING_RATE_REWARD_VERSION
+            if config.steering_rate_cost_coefficient > 0.0
+            else REWARD_VERSION
+        )
         self.device = (
             resolve_device(device) if isinstance(device, str) else device
         )
@@ -190,11 +205,20 @@ class NstepTd3Learner:
         self._action_random = np.random.default_rng(value + 2)
         self._torch_random.manual_seed(value + 3)
 
-    def enable_fine_tuning(self) -> None:
+    def enable_fine_tuning(
+        self,
+        *,
+        actor_learning_rate: float = FINE_TUNE_ACTOR_LEARNING_RATE,
+    ) -> None:
         """Use conservative actor updates and exploration for pace refinement."""
+        learning_rate = float(actor_learning_rate)
+        if not math.isfinite(learning_rate) or learning_rate <= 0.0:
+            raise ValueError(
+                "fine-tuning actor learning rate must be positive and finite"
+            )
         self.config = replace(
             self.config,
-            actor_learning_rate=FINE_TUNE_ACTOR_LEARNING_RATE,
+            actor_learning_rate=learning_rate,
             exploration_noise=FINE_TUNE_EXPLORATION_NOISE,
             longitudinal_exploration_noise=FINE_TUNE_EXPLORATION_NOISE,
             policy_delay=FINE_TUNE_POLICY_DELAY,
@@ -239,11 +263,15 @@ class NstepTd3Learner:
     def add_transitions(self, transitions: list[ReplayTransition]) -> None:
         self.replay.extend(transitions)
 
-    def train_for_interaction(self) -> list[UpdateMetrics]:
+    def train_for_interaction(
+        self,
+        *,
+        allow_actor_update: bool = True,
+    ) -> list[UpdateMetrics]:
         if not self.ready_to_train:
             return []
         return [
-            self._gradient_step()
+            self._gradient_step(allow_actor_update=allow_actor_update)
             for _ in range(self.config.gradient_steps_per_interaction)
         ]
 
@@ -349,7 +377,7 @@ class NstepTd3Learner:
             "model_family": MODEL_FAMILY,
             "observation_version": OBSERVATION_VERSION,
             "action_version": ACTION_VERSION,
-            "reward_version": REWARD_VERSION,
+            "reward_version": self.reward_version,
             "config": asdict(self.config),
             "actor": self.actor.state_dict(),
             "actor_target": self.actor_target.state_dict(),
@@ -417,6 +445,39 @@ class NstepTd3Learner:
         if not isinstance(state, dict):
             raise ValueError("invalid Agent 7 replay checkpoint")
         self.replay.load_state_dict(state)
+
+    @classmethod
+    def from_actor_checkpoint(
+        cls,
+        path: str | Path,
+        *,
+        config: NstepTd3Config,
+        device: str | torch.device = "auto",
+    ) -> "NstepTd3Learner":
+        """Initialize a fresh learner from actor parameters only."""
+        checkpoint = load_actor_checkpoint(path, device="cpu")
+        source_config = NstepTd3Config(**checkpoint["config"])
+        source_architecture = (
+            source_config.observation_size,
+            source_config.action_size,
+            source_config.hidden_size_1,
+            source_config.hidden_size_2,
+        )
+        target_architecture = (
+            config.observation_size,
+            config.action_size,
+            config.hidden_size_1,
+            config.hidden_size_2,
+        )
+        if source_architecture != target_architecture:
+            raise ValueError(
+                "actor transfer requires an identical network architecture"
+            )
+
+        learner = cls(config, device=device)
+        learner.actor.load_state_dict(checkpoint["actor"])
+        learner.actor_target.load_state_dict(checkpoint["actor"])
+        return learner
 
     @classmethod
     def load(
@@ -504,12 +565,19 @@ def load_checkpoint(
     )
     if not isinstance(checkpoint, dict):
         raise ValueError("invalid Agent 7 checkpoint payload")
+    raw_config = checkpoint.get("config")
+    if not isinstance(raw_config, Mapping):
+        raise ValueError("Agent 7 checkpoint is missing its configuration")
+    coefficient = float(raw_config.get("steering_rate_cost_coefficient", 0.0))
+    expected_reward_version = (
+        STEERING_RATE_REWARD_VERSION if coefficient > 0.0 else REWARD_VERSION
+    )
     expected = {
         "checkpoint_version": CHECKPOINT_VERSION,
         "model_family": MODEL_FAMILY,
         "observation_version": OBSERVATION_VERSION,
         "action_version": ACTION_VERSION,
-        "reward_version": REWARD_VERSION,
+        "reward_version": expected_reward_version,
     }
     mismatches = [
         name for name, value in expected.items() if checkpoint.get(name) != value
@@ -518,8 +586,6 @@ def load_checkpoint(
         raise ValueError(
             "Agent 7 checkpoint contract mismatch: " + ", ".join(mismatches)
         )
-    if not isinstance(checkpoint.get("config"), Mapping):
-        raise ValueError("Agent 7 checkpoint is missing its configuration")
     return checkpoint
 
 

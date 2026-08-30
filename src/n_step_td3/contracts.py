@@ -14,6 +14,10 @@ MODEL_FAMILY = "agent7_n_step_td3_racer"
 OBSERVATION_VERSION = "agent7_torcsrl_history_v3"
 ACTION_VERSION = "agent7_signed_steer_longitudinal_v1"
 REWARD_VERSION = "agent7_torcsrl_racing_line_velocity_v3"
+STEERING_RATE_REWARD_VERSION = (
+    "agent7_torcsrl_racing_line_velocity_steering_rate_v4"
+)
+DEFAULT_STEERING_RATE_COST_COEFFICIENT = 0.0025
 
 MAX_SPEED_KMH = 250.0
 MAX_ACCELERATION_MPS2 = 50.0
@@ -338,6 +342,7 @@ class RewardResult:
     total: float
     forward_velocity: float
     racing_line_factor: float
+    steering_rate_penalty: float
     terminal_penalty: float
 
 
@@ -346,9 +351,17 @@ def calculate_reward(
     *,
     physical_failure: bool,
     target_track_position: float = 0.0,
+    previous_steer: float = 0.0,
+    current_steer: float = 0.0,
+    steering_rate_cost_coefficient: float = 0.0,
 ) -> RewardResult:
+    coefficient = float(steering_rate_cost_coefficient)
+    if not math.isfinite(coefficient) or coefficient < 0.0:
+        raise ValueError(
+            "steering-rate cost coefficient must be finite and non-negative"
+        )
     if physical_failure:
-        return RewardResult(-10.0, 0.0, 0.0, -10.0)
+        return RewardResult(-10.0, 0.0, 0.0, 0.0, -10.0)
 
     speed = finite_float(telemetry.get("speedX")) / MAX_SPEED_KMH
     angle = finite_float(telemetry.get("angle"))
@@ -360,10 +373,13 @@ def calculate_reward(
         math.cos(angle) - abs(math.sin(angle)) - racing_line_difference
     )
     forward_velocity = speed
-    reward = forward_velocity * racing_line_factor
+    steering_delta = finite_float(current_steer) - finite_float(previous_steer)
+    steering_rate_penalty = -coefficient * steering_delta * steering_delta
+    reward = forward_velocity * racing_line_factor + steering_rate_penalty
     return RewardResult(
         total=float(reward),
         forward_velocity=float(forward_velocity),
         racing_line_factor=float(racing_line_factor),
+        steering_rate_penalty=float(steering_rate_penalty),
         terminal_penalty=0.0,
     )

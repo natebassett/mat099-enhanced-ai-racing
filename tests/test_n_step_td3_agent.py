@@ -3,6 +3,7 @@ import math
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +24,7 @@ from n_step_td3.contracts import (
     OBSERVATION_VERSION,
     REFERENCE_OBSERVATION_NOISE_LEVEL,
     REWARD_VERSION,
+    STEERING_RATE_REWARD_VERSION,
     HistoryEncoder,
     apply_observation_noise,
     build_base_observation,
@@ -172,6 +174,37 @@ class NstepTd3ContractTests(unittest.TestCase):
         self.assertAlmostEqual(corner.total, 0.5 * expected_factor)
         self.assertGreater(centered.total, corner.total)
         self.assertEqual(failed.total, -10.0)
+
+    def test_v4_reward_penalises_only_squared_steering_change(self):
+        baseline = calculate_reward(
+            telemetry(speedX=125.0),
+            physical_failure=False,
+            previous_steer=1.0,
+            current_steer=-1.0,
+        )
+        v4 = calculate_reward(
+            telemetry(speedX=125.0),
+            physical_failure=False,
+            previous_steer=1.0,
+            current_steer=-1.0,
+            steering_rate_cost_coefficient=0.0025,
+        )
+
+        self.assertEqual(baseline.steering_rate_penalty, 0.0)
+        self.assertAlmostEqual(v4.steering_rate_penalty, -0.01)
+        self.assertAlmostEqual(v4.total, baseline.total - 0.01)
+        self.assertEqual(v4.forward_velocity, baseline.forward_velocity)
+        self.assertEqual(v4.racing_line_factor, baseline.racing_line_factor)
+
+    def test_reward_rejects_invalid_steering_rate_coefficients(self):
+        for value in (-0.1, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    calculate_reward(
+                        telemetry(),
+                        physical_failure=False,
+                        steering_rate_cost_coefficient=value,
+                    )
 
     def test_reverse_velocity_remains_negative_in_reward(self):
         result = calculate_reward(telemetry(speedX=-25.0), physical_failure=False)
@@ -374,6 +407,23 @@ class NstepTd3LearnerTests(unittest.TestCase):
             )
         )
 
+    def test_actor_updates_can_be_disabled_while_critic_keeps_learning(self):
+        learner = self._learner()
+        self._fill(learner)
+        actor_before = {
+            name: value.detach().clone()
+            for name, value in learner.actor.state_dict().items()
+        }
+
+        for _ in range(4):
+            metrics = learner.train_for_interaction(allow_actor_update=False)
+            self.assertIsNone(metrics[0].actor_loss)
+
+        self.assertEqual(learner.optimizer_steps, 4)
+        self.assertEqual(learner.actor_updates, 0)
+        for name, value in learner.actor.state_dict().items():
+            torch.testing.assert_close(value, actor_before[name])
+
     def test_checkpoint_round_trip_preserves_actor_output(self):
         config = NstepTd3Config(
             hidden_size_1=8,
@@ -420,6 +470,81 @@ class NstepTd3LearnerTests(unittest.TestCase):
         )
         self.assertEqual(restored.best_lap_time_seconds, 204.0)
 
+    def test_v4_checkpoint_round_trip_uses_reward_from_configuration(self):
+        config = NstepTd3Config(
+            hidden_size_1=8,
+            hidden_size_2=8,
+            replay_capacity=16,
+            replay_start_size=8,
+            batch_size=4,
+            steering_rate_cost_coefficient=0.0025,
+        )
+        learner = NstepTd3Learner(config, device="cpu")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "agent7-v4.pt"
+            learner.save(path)
+            checkpoint = load_checkpoint(path)
+            restored = NstepTd3Learner.load(path, device="cpu")
+
+        self.assertEqual(checkpoint["reward_version"], STEERING_RATE_REWARD_VERSION)
+        self.assertEqual(restored.reward_version, STEERING_RATE_REWARD_VERSION)
+        self.assertEqual(restored.config.steering_rate_cost_coefficient, 0.0025)
+
+    def test_actor_only_transfer_resets_all_learning_state(self):
+        source_config = NstepTd3Config(
+            hidden_size_1=8,
+            hidden_size_2=8,
+            replay_capacity=16,
+            replay_start_size=8,
+            batch_size=4,
+            seed=5,
+        )
+        source = NstepTd3Learner(source_config, device="cpu")
+        with torch.no_grad():
+            for parameter in source.critic.parameters():
+                parameter.add_(1.0)
+        source.environment_steps = 123
+        source.optimizer_steps = 45
+        source.actor_updates = 6
+        source.best_evaluation_completion_rate = 1.0
+        observation = np.zeros(OBSERVATION_SIZE, dtype=np.float32)
+        expected_action = source.select_action(observation, deterministic=True)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source-v3.pt"
+            source.save(path)
+            target_config = replace(
+                source_config,
+                actor_learning_rate=1e-6,
+                steering_rate_cost_coefficient=0.0025,
+                seed=17,
+            )
+            transferred = NstepTd3Learner.from_actor_checkpoint(
+                path,
+                config=target_config,
+                device="cpu",
+            )
+
+        actual_action = transferred.select_action(
+            observation,
+            deterministic=True,
+        )
+        np.testing.assert_allclose(actual_action, expected_action, atol=1e-7)
+        self.assertEqual(transferred.environment_steps, 0)
+        self.assertEqual(transferred.optimizer_steps, 0)
+        self.assertEqual(transferred.actor_updates, 0)
+        self.assertIsNone(transferred.best_evaluation_completion_rate)
+        self.assertEqual(len(transferred.replay), 0)
+        self.assertEqual(transferred.actor_optimizer.state_dict()["state"], {})
+        self.assertEqual(transferred.reward_version, STEERING_RATE_REWARD_VERSION)
+        self.assertTrue(
+            any(
+                not torch.equal(value, source.critic.state_dict()[name])
+                for name, value in transferred.critic.state_dict().items()
+            )
+        )
+
     def test_legacy_actor_is_inference_compatible_but_not_resumable(self):
         learner = NstepTd3Learner(
             NstepTd3Config(
@@ -449,6 +574,10 @@ class NstepTd3LearnerTests(unittest.TestCase):
         )
         self.assertEqual(OBSERVATION_VERSION, "agent7_torcsrl_history_v3")
         self.assertEqual(REWARD_VERSION, "agent7_torcsrl_racing_line_velocity_v3")
+        self.assertEqual(
+            STEERING_RATE_REWARD_VERSION,
+            "agent7_torcsrl_racing_line_velocity_steering_rate_v4",
+        )
 
     def test_reseed_training_noise_is_reproducible_and_preserves_weights(self):
         config = NstepTd3Config(
@@ -523,18 +652,34 @@ class NstepTd3LearnerTests(unittest.TestCase):
 
         learner.enable_fine_tuning()
 
-        self.assertEqual(learner.config.actor_learning_rate, 3e-5)
+        self.assertEqual(learner.config.actor_learning_rate, 3e-6)
         self.assertEqual(learner.config.critic_learning_rate, critic_learning_rate)
         self.assertEqual(learner.config.exploration_noise, 0.01)
         self.assertEqual(learner.config.longitudinal_exploration_noise, 0.01)
         self.assertEqual(learner.config.policy_delay, 4)
-        self.assertEqual(learner.actor_optimizer.param_groups[0]["lr"], 3e-5)
+        self.assertEqual(learner.actor_optimizer.param_groups[0]["lr"], 3e-6)
         np.testing.assert_array_equal(
             learner._exploration_noise_scale,
             np.asarray([0.01, 0.01], dtype=np.float32),
         )
         for name, value in learner.actor.state_dict().items():
             torch.testing.assert_close(value, actor_before[name])
+
+    def test_fine_tuning_accepts_a_custom_actor_learning_rate(self):
+        learner = self._learner()
+
+        learner.enable_fine_tuning(actor_learning_rate=7e-7)
+
+        self.assertEqual(learner.config.actor_learning_rate, 7e-7)
+        self.assertEqual(learner.actor_optimizer.param_groups[0]["lr"], 7e-7)
+
+    def test_fine_tuning_rejects_invalid_actor_learning_rates(self):
+        learner = self._learner()
+
+        for value in (0.0, -1e-6, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    learner.enable_fine_tuning(actor_learning_rate=value)
 
     def test_longitudinal_exploration_can_escape_full_throttle_saturation(self):
         config = NstepTd3Config(
@@ -614,6 +759,7 @@ class NstepTd3RuntimeTests(unittest.TestCase):
         self.assertEqual(args.max_episode_steps, 25_000)
         self.assertEqual(args.observation_noise_std, 0.025)
         self.assertEqual(args.train_frequency, 4)
+        self.assertEqual(config.steering_rate_cost_coefficient, 0.0)
         self.assertFalse(args.seed_was_explicit)
         self.assertEqual(args.seed, 0)
 
@@ -622,6 +768,115 @@ class NstepTd3RuntimeTests(unittest.TestCase):
 
         self.assertEqual(script.MODEL_DIR.name, "agent7_n_step_td3_v3")
         self.assertEqual(script.RUNS_DIR.name, "agent7_n_step_td3_v3")
+        self.assertEqual(
+            script.STEERING_RATE_V4_MODEL_DIR.name,
+            "agent7_n_step_td3_v4",
+        )
+        self.assertEqual(
+            script.STEERING_RATE_V4_RUNS_DIR.name,
+            "agent7_n_step_td3_v4",
+        )
+
+    def test_v4_parser_applies_the_bounded_actor_only_profile(self):
+        script = load_training_script()
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "best_evaluation.pt"
+            checkpoint.touch()
+            original = script.BEST_EVALUATION_PATH
+            script.BEST_EVALUATION_PATH = checkpoint
+            try:
+                args = script.parse_args(
+                    ["--resume-best", "--steering-rate-v4", "--seed", "19"]
+                )
+            finally:
+                script.BEST_EVALUATION_PATH = original
+
+        config = script.config_from_args(args)
+        self.assertEqual(args.resume, checkpoint)
+        self.assertEqual(args.total_timesteps, 1_280)
+        self.assertEqual(args.train_frequency, 32)
+        self.assertEqual(args.evaluation_repeats, 10)
+        self.assertEqual(args.fine_tune_actor_learning_rate, 1e-6)
+        self.assertEqual(args.fine_tune_replay_warmup_size, 30_000)
+        self.assertEqual(args.fine_tune_critic_warmup_updates, 5_000)
+        self.assertEqual(args.steering_rate_max_actor_updates, 10)
+        self.assertEqual(args.steering_rate_promotion_median_seconds, 103.953)
+        self.assertEqual(config.steering_rate_cost_coefficient, 0.0025)
+
+    def test_v4_requires_the_protected_best_checkpoint_and_ten_evaluations(self):
+        script = load_training_script()
+        with self.assertRaises(SystemExit):
+            script.parse_args(["--steering-rate-v4"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "best_evaluation.pt"
+            checkpoint.touch()
+            original = script.BEST_EVALUATION_PATH
+            script.BEST_EVALUATION_PATH = checkpoint
+            try:
+                with self.assertRaises(SystemExit):
+                    script.parse_args(
+                        [
+                            "--resume-best",
+                            "--steering-rate-v4",
+                            "--evaluation-repeats",
+                            "9",
+                        ]
+                    )
+            finally:
+                script.BEST_EVALUATION_PATH = original
+
+    def test_v4_promotion_gate_is_strict_about_reliability_and_pace(self):
+        script = load_training_script()
+        gate = script.EvaluationPromotionGate(
+            required_completion_rate=1.0,
+            maximum_median_lap_time_seconds=103.953,
+        )
+
+        def score(completion_rate, median_lap_time):
+            return script.EvaluationScore(
+                completion_rate=completion_rate,
+                median_lap_time_seconds=median_lap_time,
+                fastest_lap_time_seconds=median_lap_time,
+                median_distance_m=2943.0,
+                mean_off_track_steps=0.0,
+                mean_damage_delta=0.0,
+            )
+
+        self.assertFalse(gate.permits(score(0.9, 100.0)))
+        self.assertFalse(gate.permits(score(1.0, 103.953)))
+        self.assertTrue(gate.permits(score(1.0, 103.952)))
+
+    def test_same_protocol_champion_is_protected_across_v4_seed_runs(self):
+        script = load_training_script()
+        config = NstepTd3Config(
+            hidden_size_1=8,
+            hidden_size_2=8,
+            replay_capacity=16,
+            replay_start_size=8,
+            batch_size=4,
+            steering_rate_cost_coefficient=0.0025,
+        )
+        incumbent = NstepTd3Learner(config, device="cpu")
+        incumbent.best_evaluation_distance_m = 2943.2
+        incumbent.best_evaluation_median_m = 2943.1
+        incumbent.best_evaluation_completion_rate = 1.0
+        incumbent.best_evaluation_median_lap_time_seconds = 102.5
+        incumbent.best_evaluation_mean_off_track_steps = 0.0
+        incumbent.best_evaluation_mean_damage_delta = 0.0
+
+        with tempfile.TemporaryDirectory() as directory:
+            model_dir = Path(directory)
+            incumbent.save(model_dir / "best_evaluation.pt")
+            fresh_candidate = NstepTd3Learner(config, device="cpu")
+            script.synchronise_recorded_evaluation(fresh_candidate, model_dir)
+
+        self.assertEqual(fresh_candidate.best_evaluation_completion_rate, 1.0)
+        self.assertEqual(
+            fresh_candidate.best_evaluation_median_lap_time_seconds,
+            102.5,
+        )
+        self.assertEqual(fresh_candidate.best_evaluation_distance_m, 2943.2)
 
     def test_training_parser_tracks_an_explicit_resume_seed(self):
         script = load_training_script()
@@ -651,8 +906,28 @@ class NstepTd3RuntimeTests(unittest.TestCase):
         self.assertTrue(args.fine_tune)
         self.assertEqual(args.resume, checkpoint)
         self.assertEqual(args.train_frequency, 8)
+        self.assertEqual(args.fine_tune_actor_learning_rate, 3e-6)
         self.assertEqual(args.fine_tune_replay_warmup_size, 30_000)
         self.assertEqual(args.fine_tune_critic_warmup_updates, 2_000)
+
+    def test_fine_tune_actor_learning_rate_can_be_overridden(self):
+        script = load_training_script()
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "agent7.pt"
+            checkpoint.touch()
+            args = script.parse_args(
+                [
+                    "--total-timesteps",
+                    "100",
+                    "--resume",
+                    str(checkpoint),
+                    "--fine-tune",
+                    "--fine-tune-actor-learning-rate",
+                    "8e-7",
+                ]
+            )
+
+        self.assertEqual(args.fine_tune_actor_learning_rate, 8e-7)
 
     def test_fine_tune_train_frequency_can_be_overridden_explicitly(self):
         script = load_training_script()
@@ -705,12 +980,14 @@ class NstepTd3RuntimeTests(unittest.TestCase):
             "racing_line_error": 0.05,
             "minimum_track_sensor_m": 12.0,
             "raw_steer": -0.25,
+            "steering_delta": -0.1,
             "raw_longitudinal": -0.4,
             "control_accel": 0.0,
             "control_brake": 0.4,
             "control_gear": 3,
             "reward_forward_velocity": 0.48,
             "reward_racing_line_factor": 0.975,
+            "reward_steering_rate_penalty": -0.000025,
             "reward_terminal_penalty": 0.0,
             "lookahead_curvature": curvature,
             "physical_failure": False,
@@ -723,6 +1000,11 @@ class NstepTd3RuntimeTests(unittest.TestCase):
         self.assertEqual(row["distance_m"], 350.0)
         self.assertEqual(row["raw_longitudinal"], -0.4)
         self.assertEqual(row["control_brake"], 0.4)
+        self.assertAlmostEqual(row["steering_delta"], -0.1)
+        self.assertAlmostEqual(
+            row["reward_steering_rate_penalty"],
+            -0.000025,
+        )
         self.assertAlmostEqual(row["lookahead_curvature_0m"], -1.0)
         self.assertAlmostEqual(row["lookahead_curvature_275m"], 1.0)
 
@@ -1329,6 +1611,49 @@ class NstepTorcsEnvironmentTests(unittest.TestCase):
             reward,
             info["reward_forward_velocity"]
             * info["reward_racing_line_factor"],
+        )
+
+    def test_environment_v4_penalises_action_change_without_filtering_steer(self):
+        initial = telemetry()
+        first = telemetry(speedX=100.0, distRaced=10.0, distFromStart=10.0)
+        second = telemetry(speedX=100.0, distRaced=20.0, distFromStart=20.0)
+        environment = NstepTorcsEnvironment(
+            observation_noise_std=0.0,
+            steering_rate_cost_coefficient=0.0025,
+            runner=_FakeRunner(initial, [first, second]),
+        )
+        environment.reset()
+
+        _observation, first_reward, *_rest, first_info = environment.step(
+            np.asarray([1.0, 0.5], dtype=np.float32)
+        )
+        _observation, second_reward, *_rest, second_info = environment.step(
+            np.asarray([-1.0, 0.5], dtype=np.float32)
+        )
+
+        self.assertEqual(first_info["raw_steer"], 1.0)
+        self.assertEqual(second_info["raw_steer"], -1.0)
+        self.assertEqual(first_info["steering_delta"], 1.0)
+        self.assertEqual(second_info["steering_delta"], -2.0)
+        self.assertAlmostEqual(
+            first_info["reward_steering_rate_penalty"],
+            -0.0025,
+        )
+        self.assertAlmostEqual(
+            second_info["reward_steering_rate_penalty"],
+            -0.01,
+        )
+        self.assertAlmostEqual(
+            first_reward,
+            first_info["reward_forward_velocity"]
+            * first_info["reward_racing_line_factor"]
+            - 0.0025,
+        )
+        self.assertAlmostEqual(
+            second_reward,
+            second_info["reward_forward_velocity"]
+            * second_info["reward_racing_line_factor"]
+            - 0.01,
         )
 
     def test_environment_applies_reproducible_observation_noise(self):

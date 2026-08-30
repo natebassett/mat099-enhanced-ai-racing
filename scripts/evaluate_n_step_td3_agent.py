@@ -35,6 +35,9 @@ from n_step_td3.racing_line import LOOKAHEAD_DISTANCES_M
 
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "evaluation" / "agent7_n_step_td3_v3"
+STEERING_RATE_V4_OUTPUT_DIR = (
+    PROJECT_ROOT / "data" / "evaluation" / "agent7_n_step_td3_v4"
+)
 TRACE_CURVATURE_COLUMNS = tuple(
     f"lookahead_curvature_{int(distance)}m"
     for distance in LOOKAHEAD_DISTANCES_M
@@ -52,6 +55,7 @@ TRACE_COLUMNS = (
     "racing_line_error",
     "minimum_track_sensor_m",
     "raw_steer",
+    "steering_delta",
     "raw_longitudinal",
     "control_accel",
     "control_brake",
@@ -59,6 +63,7 @@ TRACE_COLUMNS = (
     "reward",
     "reward_forward_velocity",
     "reward_racing_line_factor",
+    "reward_steering_rate_penalty",
     "reward_terminal_penalty",
     *TRACE_CURVATURE_COLUMNS,
     "physical_failure",
@@ -149,6 +154,7 @@ def build_trace_row(
         "racing_line_error": float(info["racing_line_error"]),
         "minimum_track_sensor_m": float(info["minimum_track_sensor_m"]),
         "raw_steer": float(info["raw_steer"]),
+        "steering_delta": float(info["steering_delta"]),
         "raw_longitudinal": float(info["raw_longitudinal"]),
         "control_accel": float(info["control_accel"]),
         "control_brake": float(info["control_brake"]),
@@ -157,6 +163,9 @@ def build_trace_row(
         "reward_forward_velocity": float(info["reward_forward_velocity"]),
         "reward_racing_line_factor": float(
             info["reward_racing_line_factor"]
+        ),
+        "reward_steering_rate_penalty": float(
+            info["reward_steering_rate_penalty"]
         ),
         "reward_terminal_penalty": float(info["reward_terminal_penalty"]),
     }
@@ -178,6 +187,8 @@ class DeterministicCheckpointPolicy:
     def __init__(self, path: Path, device: str) -> None:
         checkpoint = load_actor_checkpoint(path, device="cpu")
         config = NstepTd3Config(**checkpoint["config"])
+        self.config = config
+        self.reward_version = str(checkpoint.get("reward_version", REWARD_VERSION))
         self.device = resolve_device(device)
         self.actor = Actor(
             config.observation_size,
@@ -200,6 +211,11 @@ class DeterministicCheckpointPolicy:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     policy = DeterministicCheckpointPolicy(args.policy_path, args.device)
+    if (
+        args.output_dir == DEFAULT_OUTPUT_DIR
+        and policy.config.steering_rate_cost_coefficient > 0.0
+    ):
+        args.output_dir = STEERING_RATE_V4_OUTPUT_DIR
     environment = NstepTorcsEnvironment(
         track_name=args.track,
         max_episode_steps=args.max_episode_steps,
@@ -207,6 +223,9 @@ def main(argv: list[str] | None = None) -> None:
         observation_noise_std=args.observation_noise_std,
         seed=args.seed,
         racing_line_path=args.racing_line_path,
+        steering_rate_cost_coefficient=(
+            policy.config.steering_rate_cost_coefficient
+        ),
     )
     rows: list[dict[str, object]] = []
     trace_rows: list[dict[str, object]] = []
@@ -252,7 +271,10 @@ def main(argv: list[str] | None = None) -> None:
         "track": args.track,
         "observation_version": OBSERVATION_VERSION,
         "action_version": ACTION_VERSION,
-        "reward_version": REWARD_VERSION,
+        "reward_version": policy.reward_version,
+        "steering_rate_cost_coefficient": (
+            policy.config.steering_rate_cost_coefficient
+        ),
         "deterministic": True,
         "repeats": args.repeats,
         "median_distance_m": statistics.median(distances),
