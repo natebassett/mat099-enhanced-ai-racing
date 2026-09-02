@@ -114,6 +114,11 @@ def build_stylesheet(palette: ThemePalette = LIGHT_THEME) -> str:
         font-size: 20px;
         font-weight: 700;
     }}
+    QLabel#factValue {{
+        color: {palette.text};
+        font-size: 11px;
+        font-weight: 600;
+    }}
     QLabel#statusLabel {{
         color: {palette.muted};
         font-weight: 600;
@@ -188,13 +193,15 @@ def build_stylesheet(palette: ThemePalette = LIGHT_THEME) -> str:
         background-color: {palette.canvas};
         border: 0;
     }}
-    QTabWidget#contentTabs::pane {{
+    QTabWidget#contentTabs::pane,
+    QTabWidget#agentLabTabs::pane {{
         background-color: {palette.surface};
         border: 1px solid {palette.border};
         border-radius: 6px;
         top: -1px;
     }}
-    QTabWidget#contentTabs QTabBar::tab {{
+    QTabWidget#contentTabs QTabBar::tab,
+    QTabWidget#agentLabTabs QTabBar::tab {{
         padding: 8px 14px;
         color: {palette.muted};
         background-color: transparent;
@@ -202,7 +209,8 @@ def build_stylesheet(palette: ThemePalette = LIGHT_THEME) -> str:
         border-bottom: 2px solid transparent;
         font-weight: 600;
     }}
-    QTabWidget#contentTabs QTabBar::tab:selected {{
+    QTabWidget#contentTabs QTabBar::tab:selected,
+    QTabWidget#agentLabTabs QTabBar::tab:selected {{
         color: {palette.accent};
         border-bottom-color: {palette.accent};
     }}
@@ -242,6 +250,27 @@ def build_stylesheet(palette: ThemePalette = LIGHT_THEME) -> str:
     }}
     QComboBox:hover {{ border-color: {palette.accent}; }}
     QComboBox::drop-down {{ border: 0; width: 24px; }}
+    QComboBox QAbstractItemView {{
+        color: {palette.text};
+        background-color: {palette.surface};
+        border: 1px solid {palette.border_strong};
+        border-radius: 4px;
+        padding: 4px;
+        outline: 0;
+        selection-color: {palette.text};
+        selection-background-color: {palette.selection};
+    }}
+    QComboBox QAbstractItemView::item {{
+        min-height: 28px;
+        padding: 3px 8px;
+        border: 0;
+        border-radius: 3px;
+    }}
+    QComboBox QAbstractItemView::item:hover,
+    QComboBox QAbstractItemView::item:selected {{
+        color: {palette.text};
+        background-color: {palette.selection};
+    }}
     QTextEdit, QPlainTextEdit {{
         color: {palette.text};
         background-color: {palette.surface_alt};

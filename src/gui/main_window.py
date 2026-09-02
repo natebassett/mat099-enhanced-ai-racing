@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QSlider,
     QStyle,
@@ -211,9 +212,12 @@ class MainWindow(QMainWindow):
         self.agent_education_title_label = QLabel("Agent Guide")
         self.agent_education_badge_label = QLabel("Idle")
         self.agent_education_headline_label = QLabel("Select an agent.")
-        self.agent_algorithm_button = QPushButton("Algorithm Guide")
+        self.agent_algorithm_button = QPushButton("Open Technical Guide")
+        self.agent_education_fact_labels: dict[str, QLabel] = {}
         self.agent_education_metadata_box = QTextEdit()
         self.agent_education_overview_box = QTextEdit()
+        self.agent_education_learning_box = QTextEdit()
+        self.agent_education_takeaways_box = QTextEdit()
         self.agent_education_signals_box = QTextEdit()
         self.agent_education_strengths_box = QTextEdit()
         self.agent_education_failure_box = QTextEdit()
@@ -404,6 +408,8 @@ class MainWindow(QMainWindow):
         for box in (
             self.agent_education_metadata_box,
             self.agent_education_overview_box,
+            self.agent_education_learning_box,
+            self.agent_education_takeaways_box,
             self.agent_education_signals_box,
             self.agent_education_strengths_box,
             self.agent_education_failure_box,
@@ -456,14 +462,29 @@ class MainWindow(QMainWindow):
         page = QWidget()
         page.setObjectName("pageCanvas")
         layout = QHBoxLayout(page)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(14)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(12)
 
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._build_control_panel())
-        splitter.addWidget(self._build_telemetry_panel())
-        splitter.addWidget(self._build_explanation_panel())
-        splitter.setSizes([270, 690, 320])
+        splitter.setObjectName("dashboardSplitter")
+        splitter.setChildrenCollapsible(False)
+
+        control_panel = self._build_control_panel()
+        telemetry_panel = self._build_telemetry_panel()
+        explanation_panel = self._build_explanation_panel()
+        control_panel.setMinimumWidth(240)
+        control_panel.setMaximumWidth(300)
+        telemetry_panel.setMinimumWidth(500)
+        explanation_panel.setMinimumWidth(285)
+        explanation_panel.setMaximumWidth(430)
+
+        splitter.addWidget(control_panel)
+        splitter.addWidget(telemetry_panel)
+        splitter.addWidget(explanation_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([260, 720, 360])
 
         layout.addWidget(splitter)
         return page
@@ -471,6 +492,8 @@ class MainWindow(QMainWindow):
     def _build_control_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 8, 0)
+        layout.setSpacing(8)
 
         title = QLabel("Race Control")
         title.setFont(_section_font())
@@ -495,7 +518,10 @@ class MainWindow(QMainWindow):
 
     def _build_telemetry_panel(self) -> QWidget:
         panel = QWidget()
+        panel.setObjectName("liveTelemetryPanel")
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 0, 8, 0)
+        layout.setSpacing(8)
 
         title = QLabel("Live Driver Dashboard")
         title.setFont(_section_font())
@@ -512,6 +538,9 @@ class MainWindow(QMainWindow):
             MetricSpec("damage", "Damage", "--"),
         ]
         metric_grid = QGridLayout()
+        metric_grid.setContentsMargins(0, 0, 0, 0)
+        metric_grid.setHorizontalSpacing(6)
+        metric_grid.setVerticalSpacing(6)
         for index, metric in enumerate(metrics):
             metric_grid.addWidget(
                 self._metric_card(metric),
@@ -521,31 +550,39 @@ class MainWindow(QMainWindow):
         layout.addLayout(metric_grid)
 
         road_row = QHBoxLayout()
+        road_row.setContentsMargins(0, 0, 0, 0)
+        road_row.setSpacing(8)
         road_row.addWidget(self._visual_group("Road Position", self.track_position_widget))
         road_row.addWidget(self._visual_group("Road Ahead", self.road_sensor_widget))
         layout.addLayout(road_row)
 
-        chart_row = QHBoxLayout()
-        self.speed_plot = self._build_plot("Speed", "km/h")
+        chart_tabs = QTabWidget()
+        chart_tabs.setObjectName("contentTabs")
+        chart_tabs.setMinimumHeight(190)
+
+        self.speed_plot = self._build_plot("", "km/h")
         self.speed_plot.setYRange(0.0, 220.0)
         self.speed_curve = self.speed_plot.plot(
             [],
             [],
             pen=pg.mkPen("#2f80ed", width=2),
         )
-        chart_row.addWidget(self.speed_plot)
+        chart_tabs.addTab(self.speed_plot, "Speed")
 
-        self.steer_plot = self._build_plot("Steering", "steer")
+        self.steer_plot = self._build_plot("", "steer")
         self.steer_plot.setYRange(-1.0, 1.0)
         self.steer_curve = self.steer_plot.plot(
             [],
             [],
             pen=pg.mkPen("#8e5cf7", width=2),
         )
-        chart_row.addWidget(self.steer_plot)
-        layout.addLayout(chart_row)
+        chart_tabs.addTab(self.steer_plot, "Steering")
 
-        self.pedal_plot = self._build_plot("Throttle / Brake", "%")
+        pedal_page = QWidget()
+        pedal_layout = QVBoxLayout(pedal_page)
+        pedal_layout.setContentsMargins(0, 4, 0, 0)
+        pedal_layout.setSpacing(2)
+        self.pedal_plot = self._build_plot("", "%")
         self.pedal_plot.setYRange(0.0, 100.0)
         self.throttle_curve = self.pedal_plot.plot(
             [],
@@ -557,7 +594,7 @@ class MainWindow(QMainWindow):
             [],
             pen=pg.mkPen("#c0392b", width=2),
         )
-        layout.addWidget(
+        pedal_layout.addWidget(
             self._chart_legend(
                 [
                     ("Throttle", "#27ae60"),
@@ -565,13 +602,24 @@ class MainWindow(QMainWindow):
                 ]
             )
         )
-        layout.addWidget(self.pedal_plot)
+        pedal_layout.addWidget(self.pedal_plot, 1)
+        chart_tabs.addTab(pedal_page, "Throttle / Brake")
+        layout.addWidget(chart_tabs, 1)
 
         return panel
 
     def _build_explanation_panel(self) -> QWidget:
+        scroll_area = QScrollArea()
+        scroll_area.setObjectName("dashboardInsightScroll")
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
         panel = QWidget()
+        panel.setObjectName("scrollCanvas")
+        panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 0, 8, 0)
+        layout.setSpacing(8)
 
         title = QLabel("What The Car Is Doing")
         title.setFont(_section_font())
@@ -595,7 +643,8 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.explanation_box)
         layout.addWidget(log_group, 1)
 
-        return panel
+        scroll_area.setWidget(panel)
+        return scroll_area
 
     def _build_dyna_q_learning_panel(self) -> QWidget:
         group = QGroupBox("Dyna-Q Learning Brain")
@@ -606,22 +655,20 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.dyna_q_status_detail_label)
 
         loop_group = QGroupBox("Learning Loop")
-        loop_layout = QHBoxLayout(loop_group)
+        loop_layout = QGridLayout(loop_group)
         loop_layout.setSpacing(6)
         for index, step in enumerate(
             ("Observe", "Act", "Reward", "Update Q-table", "Replay memory")
         ):
-            if index:
-                arrow = QLabel(">")
-                arrow.setAlignment(Qt.AlignCenter)
-                loop_layout.addWidget(arrow)
-            step_label = QLabel(step)
+            step_label = QLabel(f"{index + 1}. {step}")
             step_label.setAlignment(Qt.AlignCenter)
             step_label.setWordWrap(True)
-            step_label.setMinimumHeight(34)
+            step_label.setMinimumHeight(38)
             step_label.setStyleSheet(_dyna_q_loop_style(active=False))
             self.dyna_q_loop_labels.append(step_label)
-            loop_layout.addWidget(step_label, 1)
+            loop_layout.addWidget(step_label, index // 3, index % 3)
+        for column in range(3):
+            loop_layout.setColumnStretch(column, 1)
         layout.addWidget(loop_group)
 
         why_group = QGroupBox("Why This Action?")
@@ -961,12 +1008,19 @@ class MainWindow(QMainWindow):
         page = QWidget()
         page.setObjectName("pageCanvas")
         layout = QHBoxLayout(page)
-        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setContentsMargins(16, 14, 16, 14)
 
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._build_agent_education_left_panel())
-        splitter.addWidget(self._build_agent_education_detail_panel())
-        splitter.setSizes([330, 850])
+        splitter.setObjectName("agentLabSplitter")
+        splitter.setChildrenCollapsible(False)
+        summary_panel = self._build_agent_education_left_panel()
+        detail_panel = self._build_agent_education_detail_panel()
+        summary_panel.setMinimumWidth(280)
+        summary_panel.setMaximumWidth(360)
+        detail_panel.setMinimumWidth(620)
+        splitter.addWidget(summary_panel)
+        splitter.addWidget(detail_panel)
+        splitter.setSizes([320, 1040])
         layout.addWidget(splitter)
 
         return page
@@ -974,10 +1028,17 @@ class MainWindow(QMainWindow):
     def _build_agent_education_left_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 10, 0)
+        layout.setSpacing(10)
 
-        title = QLabel("Agents")
+        title = QLabel("Agent Lab")
+        title.setObjectName("pageTitle")
         title.setFont(_section_font())
+        subtitle = QLabel("See how each driver turns information into action.")
+        subtitle.setObjectName("pageSubtitle")
+        subtitle.setWordWrap(True)
         layout.addWidget(title)
+        layout.addWidget(subtitle)
         layout.addWidget(self._combo_group("Driver", self.agent_education_combo))
 
         profile_group = QGroupBox("Profile")
@@ -985,53 +1046,127 @@ class MainWindow(QMainWindow):
         profile_layout.addWidget(self.agent_education_title_label)
         profile_layout.addWidget(self.agent_education_badge_label)
         profile_layout.addWidget(self.agent_education_headline_label)
-        profile_layout.addWidget(self.agent_algorithm_button)
         layout.addWidget(profile_group)
 
-        layout.addWidget(
-            self._text_group("Project Metadata", self.agent_education_metadata_box)
+        layout.addWidget(self._build_agent_quick_facts())
+        self.agent_algorithm_button.setProperty("primary", True)
+        self.agent_algorithm_button.setToolTip(
+            "Open equations, pseudocode, implementation notes, and source excerpts"
         )
+        layout.addWidget(self.agent_algorithm_button)
         layout.addStretch(1)
         return panel
 
-    def _build_agent_education_detail_panel(self) -> QWidget:
-        scroll_area = QScrollArea()
-        scroll_area.setObjectName("agentDetailScroll")
-        scroll_area.setWidgetResizable(True)
+    def _build_agent_quick_facts(self) -> QWidget:
+        panel = QFrame()
+        panel.setProperty("surface", True)
+        layout = QGridLayout(panel)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(10)
 
+        for index, label_text in enumerate(
+            ("Approach", "Learns from", "Policy", "Racing line")
+        ):
+            label = QLabel(label_text)
+            label.setObjectName("metricLabel")
+            value = QLabel("--")
+            value.setObjectName("factValue")
+            value.setWordWrap(True)
+            value.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            self.agent_education_fact_labels[label_text] = value
+            row = index // 2
+            column = (index % 2) * 2
+            layout.addWidget(label, row * 2, column, 1, 2)
+            layout.addWidget(value, row * 2 + 1, column, 1, 2)
+        return panel
+
+    def _build_agent_education_detail_panel(self) -> QTabWidget:
+        tabs = QTabWidget()
+        tabs.setObjectName("agentLabTabs")
+        tabs.addTab(self._build_agent_driving_page(), "How It Drives")
+        tabs.addTab(self._build_agent_learning_page(), "How It Learns")
+        tabs.addTab(self._build_agent_limits_page(), "Use & Limits")
+        return tabs
+
+    def _build_agent_driving_page(self) -> QScrollArea:
         content = QWidget()
         content.setObjectName("scrollCanvas")
         layout = QVBoxLayout(content)
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(10)
         layout.addWidget(
-            self._text_group("What This Driver Is Doing", self.agent_education_overview_box)
+            self._text_group("Driving Strategy", self.agent_education_overview_box)
         )
 
         decision_group = QGroupBox("Decision Flow")
         decision_layout = QVBoxLayout(decision_group)
         decision_layout.addWidget(self._build_agent_pipeline())
         layout.addWidget(decision_group)
-
         layout.addWidget(self._build_racing_line_visualizer_panel())
+        layout.addStretch(1)
+        return self._agent_lab_scroll_page(content, "agentDrivingScroll")
+
+    def _build_agent_learning_page(self) -> QScrollArea:
+        content = QWidget()
+        content.setObjectName("scrollCanvas")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(10)
+        layout.addWidget(
+            self._text_group("Learning Method", self.agent_education_learning_box)
+        )
+
+        detail_row = QHBoxLayout()
+        detail_row.setSpacing(10)
+        detail_row.addWidget(
+            self._text_group("Information Available", self.agent_education_signals_box)
+        )
+        detail_row.addWidget(
+            self._text_group("What To Remember", self.agent_education_takeaways_box)
+        )
+        layout.addLayout(detail_row)
+        layout.addStretch(1)
+        return self._agent_lab_scroll_page(content, "agentLearningScroll")
+
+    def _build_agent_limits_page(self) -> QScrollArea:
+        content = QWidget()
+        content.setObjectName("scrollCanvas")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(10)
 
         first_row = QHBoxLayout()
+        first_row.setSpacing(10)
         first_row.addWidget(
-            self._text_group("What It Watches", self.agent_education_signals_box)
+            self._text_group("Strengths", self.agent_education_strengths_box)
         )
         first_row.addWidget(
-            self._text_group("Where It Helps", self.agent_education_strengths_box)
+            self._text_group("Failure Signs", self.agent_education_failure_box)
         )
         layout.addLayout(first_row)
 
         second_row = QHBoxLayout()
-        second_row.addWidget(
-            self._text_group("Failure Signs", self.agent_education_failure_box)
-        )
+        second_row.setSpacing(10)
         second_row.addWidget(
             self._text_group("Track Fit", self.agent_education_tracks_box)
         )
+        second_row.addWidget(
+            self._text_group("Project Metadata", self.agent_education_metadata_box)
+        )
         layout.addLayout(second_row)
         layout.addStretch(1)
+        return self._agent_lab_scroll_page(content, "agentLimitsScroll")
 
+    def _agent_lab_scroll_page(
+        self,
+        content: QWidget,
+        object_name: str,
+    ) -> QScrollArea:
+        scroll_area = QScrollArea()
+        scroll_area.setObjectName(object_name)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll_area.setWidget(content)
         return scroll_area
 
@@ -1056,7 +1191,10 @@ class MainWindow(QMainWindow):
 
             card_layout.addWidget(step_label)
             card_layout.addWidget(body_label)
-            layout.addWidget(card, index // 3, index % 3)
+            if index < 3:
+                layout.addWidget(card, 0, index * 2, 1, 2)
+            else:
+                layout.addWidget(card, 1, (index - 3) * 3, 1, 3)
 
         return widget
 
@@ -1133,7 +1271,7 @@ class MainWindow(QMainWindow):
     def _metric_card(self, metric: MetricSpec) -> QFrame:
         card = QFrame()
         card.setProperty("metricCard", True)
-        card.setMinimumHeight(82)
+        card.setMinimumHeight(72)
 
         layout = QVBoxLayout(card)
         label = QLabel(metric.label)
@@ -1168,7 +1306,8 @@ class MainWindow(QMainWindow):
 
     def _build_plot(self, title: str, left_axis_label: str) -> pg.PlotWidget:
         plot = pg.PlotWidget()
-        plot.setTitle(title)
+        if title:
+            plot.setTitle(title)
         plot.setBackground(LIGHT_THEME.plot_background())
         plot.setLabel("left", left_axis_label)
         plot.setLabel("bottom", "lap time", units="s")
@@ -1362,10 +1501,14 @@ class MainWindow(QMainWindow):
             self.agent_algorithm_button.setEnabled(False)
             self._set_text_box(self.agent_education_metadata_box, ())
             self._set_text_box(self.agent_education_overview_box, ())
+            self._set_text_box(self.agent_education_learning_box, ())
+            self._set_text_box(self.agent_education_takeaways_box, ())
             self._set_text_box(self.agent_education_signals_box, ())
             self._set_text_box(self.agent_education_strengths_box, ())
             self._set_text_box(self.agent_education_failure_box, ())
             self._set_text_box(self.agent_education_tracks_box, ())
+            for label in self.agent_education_fact_labels.values():
+                label.setText("--")
             for label in self.agent_pipeline_labels:
                 label.setText("--")
             self._sync_racing_line_visualizer(None)
@@ -1384,10 +1527,23 @@ class MainWindow(QMainWindow):
             _format_key_value_lines(profile.metadata)
         )
         self._set_text_box(self.agent_education_overview_box, profile.overview)
+        self._set_text_box(
+            self.agent_education_learning_box,
+            profile.algorithm_summary,
+        )
+        self._set_text_box(
+            self.agent_education_takeaways_box,
+            profile.key_takeaways,
+        )
         self._set_text_box(self.agent_education_signals_box, profile.input_signals)
         self._set_text_box(self.agent_education_strengths_box, profile.strengths)
         self._set_text_box(self.agent_education_failure_box, profile.failure_signs)
         self._set_text_box(self.agent_education_tracks_box, profile.track_context)
+
+        for label, value in profile.quick_facts:
+            fact_label = self.agent_education_fact_labels.get(label)
+            if fact_label is not None:
+                fact_label.setText(value)
 
         for index, label in enumerate(self.agent_pipeline_labels):
             if index < len(profile.decision_steps):
@@ -3156,16 +3312,17 @@ def _dyna_q_status_key(status: str) -> str:
 
 def _dyna_q_status_style(status_key: str) -> str:
     palette = {
-        "waiting": ("#3b3b3b", "#d0d0d0"),
-        "explore": ("#8a5a00", "#ffffff"),
-        "greedy": ("#1f7a4d", "#ffffff"),
-        "update": ("#265d97", "#ffffff"),
-        "replay": ("#5a3f91", "#ffffff"),
+        "waiting": ("#E8ECEF", "#46535B", "#CCD4D9"),
+        "explore": ("#FFF2D5", "#805300", "#E7C16F"),
+        "greedy": ("#E0F2E8", "#17653B", "#91CBA9"),
+        "update": ("#DDECF8", "#1F5F8B", "#98BEDA"),
+        "replay": ("#ECE6F6", "#5B3C88", "#BBA9D4"),
     }
-    background, foreground = palette.get(status_key, palette["waiting"])
+    background, foreground, border = palette.get(status_key, palette["waiting"])
     return (
         f"background-color: {background}; "
         f"color: {foreground}; "
+        f"border: 1px solid {border}; "
         "border-radius: 4px; "
         "font-weight: 700; "
         "padding: 4px 8px;"
@@ -3175,17 +3332,17 @@ def _dyna_q_status_style(status_key: str) -> str:
 def _dyna_q_loop_style(*, active: bool) -> str:
     if active:
         return (
-            "background-color: #265d97; "
-            "color: #ffffff; "
-            "border: 1px solid #6fa8dc; "
+            "background-color: #D8F0EC; "
+            "color: #075E56; "
+            "border: 1px solid #6BB8AE; "
             "border-radius: 4px; "
             "font-weight: 700; "
             "padding: 4px;"
         )
     return (
-        "background-color: #303030; "
-        "color: #d0d0d0; "
-        "border: 1px solid #454545; "
+        "background-color: #F3F6F7; "
+        "color: #53616A; "
+        "border: 1px solid #D5DDE1; "
         "border-radius: 4px; "
         "padding: 4px;"
     )

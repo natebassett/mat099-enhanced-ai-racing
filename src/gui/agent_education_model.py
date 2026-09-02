@@ -29,6 +29,7 @@ class AgentEducationProfile:
     title: str
     badge: str
     headline: str
+    quick_facts: tuple[tuple[str, str], ...]
     overview: tuple[str, ...]
     decision_steps: tuple[str, ...]
     algorithm_summary: tuple[str, ...]
@@ -53,6 +54,7 @@ def build_agent_education_profile(
         title=agent.name,
         badge=template["badge"],
         headline=template["headline"],
+        quick_facts=_quick_facts(agent.agent_type),
         overview=tuple(template["overview"]),
         decision_steps=tuple(template["decision_steps"]),
         algorithm_summary=tuple(template["algorithm_summary"]),
@@ -913,6 +915,12 @@ def _template_for(agent_type: str) -> dict[str, Any]:
             ),
         }
 
+    if agent_type == "n_step_td3":
+        return _n_step_td3_template(sensor_only=False)
+
+    if agent_type == "sensor_n_step_td3":
+        return _n_step_td3_template(sensor_only=True)
+
     if agent_type == "random":
         return {
             "badge": "Baseline random driver",
@@ -1080,6 +1088,353 @@ def _template_for(agent_type: str) -> dict[str, Any]:
         "failure_signs": (
             "Unexpected off-track, stuck, or crashed outcomes.",
         ),
+    }
+
+
+def _quick_facts(agent_type: str) -> tuple[tuple[str, str], ...]:
+    facts = {
+        "map_aware": (
+            ("Approach", "Engineered planner"),
+            ("Learns from", "No training"),
+            ("Policy", "Deterministic control"),
+            ("Racing line", "Required"),
+        ),
+        "rule_based": (
+            ("Approach", "Reactive rules"),
+            ("Learns from", "No training"),
+            ("Policy", "Rules and thresholds"),
+            ("Racing line", "Not used"),
+        ),
+        "dyna_q_learning": (
+            ("Approach", "Model-based RL"),
+            ("Learns from", "Reward and replay"),
+            ("Policy", "Q-table"),
+            ("Racing line", "Not used"),
+        ),
+        "dyna_q_finalised": (
+            ("Approach", "Finalised RL"),
+            ("Learns from", "Saved training"),
+            ("Policy", "Greedy Q-table"),
+            ("Racing line", "Not used"),
+        ),
+        "dyna_q": (
+            ("Approach", "Model-based RL"),
+            ("Learns from", "Reward and replay"),
+            ("Policy", "Q-table"),
+            ("Racing line", "Not used"),
+        ),
+        "td3_scratch": (
+            ("Approach", "Continuous DRL"),
+            ("Learns from", "Reward and replay"),
+            ("Policy", "Neural actor"),
+            ("Racing line", "Not used"),
+        ),
+        "n_step_td3": (
+            ("Approach", "N-step TD3"),
+            ("Learns from", "Reward and replay"),
+            ("Policy", "Neural actor"),
+            ("Racing line", "Geometry input"),
+        ),
+        "sensor_n_step_td3": (
+            ("Approach", "Sensor-only TD3"),
+            ("Learns from", "Reward + own laps"),
+            ("Policy", "Neural actor"),
+            ("Racing line", "Not used"),
+        ),
+        "random": (
+            ("Approach", "Random baseline"),
+            ("Learns from", "No training"),
+            ("Policy", "Random samples"),
+            ("Racing line", "Not used"),
+        ),
+    }
+    return facts.get(
+        agent_type,
+        (
+            ("Approach", "Project agent"),
+            ("Learns from", "Agent specific"),
+            ("Policy", "See guide"),
+            ("Racing line", "See metadata"),
+        ),
+    )
+
+
+def _n_step_td3_template(*, sensor_only: bool) -> dict[str, Any]:
+    if sensor_only:
+        badge = "Sensor-only N-step TD3 policy"
+        headline = (
+            "Agent 8 learns continuous steering and acceleration from TORCS sensors "
+            "without a racing-line file or an external teacher."
+        )
+        overview = (
+            "It receives vehicle motion, road-range sensors, wheel spin, and recent driving history.",
+            (
+                "The observation deliberately contains no target route. Racing-line feature "
+                "slots are zeroed so the network contract stays compatible with Agent 7."
+            ),
+            (
+                "Most training is reward-driven TD3. Later stability experiments can retain "
+                "a small sample of Agent 8's own successful laps; this is self-generated "
+                "experience, not an external demonstration."
+            ),
+            (
+                "At deployment, exploration noise is disabled and the neural actor produces "
+                "the controls directly. Automatic shifting keeps the learning task focused "
+                "on steering, throttle, and braking."
+            ),
+        )
+        decision_steps = (
+            "Read vehicle motion, track position, wheel spin, and all 19 road sensors.",
+            "Normalise 45 sensor features and append recent observations and actions.",
+            "Pass the 141-value history state through the deterministic actor network.",
+            "Decode signed steering and longitudinal intent into steering, throttle, and brake.",
+            "Apply automatic gear selection and send the controls to TORCS.",
+        )
+        reward_title = "Sensor Stability Reward"
+        reward_formula = (
+            r"$r = \frac{v_x}{250}\cos(\theta)"
+            r" - \beta p^2 - \alpha(\Delta steer)^2"
+            r" + B_{lap} - P_{failure}$"
+        )
+        reward_explanation = (
+            "Forward velocity is useful only when aligned with the road. Small centring and "
+            "steering-rate terms improve stability without prescribing a racing line, while "
+            "lap completion and physical failure have clear terminal consequences."
+        )
+        input_signals = (
+            "Longitudinal, sideways, and vertical speed plus estimated acceleration.",
+            "Heading angle, track position, RPM, and four wheel-spin values.",
+            "All 19 TORCS road-range sensors.",
+            "Three recent observation frames and three previous two-value actions.",
+            "No racing-line target, curvature map, or teacher action.",
+        )
+        strengths = (
+            "Learns its own route from local sensors and long-term reward.",
+            "The 3-step return carries useful outcomes back through time faster than one-step TD3.",
+            "Twin critics and target smoothing reduce optimistic estimates of fragile actions.",
+            "Saved evaluation checkpoints separate reliable policies from occasional fast laps.",
+        )
+        failure_signs = (
+            "Repeated failure at one corner suggests a narrow policy rather than missing map data.",
+            "Steering saturation or oscillation can trade reliability for a rare fast lap.",
+            "A high single-run pace with poor completion rate is not a reliable champion.",
+            "Self-generated success replay can overfit if it overwhelms ordinary failure and recovery data.",
+        )
+        key_takeaways = (
+            "Agent 8 is the sensor-only neural comparison against engineered and map-aware drivers.",
+            "It does not receive a racing line, target speed, or teacher control.",
+            "Its 141 inputs include short-term memory, allowing the actor to infer motion trends.",
+            "Any optional imitation term uses only laps discovered by Agent 8 itself and is recorded in checkpoint metadata.",
+        )
+        agent_note = (
+            "Agent 8 preserves the same observation width as Agent 7, but its racing-line "
+            "difference and lookahead-curvature slots are fixed at zero."
+        )
+    else:
+        badge = "Racing-line-informed N-step TD3 policy"
+        headline = (
+            "Agent 7 learns continuous control with N-step TD3 while using racing-line "
+            "geometry as context, never as a copied teacher action."
+        )
+        overview = (
+            "It combines live TORCS telemetry with the target-line offset and upcoming curvature.",
+            (
+                "The racing line tells the network where the planned route lies and how the "
+                "road bends ahead. It does not supply steering, throttle, brake, or target-speed actions."
+            ),
+            (
+                "Three recent observations and three recent actions give the policy short-term "
+                "memory of acceleration, steering changes, and developing slides."
+            ),
+            (
+                "During training, replayed transitions update two value networks and then a "
+                "delayed actor. During evaluation, the actor runs deterministically without exploration noise."
+            ),
+        )
+        decision_steps = (
+            "Read vehicle motion, track position, wheel spin, and all 19 road sensors.",
+            "Look up racing-line offset and curvature ahead at the current lap distance.",
+            "Normalise 45 features and append recent observations and actions into 141 values.",
+            "Pass that state through the actor to produce signed steering and longitudinal intent.",
+            "Decode the action, select the gear automatically, and send controls to TORCS.",
+        )
+        reward_title = "Racing-Line Velocity Reward"
+        reward_formula = (
+            r"$r = \frac{v_x}{250}"
+            r"[\cos(\theta)-|\sin(\theta)|-|p-p_{line}|]"
+            r" - \alpha(\Delta steer)^2$"
+        )
+        reward_explanation = (
+            "The reward favours speed that is aligned with the road and close to the saved "
+            "line. It scores the result of the neural action; it does not tell the actor which action to copy."
+        )
+        input_signals = (
+            "Longitudinal, sideways, and vertical speed plus estimated acceleration.",
+            "Heading angle, track position, RPM, and four wheel-spin values.",
+            "All 19 TORCS road-range sensors.",
+            "Racing-line position difference and lookahead curvature samples.",
+            "Three recent observation frames and three previous two-value actions.",
+        )
+        strengths = (
+            "Preview curvature gives the neural policy advance warning of corners.",
+            "The 3-step return carries useful outcomes back through time faster than one-step TD3.",
+            "Twin critics and target smoothing reduce optimistic estimates of fragile actions.",
+            "The network still discovers steering, acceleration, and braking from reward feedback.",
+        )
+        failure_signs = (
+            "A missing or mismatched racing-line file invalidates the observation context.",
+            "Strong line adherence can favour consistency over a faster route discovered elsewhere.",
+            "Steering saturation or oscillation can waste speed even when laps complete.",
+            "A fast isolated lap is not evidence of robust performance across repeated evaluations.",
+        )
+        key_takeaways = (
+            "Agent 7 is neural DRL with privileged track geometry, not behaviour cloning.",
+            "The racing line contributes observations and reward context, but never control labels.",
+            "Its 141 inputs include short-term history as well as current telemetry.",
+            "Passive evaluation saves strong policies without rolling weights back into training.",
+        )
+        agent_note = (
+            "Agent 7 adds racing-line position error and lookahead curvature to the same "
+            "vehicle and road signals used by the sensor-only variant."
+        )
+
+    return {
+        "badge": badge,
+        "headline": headline,
+        "overview": overview,
+        "decision_steps": decision_steps,
+        "algorithm_summary": (
+            "N-step TD3 is a deterministic actor-critic algorithm for continuous control.",
+            (
+                "The actor maps the 141-value state directly to two continuous outputs: "
+                "steering and signed longitudinal intent."
+            ),
+            (
+                "The replay buffer stores experience from both successful and failed driving. "
+                "A sampled transition uses up to three rewards before bootstrapping from the target critics."
+            ),
+            (
+                "Two critics estimate long-term return. The smaller target estimate is used, "
+                "which limits the overestimation that can destabilise deterministic policies."
+            ),
+            (
+                "Clipped noise is added only to target actions during critic learning. The actor "
+                "updates less often, then slowly updates its target network."
+            ),
+            agent_note,
+        ),
+        "pseudocode": (
+            "Reset TORCS and initialise the three-frame observation/action history.",
+            "Read and normalise the current telemetry into 45 base features.",
+            "Append three base observations and three prior actions to form 141 inputs.",
+            "Ask the actor for signed steering and longitudinal intent; add exploration noise only in training.",
+            "Send decoded controls to TORCS and observe reward, next state, and termination.",
+            "Accumulate a discounted 3-step return and store the transition in replay memory.",
+            "Sample replay and update both critics toward the smaller smoothed target value.",
+            "On delayed update steps, improve the actor using critic Q1's gradient.",
+            "Soft-update target networks and periodically save passive evaluation checkpoints.",
+        ),
+        "formula_notes": (
+            FormulaNote(
+                title="History Observation",
+                formula=r"$s_t=[o_{t-2},o_{t-1},o_t,a_{t-3},a_{t-2},a_{t-1}]\in\mathbb{R}^{141}$",
+                explanation=(
+                    "Three 45-feature telemetry frames and three previous two-value actions "
+                    "give the feed-forward actor a compact view of recent motion."
+                ),
+            ),
+            FormulaNote(
+                title="Three-Step Critic Target",
+                formula=(
+                    r"$y_t=\sum_{k=0}^{2}\gamma^k r_{t+k}"
+                    r"+\gamma^3(1-d)\min_{i\in\{1,2\}}Q'_{i}(s_{t+3},\tilde a)$"
+                ),
+                explanation=(
+                    "The target includes three observed rewards before asking the target critics "
+                    "to estimate what happens later. Terminal transitions do not bootstrap."
+                ),
+            ),
+            FormulaNote(
+                title="Target Policy Smoothing",
+                formula=r"$\tilde a=\mathrm{clip}(\mu'(s')+\mathrm{clip}(\epsilon,-c,c),-1,1)$",
+                explanation=(
+                    "Clipped Gaussian noise makes the critic value actions that remain useful "
+                    "under small neighbouring control changes, rather than narrow action spikes."
+                ),
+            ),
+            FormulaNote(
+                title=reward_title,
+                formula=reward_formula,
+                explanation=reward_explanation,
+            ),
+            FormulaNote(
+                title="Delayed Actor Objective",
+                formula=r"$L_{actor}=-\mathbb{E}[Q_1(s,\mu(s))]$",
+                explanation=(
+                    "The actor follows the first critic's gradient only on delayed update steps. "
+                    "Selected Agent 8 stability experiments may add a decaying loss on actions "
+                    "from its own completed laps; checkpoint metadata records that choice."
+                ),
+            ),
+        ),
+        "code_snippets": (
+            CodeSnippet(
+                title="Telemetry and history state",
+                source="src/n_step_td3/contracts.py - build_base_observation / HistoryEncoder",
+                explanation=(
+                    "The shared contract creates 45 base inputs and combines three frames with "
+                    "three previous actions. Sensor-only mode zeroes all racing-line values."
+                ),
+                code=(
+                    "base = build_base_observation(\n"
+                    "    telemetry, previous_telemetry=previous,\n"
+                    "    racing_line=racing_line,\n"
+                    "    include_racing_line_features=use_racing_line,\n"
+                    ")\n"
+                    "state = history.observe(base)  # shape: (141,)"
+                ),
+            ),
+            CodeSnippet(
+                title="Twin-critic learning target",
+                source="src/n_step_td3/learner.py - NstepTd3Learner._gradient_step",
+                explanation=(
+                    "Target smoothing and the smaller critic value implement the two central TD3 protections."
+                ),
+                code=(
+                    "target_noise = normal_noise(actions.shape).mul(policy_noise)\n"
+                    "target_noise = target_noise.clamp(-noise_clip, noise_clip)\n"
+                    "next_actions = (actor_target(next_obs) + target_noise).clamp(-1, 1)\n"
+                    "target_q1, target_q2 = critic_target(next_obs, next_actions)\n"
+                    "target_q = returns + gamma_n * torch.minimum(target_q1, target_q2)"
+                ),
+            ),
+            CodeSnippet(
+                title="Delayed neural policy update",
+                source="src/n_step_td3/learner.py - NstepTd3Learner._gradient_step",
+                explanation=(
+                    "The actor is updated less frequently than the critics and is trained to "
+                    "select controls with a high predicted long-term return."
+                ),
+                code=(
+                    "if optimizer_steps % policy_delay == 0:\n"
+                    "    predicted_actions = actor(observations)\n"
+                    "    actor_loss = -critic.first(observations, predicted_actions).mean()\n"
+                    "    actor_loss.backward()\n"
+                    "    actor_optimizer.step()"
+                ),
+            ),
+        ),
+        "math_notes": (
+            "The actor is the neural driver; the critics are training-time judges of long-term return.",
+            "The 3-step target balances immediate evidence with a learned estimate of later outcomes.",
+            "Taking the smaller critic target reduces optimistic value errors.",
+            "Target policy noise regularises critic learning; evaluation itself remains deterministic.",
+            "Automatic gears are an engineered convenience, while steering and pedal intent remain neural outputs.",
+        ),
+        "key_takeaways": key_takeaways,
+        "input_signals": input_signals,
+        "strengths": strengths,
+        "failure_signs": failure_signs,
     }
 
 

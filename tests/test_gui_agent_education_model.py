@@ -112,6 +112,39 @@ class GuiAgentEducationModelTests(unittest.TestCase):
         self.assertTrue(any("build_td3_observation" in snippet.source for snippet in profile.code_snippets))
         self.assertIn("No racing-line file required", dict(profile.metadata)["Track dependency"])
 
+    def test_agent7_profile_explains_n_step_td3_without_action_imitation(self):
+        profile = build_agent_education_profile(
+            _agent("torcsRL N-Step TD3 Racer", "n_step_td3", requires_line=True),
+            _tracks(),
+        )
+
+        self.assertEqual(profile.badge, "Racing-line-informed N-step TD3 policy")
+        self.assertIn("never as a copied teacher action", profile.headline)
+        self.assertEqual(dict(profile.quick_facts)["Policy"], "Neural actor")
+        self.assertEqual(dict(profile.quick_facts)["Racing line"], "Geometry input")
+        self.assertTrue(any("141-value" in note for note in profile.algorithm_summary))
+        self.assertTrue(any("Three-Step Critic Target" == note.title for note in profile.formula_notes))
+        self.assertTrue(any(r"\gamma^3" in note.formula for note in profile.formula_notes))
+        self.assertTrue(any("NstepTd3Learner" in snippet.source for snippet in profile.code_snippets))
+
+    def test_agent8_profile_explains_sensor_only_learning_and_own_laps(self):
+        profile = build_agent_education_profile(
+            _agent(
+                "Sensor-Only N-Step TD3 Racer",
+                "sensor_n_step_td3",
+                requires_line=False,
+            ),
+            _tracks(),
+        )
+
+        self.assertEqual(profile.badge, "Sensor-only N-step TD3 policy")
+        self.assertIn("without a racing-line file or an external teacher", profile.headline)
+        self.assertEqual(dict(profile.quick_facts)["Learns from"], "Reward + own laps")
+        self.assertEqual(dict(profile.quick_facts)["Racing line"], "Not used")
+        self.assertTrue(any("self-generated" in note for note in profile.overview))
+        self.assertTrue(any("Sensor Stability Reward" == note.title for note in profile.formula_notes))
+        self.assertTrue(any("No racing-line target" in note for note in profile.input_signals))
+
 
 def _agent(name: str, agent_type: str, *, requires_line: bool) -> AgentOption:
     return AgentOption(

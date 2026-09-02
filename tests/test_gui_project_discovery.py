@@ -31,7 +31,9 @@ class ProjectDiscoveryTests(unittest.TestCase):
         self.assertIn("dyna_q_learning", agent_types)
         self.assertIn("dyna_q_finalised", agent_types)
         self.assertIn("td3_scratch", agent_types)
-        self.assertIn("agent8_recorded_elite_lap", agent_types)
+        self.assertIn("n_step_td3", agent_types)
+        self.assertIn("sensor_n_step_td3", agent_types)
+        self.assertNotIn("agent8_recorded_elite_lap", agent_types)
         self.assertTrue(any(agent.uses_full_control for agent in agents))
 
     def test_discovers_torcs_tracks_from_xml(self):

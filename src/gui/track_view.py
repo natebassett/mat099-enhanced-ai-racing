@@ -54,7 +54,7 @@ class TrackPositionWidget(QWidget):
         painter.drawEllipse(QPointF(marker_x, road.center().y()), 8, 8)
 
         painter.setFont(_small_font())
-        painter.setPen(QColor("#d8d8d8"))
+        painter.setPen(QColor("#5D6973"))
         painter.drawText(rect.left(), rect.top(), "Left edge")
         painter.drawText(
             QRectF(rect.left(), rect.top(), rect.width(), 16),
@@ -90,7 +90,7 @@ class RoadSensorWidget(QWidget):
         rect = self.rect().adjusted(14, 10, -14, -12)
         zones = sensor_zones(self._track_sensors)
         if not zones:
-            painter.setPen(QColor("#d8d8d8"))
+            painter.setPen(QColor("#5D6973"))
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "Road ahead unavailable")
             return
 
@@ -109,7 +109,7 @@ class RoadSensorWidget(QWidget):
             painter.setBrush(_sensor_color(distance))
             painter.drawRoundedRect(bar, 3, 3)
 
-            painter.setPen(QColor("#d8d8d8"))
+            painter.setPen(QColor("#5D6973"))
             painter.drawText(
                 QRectF(left, baseline + 2, bar_width, 16),
                 Qt.AlignmentFlag.AlignCenter,

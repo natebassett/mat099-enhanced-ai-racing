@@ -111,7 +111,6 @@ def discover_agents() -> list[AgentOption]:
     from agents.td3_agent import Td3ScratchAgent
     from agents.n_step_td3_agent import NstepTd3Agent
     from agents.sensor_n_step_td3_agent import SensorNstepTd3Agent
-    from agents.recorded_elite_lap_agent import RecordedEliteLapAgent
 
     return [
         _agent_option(DynaQLearningAgent),
@@ -119,7 +118,6 @@ def discover_agents() -> list[AgentOption]:
         _agent_option(Td3ScratchAgent),
         _agent_option(NstepTd3Agent),
         _agent_option(SensorNstepTd3Agent),
-        _agent_option(RecordedEliteLapAgent),
         _agent_option(MapAwareAgent),
         _agent_option(RuleBasedAgent),
         _agent_option(RandomAgent),
