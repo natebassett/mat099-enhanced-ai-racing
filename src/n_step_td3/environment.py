@@ -17,11 +17,14 @@ if TYPE_CHECKING:
     from runner.torcs_runner import TorcsRunner
 
 from .contracts import (
+    DEFAULT_SENSOR_STABILITY_CENTERING_COEFFICIENT,
+    SENSOR_STABILITY_HEADING_LIMIT_RAD,
     HistoryEncoder,
     apply_observation_noise,
     build_base_observation,
     calculate_progress_reward,
     calculate_reward,
+    calculate_sensor_stability_reward,
     decode_action,
     finite_float,
     track_sensors,
@@ -84,6 +87,10 @@ class NstepTorcsEnvironment:
         steering_rate_cost_coefficient: float = 0.0,
         physical_steering_limit: float = 1.0,
         progress_reward: bool = False,
+        stability_reward: bool = False,
+        stability_centering_coefficient: float = (
+            DEFAULT_SENSOR_STABILITY_CENTERING_COEFFICIENT
+        ),
         racing_line_features: bool = True,
         runner: TorcsRunner | None = None,
     ) -> None:
@@ -109,6 +116,17 @@ class NstepTorcsEnvironment:
             raise ValueError(
                 "progress reward cannot be combined with steering-rate shaping"
             )
+        if progress_reward and stability_reward:
+            raise ValueError("progress and stability rewards are mutually exclusive")
+        if stability_reward and racing_line_features:
+            raise ValueError("stability reward is reserved for sensor-only Agent 8")
+        if (
+            not math.isfinite(stability_centering_coefficient)
+            or stability_centering_coefficient < 0.0
+        ):
+            raise ValueError(
+                "stability centering coefficient must be finite and non-negative"
+            )
         self.track_name = str(track_name)
         self.max_episode_steps = int(max_episode_steps)
         self.manual_start = bool(manual_start)
@@ -119,6 +137,10 @@ class NstepTorcsEnvironment:
         )
         self.physical_steering_limit = float(physical_steering_limit)
         self.progress_reward = bool(progress_reward)
+        self.stability_reward = bool(stability_reward)
+        self.stability_centering_coefficient = float(
+            stability_centering_coefficient
+        )
         self.racing_line_features = bool(racing_line_features)
         self._observation_random = np.random.default_rng(seed)
         if runner is None:
@@ -240,6 +262,10 @@ class NstepTorcsEnvironment:
         off_track = bool(abs(track_position) > 1.0 or float(road.min()) < 0.0)
         crashed = bool(damage_delta > 0.0)
         backwards = bool(math.cos(angle) < 0.0)
+        unsafe_heading = bool(
+            self.stability_reward
+            and abs(angle) > SENSOR_STABILITY_HEADING_LIMIT_RAD
+        )
         stalled = bool(self.steps > 100 and speed < 5.0)
 
         completed_lap = self.lap_tracker.update(telemetry)
@@ -256,12 +282,20 @@ class NstepTorcsEnvironment:
                 telemetry.get("curLapTime", 0.0)
             )
 
-        physical_failure = off_track or crashed or backwards or stalled
-        terminated = bool(physical_failure)
+        physical_failure = (
+            off_track or crashed or backwards or unsafe_heading or stalled
+        )
+        goal_terminal = bool(
+            self.stability_reward and completed_lap is not None
+        )
+        terminated = bool(physical_failure or goal_terminal)
         truncated = bool(
-            completed_lap is not None
-            or self.steps >= self.max_episode_steps
-            or (server_stopped and not physical_failure)
+            not goal_terminal
+            and (
+                completed_lap is not None
+                or self.steps >= self.max_episode_steps
+                or (server_stopped and not physical_failure)
+            )
         )
         line_sample = (
             self.racing_line.sample(
@@ -276,7 +310,21 @@ class NstepTorcsEnvironment:
                 ),
             )
         )
-        if self.progress_reward:
+        if self.stability_reward:
+            reward_result = calculate_sensor_stability_reward(
+                telemetry,
+                physical_failure=physical_failure,
+                lap_completed=completed_lap is not None,
+                previous_steer=self.previous_steer,
+                current_steer=float(action_values[0]),
+                centering_coefficient=(
+                    self.stability_centering_coefficient
+                ),
+                steering_rate_cost_coefficient=(
+                    self.steering_rate_cost_coefficient
+                ),
+            )
+        elif self.progress_reward:
             reward_result = calculate_progress_reward(
                 self.current_telemetry.get("distRaced"),
                 telemetry.get("distRaced"),
@@ -326,6 +374,8 @@ class NstepTorcsEnvironment:
             reason = "crashed"
         elif backwards:
             reason = "backwards"
+        elif unsafe_heading:
+            reason = "unsafe_heading"
         elif stalled:
             reason = "stalled"
         elif server_stopped:
@@ -353,6 +403,7 @@ class NstepTorcsEnvironment:
             "off_track": off_track,
             "crashed": crashed,
             "backwards": backwards,
+            "unsafe_heading": unsafe_heading,
             "stalled": stalled,
             "physical_failure": physical_failure,
             "laps_completed": self.lap_tracker.laps_completed,
@@ -368,6 +419,7 @@ class NstepTorcsEnvironment:
             "reward_lap_completion_bonus": (
                 reward_result.lap_completion_bonus
             ),
+            "reward_centering_penalty": reward_result.centering_penalty,
             "steering_delta": steering_delta,
             "target_track_position": line_sample.target_track_position,
             "racing_line_error": (

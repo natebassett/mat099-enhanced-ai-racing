@@ -13,7 +13,13 @@ RELIABILITY_MODEL_DIR = (
 ROBUST_PACE_MODEL_DIR = (
     PROJECT_ROOT / "models" / "agent8_sensor_n_step_td3_v1_robust_pace"
 )
+SELF_IMITATION_MODEL_DIR = (
+    PROJECT_ROOT
+    / "models"
+    / "agent8_sensor_n_step_td3_self_imitation_stability"
+)
 DEFAULT_MODEL_CANDIDATES = (
+    SELF_IMITATION_MODEL_DIR / "champion_83_038s_36of40_clean.pt",
     ROBUST_PACE_MODEL_DIR / "best_evaluation.pt",
     RELIABILITY_MODEL_DIR / "best_evaluation.pt",
     MODEL_DIR / "best_evaluation.pt",

@@ -12,6 +12,7 @@ from n_step_td3.contracts import (
     OBSERVATION_SIZE,
     REWARD_VERSION,
     HistoryEncoder,
+    SteeringEmaFilter,
     build_base_observation,
     decode_action,
     finite_float,
@@ -104,6 +105,9 @@ class NstepTd3Agent:
         if self.policy is None:
             self.policy = self._load_policy(require_policy=require_policy)
             self.policy_loaded = self.policy is not None
+        self.steering_filter = SteeringEmaFilter(
+            self.policy_config.deployment_steering_ema_retention
+        )
         self.history = HistoryEncoder()
         self.reset()
 
@@ -124,9 +128,18 @@ class NstepTd3Agent:
             "n_steps": 3,
             "policy_path": policy_path,
             "policy_loaded": self.policy_loaded,
-            "learning_source": "reward_only",
+            "learning_source": (
+                "self_generated_demonstration_regularized"
+                if self.policy_config.self_imitation_initial_coefficient > 0.0
+                else "reward_only"
+            ),
             "teacher": None,
-            "behaviour_cloning": False,
+            "behaviour_cloning": bool(
+                self.policy_config.self_imitation_initial_coefficient > 0.0
+            ),
+            "self_generated_demonstration": bool(
+                self.policy_config.self_imitation_initial_coefficient > 0.0
+            ),
             "racing_line_imitation": False,
             "racing_line_observation": self.requires_racing_line,
             "racing_line_reward_shaping": bool(
@@ -139,14 +152,19 @@ class NstepTd3Agent:
                 else str(self.racing_line_path)
             ),
             "automatic_gear_shift": True,
+            "deployment_steering_ema_retention": (
+                self.policy_config.deployment_steering_ema_retention
+            ),
             "implementation": "independent_torcsrl_informed",
         }
 
     def reset(self) -> None:
         self.history.reset()
+        self.steering_filter.reset()
         self.stalled_steps = 0
         self.previous_telemetry: Mapping[str, Any] | None = None
         self.last_raw_action = np.zeros(ACTION_SIZE, dtype=np.float32)
+        self.last_network_action = np.zeros(ACTION_SIZE, dtype=np.float32)
         self.last_controls = {
             "steer": 0.0,
             "accel": 0.0,
@@ -179,7 +197,8 @@ class NstepTd3Agent:
                 include_racing_line_features=self.requires_racing_line,
             )
         )
-        raw_action = np.clip(self._predict(observation), -1.0, 1.0)
+        network_action = np.clip(self._predict(observation), -1.0, 1.0)
+        raw_action = self.steering_filter.apply(network_action)
         controls = decode_action(
             raw_action,
             telemetry,
@@ -189,6 +208,7 @@ class NstepTd3Agent:
         )
         self.history.record_action(raw_action)
         self.last_raw_action = raw_action.copy()
+        self.last_network_action = network_action.copy()
         self.last_controls = dict(controls)
         self.previous_telemetry = dict(telemetry)
         return {
@@ -209,6 +229,15 @@ class NstepTd3Agent:
             return True, "off track"
         if np.cos(angle) < 0.0:
             return True, "wrong direction"
+        stability_reward = bool(
+            getattr(
+                getattr(self, "policy_config", None),
+                "stability_reward",
+                False,
+            )
+        )
+        if stability_reward and abs(angle) > np.pi / 4.0:
+            return True, "unsafe heading"
         if self.stalled_steps > 120:
             return True, "car stalled"
         return False, ""
@@ -217,6 +246,7 @@ class NstepTd3Agent:
         return {
             "nstep_td3_policy_loaded": self.policy_loaded,
             "nstep_td3_raw_steer": float(self.last_raw_action[0]),
+            "nstep_td3_network_steer": float(self.last_network_action[0]),
             "nstep_td3_control_steer": float(self.last_controls["steer"]),
             "nstep_td3_raw_longitudinal": float(self.last_raw_action[1]),
         }

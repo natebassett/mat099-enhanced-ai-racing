@@ -22,6 +22,7 @@ from agents.n_step_td3_agent import default_model_path
 from n_step_td3.contracts import (
     ACTION_VERSION,
     REWARD_VERSION,
+    SteeringEmaFilter,
 )
 from n_step_td3.environment import NstepTorcsEnvironment
 from n_step_td3.learner import (
@@ -42,6 +43,12 @@ PACE_V5_OUTPUT_DIR = (
 )
 SENSOR_ONLY_OUTPUT_DIR = (
     PROJECT_ROOT / "data" / "evaluation" / "agent8_sensor_n_step_td3"
+)
+SENSOR_STABILITY_OUTPUT_DIR = (
+    PROJECT_ROOT
+    / "data"
+    / "evaluation"
+    / "agent8_sensor_n_step_td3_self_imitation_stability"
 )
 TRACE_CURVATURE_COLUMNS = tuple(
     f"lookahead_curvature_{int(distance)}m"
@@ -73,6 +80,7 @@ TRACE_COLUMNS = (
     "reward_terminal_penalty",
     "reward_progress_m",
     "reward_lap_completion_bonus",
+    "reward_centering_penalty",
     *TRACE_CURVATURE_COLUMNS,
     "physical_failure",
     "termination_reason",
@@ -110,6 +118,14 @@ def build_parser() -> argparse.ArgumentParser:
             "unchanged."
         ),
     )
+    parser.add_argument(
+        "--steering-ema-retention",
+        type=float,
+        help=(
+            "Override the checkpoint's deterministic steering EMA retention "
+            "for this evaluation only. Zero disables smoothing."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=10_000)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--manual-start", action="store_true")
@@ -145,6 +161,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(
             "--physical-steering-limit must be finite and in (0, 1]"
         )
+    if args.steering_ema_retention is not None and (
+        not math.isfinite(args.steering_ema_retention)
+        or not 0.0 <= args.steering_ema_retention < 1.0
+    ):
+        parser.error("--steering-ema-retention must be finite and in [0, 1)")
     if args.racing_line_path is not None and not args.racing_line_path.is_file():
         parser.error(
             f"--racing-line-path does not exist: {args.racing_line_path}"
@@ -197,6 +218,9 @@ def build_trace_row(
         "reward_lap_completion_bonus": float(
             info["reward_lap_completion_bonus"]
         ),
+        "reward_centering_penalty": float(
+            info.get("reward_centering_penalty", 0.0)
+        ),
     }
     curvature = np.asarray(info["lookahead_curvature"], dtype=np.float32)
     if curvature.shape != (len(TRACE_CURVATURE_COLUMNS),):
@@ -213,7 +237,13 @@ def build_trace_row(
 
 
 class DeterministicCheckpointPolicy:
-    def __init__(self, path: Path, device: str) -> None:
+    def __init__(
+        self,
+        path: Path,
+        device: str,
+        *,
+        steering_ema_retention: float | None = None,
+    ) -> None:
         checkpoint = load_actor_checkpoint(path, device="cpu")
         config = NstepTd3Config(**checkpoint["config"])
         self.config = config
@@ -229,6 +259,15 @@ class DeterministicCheckpointPolicy:
         ).to(self.device)
         self.actor.load_state_dict(checkpoint["actor"])
         self.actor.eval()
+        retention = (
+            config.deployment_steering_ema_retention
+            if steering_ema_retention is None
+            else float(steering_ema_retention)
+        )
+        self.steering_filter = SteeringEmaFilter(retention)
+
+    def reset(self) -> None:
+        self.steering_filter.reset()
 
     @torch.no_grad()
     def act(self, observation: np.ndarray) -> np.ndarray:
@@ -237,18 +276,25 @@ class DeterministicCheckpointPolicy:
             dtype=torch.float32,
             device=self.device,
         ).reshape(1, -1)
-        return self.actor(value).squeeze(0).cpu().numpy().astype(np.float32)
+        action = self.actor(value).squeeze(0).cpu().numpy().astype(np.float32)
+        return self.steering_filter.apply(action)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    policy = DeterministicCheckpointPolicy(args.policy_path, args.device)
+    policy = DeterministicCheckpointPolicy(
+        args.policy_path,
+        args.device,
+        steering_ema_retention=args.steering_ema_retention,
+    )
     physical_steering_limit = (
         policy.config.physical_steering_limit
         if args.physical_steering_limit is None
         else args.physical_steering_limit
     )
-    if args.output_dir == DEFAULT_OUTPUT_DIR and not policy.config.racing_line_features:
+    if args.output_dir == DEFAULT_OUTPUT_DIR and policy.config.stability_reward:
+        args.output_dir = SENSOR_STABILITY_OUTPUT_DIR
+    elif args.output_dir == DEFAULT_OUTPUT_DIR and not policy.config.racing_line_features:
         args.output_dir = SENSOR_ONLY_OUTPUT_DIR
     elif (
         args.output_dir == DEFAULT_OUTPUT_DIR
@@ -272,6 +318,10 @@ def main(argv: list[str] | None = None) -> None:
         ),
         physical_steering_limit=physical_steering_limit,
         progress_reward=policy.config.progress_reward,
+        stability_reward=policy.config.stability_reward,
+        stability_centering_coefficient=(
+            policy.config.stability_centering_coefficient
+        ),
         racing_line_features=policy.config.racing_line_features,
     )
     rows: list[dict[str, object]] = []
@@ -279,6 +329,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         for repeat in range(1, args.repeats + 1):
             observation, _ = environment.reset()
+            policy.reset()
             done = False
             while not done:
                 action = policy.act(observation)
@@ -328,6 +379,16 @@ def main(argv: list[str] | None = None) -> None:
             policy.config.physical_steering_limit
         ),
         "progress_reward": policy.config.progress_reward,
+        "stability_reward": policy.config.stability_reward,
+        "stability_centering_coefficient": (
+            policy.config.stability_centering_coefficient
+        ),
+        "self_imitation_initial_coefficient": (
+            policy.config.self_imitation_initial_coefficient
+        ),
+        "deployment_steering_ema_retention": (
+            policy.steering_filter.retention
+        ),
         "racing_line_features": policy.config.racing_line_features,
         "racing_line_path": (
             None

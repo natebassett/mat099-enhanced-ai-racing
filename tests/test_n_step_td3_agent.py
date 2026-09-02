@@ -23,6 +23,7 @@ from n_step_td3.contracts import (
     BASE_OBSERVATION_NOISE_STD,
     BASE_OBSERVATION_SIZE,
     DEFAULT_PACE_STEERING_LIMIT,
+    DEFAULT_SENSOR_STABILITY_CENTERING_COEFFICIENT,
     OBSERVATION_SIZE,
     OBSERVATION_VERSION,
     PACE_ACTION_VERSION,
@@ -34,12 +35,17 @@ from n_step_td3.contracts import (
     SENSOR_ONLY_MODEL_FAMILY,
     SENSOR_ONLY_OBSERVATION_VERSION,
     SENSOR_ONLY_REWARD_VERSION,
+    SENSOR_STABILITY_ACTION_VERSION,
+    SENSOR_STABILITY_LAP_COMPLETION_BONUS,
+    SENSOR_STABILITY_REWARD_VERSION,
     STEERING_RATE_REWARD_VERSION,
     HistoryEncoder,
+    SteeringEmaFilter,
     apply_observation_noise,
     build_base_observation,
     calculate_progress_reward,
     calculate_reward,
+    calculate_sensor_stability_reward,
     decode_action,
 )
 from n_step_td3.environment import (
@@ -278,6 +284,57 @@ class NstepTd3ContractTests(unittest.TestCase):
 
         self.assertAlmostEqual(result.total, -0.1)
 
+    def test_sensor_stability_reward_combines_forward_motion_and_soft_costs(self):
+        result = calculate_sensor_stability_reward(
+            telemetry(speedX=125.0, angle=0.2, trackPos=0.5),
+            physical_failure=False,
+            lap_completed=False,
+            previous_steer=0.1,
+            current_steer=0.3,
+            centering_coefficient=0.05,
+            steering_rate_cost_coefficient=0.0025,
+        )
+
+        self.assertAlmostEqual(
+            result.forward_velocity,
+            0.5 * math.cos(0.2),
+        )
+        self.assertAlmostEqual(result.centering_penalty, -0.0125)
+        self.assertAlmostEqual(result.steering_rate_penalty, -0.0001)
+        self.assertAlmostEqual(
+            result.total,
+            result.forward_velocity
+            + result.centering_penalty
+            + result.steering_rate_penalty,
+        )
+
+    def test_sensor_stability_reward_makes_a_clean_lap_a_terminal_goal(self):
+        result = calculate_sensor_stability_reward(
+            telemetry(speedX=100.0),
+            physical_failure=False,
+            lap_completed=True,
+        )
+
+        self.assertEqual(
+            result.lap_completion_bonus,
+            SENSOR_STABILITY_LAP_COMPLETION_BONUS,
+        )
+        self.assertGreater(result.total, SENSOR_STABILITY_LAP_COMPLETION_BONUS)
+
+    def test_steering_ema_filters_only_steering_and_resets_cleanly(self):
+        filter_ = SteeringEmaFilter(0.8)
+
+        first = filter_.apply(np.asarray([1.0, 0.5], dtype=np.float32))
+        second = filter_.apply(np.asarray([-1.0, -0.25], dtype=np.float32))
+        filter_.reset()
+        after_reset = filter_.apply(
+            np.asarray([-1.0, -0.25], dtype=np.float32)
+        )
+
+        np.testing.assert_allclose(first, [1.0, 0.5])
+        np.testing.assert_allclose(second, [0.6, -0.25])
+        np.testing.assert_allclose(after_reset, [-1.0, -0.25])
+
     def test_observation_noise_uses_feature_specific_reference_profile(self):
         profile = np.asarray(BASE_OBSERVATION_NOISE_STD)
 
@@ -490,6 +547,210 @@ class NstepTd3LearnerTests(unittest.TestCase):
         self.assertEqual(learner.actor_updates, 0)
         for name, value in learner.actor.state_dict().items():
             torch.testing.assert_close(value, actor_before[name])
+
+    def test_elite_replay_contributes_at_most_one_quarter_of_batch(self):
+        learner = self._learner()
+        self._fill(learner)
+        learner.configure_elite_replay(capacity=8, fraction=0.25)
+        for _ in range(4):
+            learner.add_elite_transitions(
+                [
+                    ReplayTransition(
+                        observation=np.full(4, 99.0, dtype=np.float32),
+                        action=np.zeros(2, dtype=np.float32),
+                        discounted_return=1.0,
+                        next_observation=np.full(4, 99.0, dtype=np.float32),
+                        terminated=False,
+                        steps=3,
+                    )
+                ]
+            )
+
+        observations, *_rest = learner._sample_training_batch()
+
+        elite_rows = torch.all(observations == 99.0, dim=1)
+        self.assertEqual(int(elite_rows.sum().item()), 1)
+        self.assertEqual(observations.shape[0], learner.config.batch_size)
+
+    def test_elite_replay_round_trip_preserves_success_transitions(self):
+        learner = self._learner()
+        learner.configure_elite_replay(capacity=8, fraction=0.25)
+        transition = ReplayTransition(
+            observation=np.ones(4, dtype=np.float32),
+            action=np.zeros(2, dtype=np.float32),
+            discounted_return=7.0,
+            next_observation=np.full(4, 2.0, dtype=np.float32),
+            terminated=True,
+            steps=2,
+        )
+        learner.add_elite_transitions([transition])
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "elite.pt"
+            learner.save_elite_replay(path)
+            restored = self._learner()
+            restored.configure_elite_replay(capacity=8, fraction=0.25)
+            restored.load_elite_replay(path)
+
+        self.assertEqual(restored.elite_replay_size, 1)
+        self.assertIsNotNone(restored.elite_replay)
+        batch = restored.elite_replay.sample(1, torch.device("cpu"))
+        self.assertEqual(float(batch[2].item()), 7.0)
+        self.assertEqual(float(batch[4].item()), 1.0)
+
+    def test_self_imitation_uses_an_eighty_twenty_dual_replay_batch(self):
+        learner = NstepTd3Learner(
+            NstepTd3Config(
+                observation_size=4,
+                action_size=2,
+                hidden_size_1=8,
+                hidden_size_2=8,
+                replay_capacity=32,
+                replay_start_size=10,
+                batch_size=10,
+                policy_delay=1,
+                steering_rate_cost_coefficient=0.0025,
+                stability_reward=True,
+                self_imitation_initial_coefficient=1.0,
+                self_imitation_final_coefficient=0.1,
+                self_imitation_decay_actor_updates=10,
+                deployment_steering_ema_retention=0.8,
+                racing_line_features=False,
+                seed=7,
+            ),
+            device="cpu",
+        )
+        random = np.random.default_rng(3)
+        for _ in range(10):
+            observation = random.normal(size=4).astype(np.float32)
+            learner.replay.add(
+                ReplayTransition(
+                    observation=observation,
+                    action=np.zeros(2, dtype=np.float32),
+                    discounted_return=1.0,
+                    next_observation=observation,
+                    terminated=False,
+                    steps=3,
+                )
+            )
+        learner.configure_elite_replay(capacity=8, fraction=0.2)
+        for _ in range(4):
+            learner.add_elite_transitions(
+                [
+                    ReplayTransition(
+                        observation=np.full(4, 99.0, dtype=np.float32),
+                        action=np.full(2, 0.5, dtype=np.float32),
+                        discounted_return=10.0,
+                        next_observation=np.full(4, 99.0, dtype=np.float32),
+                        terminated=True,
+                        steps=3,
+                    )
+                ]
+            )
+
+        batch, elite_size = learner._sample_training_batch_with_elite_size()
+        observations = batch[0]
+        metric = learner.train_for_interaction()[0]
+
+        self.assertEqual(elite_size, 2)
+        self.assertEqual(
+            int(torch.all(observations == 99.0, dim=1).sum().item()),
+            2,
+        )
+        self.assertIsNotNone(metric.rl_actor_loss)
+        self.assertIsNotNone(metric.behaviour_cloning_loss)
+        self.assertEqual(metric.behaviour_cloning_coefficient, 1.0)
+        self.assertLess(learner.self_imitation_coefficient, 1.0)
+
+    def test_stability_checkpoint_versions_reward_action_and_learning_contracts(self):
+        config = NstepTd3Config(
+            hidden_size_1=8,
+            hidden_size_2=8,
+            replay_capacity=16,
+            replay_start_size=8,
+            batch_size=4,
+            steering_rate_cost_coefficient=0.0025,
+            stability_reward=True,
+            stability_centering_coefficient=(
+                DEFAULT_SENSOR_STABILITY_CENTERING_COEFFICIENT
+            ),
+            self_imitation_initial_coefficient=1.0,
+            self_imitation_final_coefficient=0.05,
+            self_imitation_decay_actor_updates=10_000,
+            deployment_steering_ema_retention=0.8,
+            racing_line_features=False,
+        )
+        learner = NstepTd3Learner(config, device="cpu")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "agent8-stability.pt"
+            learner.save(path)
+            checkpoint = load_checkpoint(path)
+
+        self.assertEqual(
+            checkpoint["reward_version"],
+            SENSOR_STABILITY_REWARD_VERSION,
+        )
+        self.assertEqual(
+            checkpoint["action_version"],
+            SENSOR_STABILITY_ACTION_VERSION,
+        )
+
+    def test_legacy_elite_lap_migration_rebuilds_returns_and_terminals(self):
+        source_config = NstepTd3Config(
+            hidden_size_1=8,
+            hidden_size_2=8,
+            replay_capacity=8,
+            replay_start_size=4,
+            batch_size=4,
+            racing_line_features=False,
+        )
+        source = NstepTd3Learner(source_config, device="cpu")
+        source.configure_elite_replay(capacity=8, fraction=0.25)
+        for steps in (3, 2, 1):
+            observation = np.zeros(OBSERVATION_SIZE, dtype=np.float32)
+            next_observation = np.zeros(OBSERVATION_SIZE, dtype=np.float32)
+            latest_base = (3 - 1) * BASE_OBSERVATION_SIZE
+            next_observation[latest_base] = 0.4
+            source.add_elite_transitions(
+                [
+                    ReplayTransition(
+                        observation=observation,
+                        action=np.asarray([0.0, 0.5], dtype=np.float32),
+                        discounted_return=0.1,
+                        next_observation=next_observation,
+                        terminated=False,
+                        steps=steps,
+                    )
+                ]
+            )
+
+        target_config = replace(
+            source_config,
+            steering_rate_cost_coefficient=0.0025,
+            stability_reward=True,
+            self_imitation_initial_coefficient=1.0,
+            self_imitation_final_coefficient=0.05,
+            self_imitation_decay_actor_updates=10,
+            deployment_steering_ema_retention=0.8,
+        )
+        target = NstepTd3Learner(target_config, device="cpu")
+        target.configure_elite_replay(capacity=8, fraction=0.2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-elite.pt"
+            source.save_elite_replay(path)
+            lap_count = target.import_legacy_elite_replay_for_stability(path)
+
+        self.assertEqual(lap_count, 1)
+        self.assertIsNotNone(target.elite_replay)
+        state = target.elite_replay.state_dict()
+        np.testing.assert_array_equal(
+            state["terminated"],
+            np.ones((3, 1), dtype=np.float32),
+        )
+        self.assertGreater(float(state["returns"][0, 0]), 900.0)
+        self.assertGreater(float(state["returns"][2, 0]), 1_000.0)
 
     def test_checkpoint_round_trip_preserves_actor_output(self):
         config = NstepTd3Config(
@@ -841,6 +1102,15 @@ class NstepTd3LearnerTests(unittest.TestCase):
         )
 
 class NstepTd3RuntimeTests(unittest.TestCase):
+    def test_sensor_agent_prioritises_validated_clean_deployment_champion(self):
+        champion = SensorNstepTd3Agent.default_model_candidates[0]
+
+        self.assertEqual(champion.name, "champion_83_038s_36of40_clean.pt")
+        self.assertEqual(
+            champion.parent.name,
+            "agent8_sensor_n_step_td3_self_imitation_stability",
+        )
+
     def test_agent7_is_a_separate_reward_only_runtime_agent(self):
         seen_shapes = []
 
@@ -1361,6 +1631,118 @@ class NstepTd3RuntimeTests(unittest.TestCase):
             )
         )
 
+    def test_self_imitation_stability_profile_is_isolated_and_actor_only(self):
+        script = load_training_script()
+        source = NstepTd3Learner(
+            NstepTd3Config(
+                hidden_size_1=8,
+                hidden_size_2=8,
+                racing_line_features=False,
+                seed=7,
+            ),
+            device="cpu",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "sensor_agent.pt"
+            source.save(checkpoint)
+            args = script.parse_args(
+                [
+                    "--sensor-only",
+                    "--sensor-self-imitation-stability",
+                    "--resume",
+                    str(checkpoint),
+                    "--observation-noise-std",
+                    "0",
+                    "--seed",
+                    "73",
+                ]
+            )
+            transferred = (
+                script.initialize_sensor_self_imitation_stability_learner(args)
+            )
+
+        self.assertEqual(args.evaluation_repeats, 10)
+        self.assertEqual(args.train_frequency, 8)
+        self.assertEqual(transferred.config.actor_learning_rate, 1e-6)
+        self.assertEqual(transferred.config.exploration_noise, 0.02)
+        self.assertTrue(transferred.config.stability_reward)
+        self.assertFalse(transferred.config.racing_line_features)
+        self.assertEqual(
+            transferred.config.self_imitation_initial_coefficient,
+            1.0,
+        )
+        self.assertEqual(
+            transferred.config.deployment_steering_ema_retention,
+            0.8,
+        )
+        for name, value in source.actor.state_dict().items():
+            torch.testing.assert_close(value, transferred.actor.state_dict()[name])
+        self.assertFalse(
+            torch.allclose(
+                next(source.critic.parameters()),
+                next(transferred.critic.parameters()),
+            )
+        )
+        self.assertEqual(
+            script.SENSOR_SELF_IMITATION_MODEL_DIR.name,
+            "agent8_sensor_n_step_td3_self_imitation_stability",
+        )
+
+    def test_self_imitation_stability_accepts_clean_and_reference_noise(self):
+        script = load_training_script()
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "sensor_agent.pt"
+            checkpoint.touch()
+            clean_args = script.parse_args(
+                [
+                    "--sensor-only",
+                    "--sensor-self-imitation-stability",
+                    "--resume",
+                    str(checkpoint),
+                    "--observation-noise-std",
+                    "0",
+                ]
+            )
+            noisy_args = script.parse_args(
+                [
+                    "--sensor-only",
+                    "--sensor-self-imitation-stability",
+                    "--resume",
+                    str(checkpoint),
+                    "--observation-noise-std",
+                    "0.025",
+                ]
+            )
+
+        self.assertEqual(clean_args.observation_noise_std, 0.0)
+        self.assertEqual(noisy_args.observation_noise_std, 0.025)
+        self.assertEqual(
+            script.evaluation_observation_noise_std(clean_args),
+            0.0,
+        )
+        self.assertEqual(
+            script.evaluation_observation_noise_std(noisy_args),
+            0.025,
+        )
+
+    def test_robust_pace_keeps_clean_passive_evaluations(self):
+        script = load_training_script()
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "sensor_agent.pt"
+            checkpoint.touch()
+            args = script.parse_args(
+                [
+                    "--sensor-only",
+                    "--sensor-v1-robust-pace-continuation",
+                    "--resume",
+                    str(checkpoint),
+                    "--observation-noise-std",
+                    "0",
+                ]
+            )
+
+        self.assertEqual(script.evaluation_observation_noise_std(args), 0.0)
+
     def test_sensor_v1_robust_pace_noise_selector_has_two_profiles(self):
         script = load_training_script()
 
@@ -1379,6 +1761,114 @@ class NstepTd3RuntimeTests(unittest.TestCase):
             script.select_sensor_v1_robust_pace_noise(RandomSource(0.25)),
             0.0,
         )
+
+    def test_elite_lap_requires_clean_sub_ninety_zero_noise_episode(self):
+        script = load_training_script()
+        summary = EpisodeSummary(
+            episode=1,
+            steps=4_200,
+            reward=1.0,
+            distance_m=2_843.0,
+            max_speed_kmh=180.0,
+            average_speed_kmh=120.0,
+            off_track_steps=0,
+            damage_delta=0.0,
+            laps_completed=1,
+            best_lap_time_seconds=89.999,
+            termination_reason="lap_complete",
+        )
+
+        self.assertTrue(
+            script.is_clean_elite_lap(summary, observation_noise_std=0.0)
+        )
+        self.assertFalse(
+            script.is_clean_elite_lap(summary, observation_noise_std=0.025)
+        )
+        self.assertFalse(
+            script.is_clean_elite_lap(
+                replace(summary, best_lap_time_seconds=90.0),
+                observation_noise_std=0.0,
+            )
+        )
+        self.assertFalse(
+            script.is_clean_elite_lap(
+                replace(summary, off_track_steps=1),
+                observation_noise_std=0.0,
+            )
+        )
+        self.assertFalse(
+            script.is_clean_elite_lap(
+                replace(summary, damage_delta=1.0),
+                observation_noise_std=0.0,
+            )
+        )
+
+    def test_elite_success_persists_trace_policy_and_metadata(self):
+        script = load_training_script()
+        learner = NstepTd3Learner(
+            NstepTd3Config(
+                observation_size=4,
+                action_size=2,
+                hidden_size_1=8,
+                hidden_size_2=8,
+                replay_capacity=16,
+                replay_start_size=4,
+                batch_size=2,
+                racing_line_features=False,
+                seed=13,
+            ),
+            device="cpu",
+        )
+        learner.configure_elite_replay(capacity=8, fraction=0.25)
+        transitions = [
+            ReplayTransition(
+                observation=np.full(4, index, dtype=np.float32),
+                action=np.zeros(2, dtype=np.float32),
+                discounted_return=float(index),
+                next_observation=np.full(4, index + 1, dtype=np.float32),
+                terminated=index == 1,
+                steps=2 - index,
+            )
+            for index in range(2)
+        ]
+        summary = EpisodeSummary(
+            episode=7,
+            steps=2,
+            reward=3.0,
+            distance_m=2_843.0,
+            max_speed_kmh=180.0,
+            average_speed_kmh=120.0,
+            off_track_steps=0,
+            damage_delta=0.0,
+            laps_completed=1,
+            best_lap_time_seconds=84.674,
+            termination_reason="lap_complete",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = script.preserve_elite_success(
+                learner,
+                summary,
+                transitions,
+                observation_noise_std=0.0,
+                run_timestamp="20260902-120000",
+                replay_path=root / "elite.pt",
+                policy_dir=root / "policies",
+            )
+            self.assertIsNotNone(result)
+            replay_path, policy_path = result
+            metadata = json.loads(policy_path.with_suffix(".json").read_text())
+
+            restored = NstepTd3Learner(learner.config, device="cpu")
+            restored.configure_elite_replay(capacity=8, fraction=0.25)
+            restored.load_elite_replay(replay_path)
+
+        self.assertEqual(restored.elite_replay_size, 2)
+        self.assertEqual(metadata["episode_transition_count"], 2)
+        self.assertEqual(metadata["episode"]["best_lap_time_seconds"], 84.674)
+        self.assertFalse(metadata["teacher_actions"])
+        self.assertFalse(metadata["behaviour_cloning"])
 
     def test_sensor_steering_v2_preserves_actor_and_resets_critic(self):
         script = load_training_script()
@@ -1471,8 +1961,56 @@ class NstepTd3RuntimeTests(unittest.TestCase):
                         "0",
                     ]
                 )
-
         self.assertEqual(args.physical_steering_limit, 0.7)
+
+    def test_deterministic_checkpoint_policy_resets_steering_ema_per_episode(self):
+        script = load_evaluation_script()
+        learner = NstepTd3Learner(
+            NstepTd3Config(
+                hidden_size_1=8,
+                hidden_size_2=8,
+                replay_capacity=16,
+                replay_start_size=8,
+                batch_size=4,
+                steering_rate_cost_coefficient=0.0025,
+                stability_reward=True,
+                self_imitation_initial_coefficient=1.0,
+                self_imitation_final_coefficient=0.05,
+                self_imitation_decay_actor_updates=10,
+                deployment_steering_ema_retention=0.8,
+                racing_line_features=False,
+            ),
+            device="cpu",
+        )
+
+        class SequenceActor(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def forward(self, observation):
+                steer = 1.0 if self.calls == 0 else -1.0
+                self.calls += 1
+                return torch.tensor(
+                    [[steer, -0.25]],
+                    dtype=torch.float32,
+                    device=observation.device,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "stability.pt"
+            learner.save(checkpoint)
+            policy = script.DeterministicCheckpointPolicy(checkpoint, "cpu")
+            policy.actor = SequenceActor()
+            observation = np.zeros(OBSERVATION_SIZE, dtype=np.float32)
+            first = policy.act(observation)
+            second = policy.act(observation)
+            policy.reset()
+            after_reset = policy.act(observation)
+
+        np.testing.assert_allclose(first, [1.0, -0.25])
+        np.testing.assert_allclose(second, [0.6, -0.25])
+        np.testing.assert_allclose(after_reset, [-1.0, -0.25])
 
     def test_v4_parser_applies_the_bounded_actor_only_profile(self):
         script = load_training_script()
@@ -2139,6 +2677,7 @@ class NstepTd3RuntimeTests(unittest.TestCase):
             def write_episode(self, *_args, **_kwargs):
                 return None
 
+        completed_episode_sizes = []
         observation, interactions = script.collect_replay_warmup(
             FakeEnvironment(),
             learner,
@@ -2146,12 +2685,16 @@ class NstepTd3RuntimeTests(unittest.TestCase):
             FakeLogger(),
             None,
             use_random_actions=True,
+            on_completed_episode=lambda _summary, transitions: (
+                completed_episode_sizes.append(len(transitions))
+            ),
         )
 
         self.assertEqual(interactions, 4)
         self.assertTrue(learner.ready_to_train)
         self.assertEqual(learner.environment_steps, 0)
         self.assertEqual(observation.shape, (4,))
+        self.assertEqual(completed_episode_sizes, [2, 2])
 
     def test_replay_warmup_can_collect_a_larger_fixed_policy_buffer(self):
         script = load_training_script()
@@ -2666,6 +3209,64 @@ class NstepTorcsEnvironmentTests(unittest.TestCase):
             info["lookahead_curvature"],
             np.zeros(12, dtype=np.float32),
         )
+
+    def test_stability_environment_terminates_unsafe_heading_early(self):
+        initial = telemetry()
+        following = telemetry(
+            speedX=100.0,
+            angle=0.8,
+            trackPos=0.2,
+            distRaced=10.0,
+            distFromStart=10.0,
+        )
+        environment = NstepTorcsEnvironment(
+            observation_noise_std=0.0,
+            racing_line_features=False,
+            stability_reward=True,
+            steering_rate_cost_coefficient=0.0025,
+            runner=_FakeRunner(initial, [following]),
+        )
+        environment.reset()
+
+        _observation, reward, terminated, truncated, info = environment.step(
+            np.asarray([0.0, 0.5], dtype=np.float32)
+        )
+
+        self.assertTrue(terminated)
+        self.assertFalse(truncated)
+        self.assertTrue(info["unsafe_heading"])
+        self.assertEqual(info["termination_reason"], "unsafe_heading")
+        self.assertLess(reward, 0.0)
+
+    def test_stability_environment_treats_lap_completion_as_terminal_goal(self):
+        initial = telemetry(lastLapTime=0.0)
+        following = telemetry(
+            speedX=100.0,
+            distRaced=2843.1,
+            distFromStart=0.1,
+            lastLapTime=83.0,
+        )
+        environment = NstepTorcsEnvironment(
+            observation_noise_std=0.0,
+            racing_line_features=False,
+            stability_reward=True,
+            steering_rate_cost_coefficient=0.0025,
+            runner=_FakeRunner(initial, [following]),
+        )
+        environment.reset()
+
+        _observation, reward, terminated, truncated, info = environment.step(
+            np.asarray([0.0, 0.5], dtype=np.float32)
+        )
+
+        self.assertTrue(terminated)
+        self.assertFalse(truncated)
+        self.assertEqual(info["termination_reason"], "lap_completed")
+        self.assertEqual(
+            info["reward_lap_completion_bonus"],
+            SENSOR_STABILITY_LAP_COMPLETION_BONUS,
+        )
+        self.assertGreater(reward, SENSOR_STABILITY_LAP_COMPLETION_BONUS)
 
     def test_environment_applies_reproducible_observation_noise(self):
         first_environment = NstepTorcsEnvironment(

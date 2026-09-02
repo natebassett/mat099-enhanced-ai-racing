@@ -1,0 +1,26 @@
+{
+  "format_version": "agent8_recorded_action_demo_v1",
+  "name": "Agent 8 Recorded 83.620s Demonstration",
+  "source_agent": "Agent 8 sensor-only N-step TD3",
+  "source_learning": "reward_only",
+  "control_mode": "open_loop_recorded_action_playback",
+  "actions_file": "agent8_elite_83_620s_actions.npz",
+  "episode_transition_count": 4040,
+  "episode": {
+    "steps": 4040,
+    "reward": 1511.6962624429,
+    "distance_m": 2943.7,
+    "max_speed_kmh": 209.007,
+    "average_speed_kmh": 123.74166254596537,
+    "off_track_steps": 0,
+    "damage_delta": 0.0,
+    "laps_completed": 1,
+    "best_lap_time_seconds": 83.62,
+    "termination_reason": "lap_completed"
+  },
+  "observation_noise_std": 0.0,
+  "teacher_actions": false,
+  "behaviour_cloning": false,
+  "racing_line_features": false,
+  "evaluation_eligible": false
+}

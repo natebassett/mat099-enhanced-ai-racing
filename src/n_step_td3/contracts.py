@@ -17,6 +17,10 @@ REWARD_VERSION = "agent7_torcsrl_racing_line_velocity_v3"
 SENSOR_ONLY_MODEL_FAMILY = "agent8_sensor_n_step_td3_racer"
 SENSOR_ONLY_OBSERVATION_VERSION = "agent8_torcs_sensor_history_v1"
 SENSOR_ONLY_REWARD_VERSION = "agent8_centerline_velocity_v1"
+SENSOR_STABILITY_ACTION_VERSION = (
+    "agent8_signed_steer_longitudinal_deployment_ema_v2"
+)
+SENSOR_STABILITY_REWARD_VERSION = "agent8_forward_velocity_stability_v2"
 STEERING_RATE_REWARD_VERSION = (
     "agent7_torcsrl_racing_line_velocity_steering_rate_v4"
 )
@@ -26,6 +30,11 @@ DEFAULT_STEERING_RATE_COST_COEFFICIENT = 0.0025
 DEFAULT_PACE_STEERING_LIMIT = 0.3
 PACE_FAILURE_PENALTY = -10.0
 PACE_LAP_COMPLETION_BONUS = 1_000.0
+SENSOR_STABILITY_FAILURE_PENALTY = -10.0
+SENSOR_STABILITY_LAP_COMPLETION_BONUS = 1_000.0
+SENSOR_STABILITY_HEADING_LIMIT_RAD = math.pi / 4.0
+DEFAULT_SENSOR_STABILITY_CENTERING_COEFFICIENT = 0.05
+DEFAULT_SENSOR_STABILITY_STEERING_RATE_COEFFICIENT = 0.0025
 MAX_ABSOLUTE_PROGRESS_PER_INTERACTION_M = 5.0
 
 MAX_SPEED_KMH = 250.0
@@ -366,6 +375,36 @@ def decode_action(
     }
 
 
+class SteeringEmaFilter:
+    """Low-pass only the steering channel of a deterministic policy action."""
+
+    def __init__(self, retention: float) -> None:
+        value = float(retention)
+        if not math.isfinite(value) or not 0.0 <= value < 1.0:
+            raise ValueError("steering EMA retention must be finite and in [0, 1)")
+        self.retention = value
+        self.reset()
+
+    def reset(self) -> None:
+        self._previous_steer = 0.0
+        self._started = False
+
+    def apply(self, action: np.ndarray) -> np.ndarray:
+        value = np.asarray(action, dtype=np.float32).reshape(-1).copy()
+        if value.shape != (ACTION_SIZE,):
+            raise ValueError(f"expected action shape {(ACTION_SIZE,)}, got {value.shape}")
+        value = np.nan_to_num(value, nan=0.0, posinf=1.0, neginf=-1.0)
+        value = np.clip(value, -1.0, 1.0)
+        if self._started:
+            value[0] = (
+                self.retention * self._previous_steer
+                + (1.0 - self.retention) * float(value[0])
+            )
+        self._previous_steer = float(value[0])
+        self._started = True
+        return value.astype(np.float32)
+
+
 @dataclass(frozen=True)
 class RewardResult:
     total: float
@@ -375,6 +414,7 @@ class RewardResult:
     terminal_penalty: float
     progress_m: float = 0.0
     lap_completion_bonus: float = 0.0
+    centering_penalty: float = 0.0
 
 
 def calculate_reward(
@@ -442,4 +482,61 @@ def calculate_progress_reward(
         terminal_penalty=terminal_penalty,
         progress_m=progress_m,
         lap_completion_bonus=lap_bonus,
+    )
+
+
+def calculate_sensor_stability_reward(
+    telemetry: Mapping[str, Any],
+    *,
+    physical_failure: bool,
+    lap_completed: bool,
+    previous_steer: float = 0.0,
+    current_steer: float = 0.0,
+    centering_coefficient: float = (
+        DEFAULT_SENSOR_STABILITY_CENTERING_COEFFICIENT
+    ),
+    steering_rate_cost_coefficient: float = (
+        DEFAULT_SENSOR_STABILITY_STEERING_RATE_COEFFICIENT
+    ),
+) -> RewardResult:
+    """Reward safe forward velocity without prescribing a racing line."""
+    center_weight = float(centering_coefficient)
+    steering_weight = float(steering_rate_cost_coefficient)
+    if not math.isfinite(center_weight) or center_weight < 0.0:
+        raise ValueError("centering coefficient must be finite and non-negative")
+    if not math.isfinite(steering_weight) or steering_weight < 0.0:
+        raise ValueError(
+            "steering-rate cost coefficient must be finite and non-negative"
+        )
+
+    speed = finite_float(telemetry.get("speedX")) / MAX_SPEED_KMH
+    angle = finite_float(telemetry.get("angle"))
+    track_position = finite_float(telemetry.get("trackPos"))
+    forward_velocity = speed * math.cos(angle)
+    centering_penalty = -center_weight * track_position * track_position
+    steering_delta = finite_float(current_steer) - finite_float(previous_steer)
+    steering_rate_penalty = -steering_weight * steering_delta * steering_delta
+    terminal_penalty = (
+        SENSOR_STABILITY_FAILURE_PENALTY if physical_failure else 0.0
+    )
+    lap_bonus = (
+        SENSOR_STABILITY_LAP_COMPLETION_BONUS
+        if lap_completed and not physical_failure
+        else 0.0
+    )
+    total = (
+        forward_velocity
+        + centering_penalty
+        + steering_rate_penalty
+        + terminal_penalty
+        + lap_bonus
+    )
+    return RewardResult(
+        total=float(total),
+        forward_velocity=float(forward_velocity),
+        racing_line_factor=1.0,
+        steering_rate_penalty=float(steering_rate_penalty),
+        terminal_penalty=float(terminal_penalty),
+        lap_completion_bonus=float(lap_bonus),
+        centering_penalty=float(centering_penalty),
     )

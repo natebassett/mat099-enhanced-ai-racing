@@ -5,6 +5,7 @@ from agents.dyna_q_agent import DynaQFinalisedAgent, DynaQLearningAgent
 from agents.td3_agent import Td3ScratchAgent
 from agents.n_step_td3_agent import NstepTd3Agent
 from agents.sensor_n_step_td3_agent import SensorNstepTd3Agent
+from agents.recorded_elite_lap_agent import RecordedEliteLapAgent
 from runner.torcs_runner import TorcsRunner
 from storage import RaceRepository
 
@@ -50,11 +51,12 @@ def menu():
         print("[6] TD3 Scratch Racer")
         print("[7] torcsRL N-Step TD3 Racer")
         print("[8] Sensor-Only N-Step TD3 Racer")
+        print("[9] Agent 8 Recorded 83.620s Demonstration")
         print("[0] Exit\n")
 
         choice = input("Enter choice: ")
 
-        if choice in {"1", "2", "3", "4", "5", "6", "7", "8"}:
+        if choice in {"1", "2", "3", "4", "5", "6", "7", "8", "9"}:
 
             runner = TorcsRunner()
 
@@ -67,6 +69,7 @@ def menu():
                 "6": Td3ScratchAgent,
                 "7": NstepTd3Agent,
                 "8": SensorNstepTd3Agent,
+                "9": RecordedEliteLapAgent,
             }
             agent = agents[choice]()
 

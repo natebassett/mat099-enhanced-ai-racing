@@ -15,6 +15,10 @@ import torch.nn.functional as functional
 from .contracts import (
     ACTION_SIZE,
     ACTION_VERSION,
+    BASE_OBSERVATION_SIZE,
+    DEFAULT_SENSOR_STABILITY_CENTERING_COEFFICIENT,
+    HISTORY_OBSERVATIONS,
+    MAX_SPEED_KMH,
     MODEL_FAMILY,
     OBSERVATION_SIZE,
     OBSERVATION_VERSION,
@@ -24,13 +28,18 @@ from .contracts import (
     SENSOR_ONLY_MODEL_FAMILY,
     SENSOR_ONLY_OBSERVATION_VERSION,
     SENSOR_ONLY_REWARD_VERSION,
+    SENSOR_STABILITY_ACTION_VERSION,
+    SENSOR_STABILITY_REWARD_VERSION,
     STEERING_RATE_REWARD_VERSION,
+    calculate_sensor_stability_reward,
 )
 from .networks import Actor, TwinCritic
 from .replay import NstepReplayBuffer, ReplayTransition
 
 
 CHECKPOINT_VERSION = "agent7_n_step_td3_checkpoint_v2"
+ELITE_REPLAY_VERSION = "agent8_elite_success_replay_v1"
+MAX_ELITE_REPLAY_FRACTION = 0.25
 FINE_TUNE_ACTOR_LEARNING_RATE = 3e-6
 FINE_TUNE_EXPLORATION_NOISE = 0.01
 FINE_TUNE_POLICY_DELAY = 4
@@ -65,6 +74,14 @@ class NstepTd3Config:
     steering_rate_cost_coefficient: float = 0.0
     physical_steering_limit: float = 1.0
     progress_reward: bool = False
+    stability_reward: bool = False
+    stability_centering_coefficient: float = (
+        DEFAULT_SENSOR_STABILITY_CENTERING_COEFFICIENT
+    )
+    self_imitation_initial_coefficient: float = 0.0
+    self_imitation_final_coefficient: float = 0.0
+    self_imitation_decay_actor_updates: int = 1
+    deployment_steering_ema_retention: float = 0.0
     racing_line_features: bool = True
     seed: int = 0
 
@@ -112,6 +129,53 @@ class NstepTd3Config:
             )
         if self.progress_reward and self.physical_steering_limit >= 1.0:
             raise ValueError("progress reward requires bounded physical steering")
+        if self.progress_reward and self.stability_reward:
+            raise ValueError("progress and stability rewards are mutually exclusive")
+        if self.stability_reward and self.racing_line_features:
+            raise ValueError("stability reward requires sensor-only observations")
+        if (
+            not math.isfinite(self.stability_centering_coefficient)
+            or self.stability_centering_coefficient < 0.0
+        ):
+            raise ValueError(
+                "stability centering coefficient must be finite and non-negative"
+            )
+        imitation_coefficients = (
+            self.self_imitation_initial_coefficient,
+            self.self_imitation_final_coefficient,
+        )
+        if any(
+            not math.isfinite(value) or value < 0.0
+            for value in imitation_coefficients
+        ):
+            raise ValueError(
+                "self-imitation coefficients must be finite and non-negative"
+            )
+        if self.self_imitation_decay_actor_updates < 1:
+            raise ValueError("self-imitation decay must cover at least one actor update")
+        if (
+            self.self_imitation_final_coefficient
+            > self.self_imitation_initial_coefficient
+        ):
+            raise ValueError(
+                "final self-imitation coefficient cannot exceed its initial value"
+            )
+        if (
+            self.self_imitation_initial_coefficient > 0.0
+            and not self.stability_reward
+        ):
+            raise ValueError("self-imitation is only enabled by the stability profile")
+        if (
+            not math.isfinite(self.deployment_steering_ema_retention)
+            or not 0.0 <= self.deployment_steering_ema_retention < 1.0
+        ):
+            raise ValueError(
+                "deployment steering EMA retention must be finite and in [0, 1)"
+            )
+        if self.deployment_steering_ema_retention > 0.0 and not self.stability_reward:
+            raise ValueError(
+                "deployment steering smoothing is only enabled by the stability profile"
+            )
         if not self.racing_line_features and self.progress_reward:
             raise ValueError(
                 "sensor-only training uses the centreline velocity reward"
@@ -119,6 +183,7 @@ class NstepTd3Config:
         if (
             not self.racing_line_features
             and self.steering_rate_cost_coefficient > 0.0
+            and not self.stability_reward
         ):
             raise ValueError(
                 "sensor-only training does not use racing-line fine-tuning modes"
@@ -138,6 +203,8 @@ def observation_version_for_config(config: NstepTd3Config) -> str:
 
 
 def action_version_for_config(config: NstepTd3Config) -> str:
+    if config.stability_reward and config.deployment_steering_ema_retention > 0.0:
+        return SENSOR_STABILITY_ACTION_VERSION
     return (
         PACE_ACTION_VERSION
         if config.physical_steering_limit < 1.0
@@ -146,6 +213,8 @@ def action_version_for_config(config: NstepTd3Config) -> str:
 
 
 def reward_version_for_config(config: NstepTd3Config) -> str:
+    if config.stability_reward:
+        return SENSOR_STABILITY_REWARD_VERSION
     if not config.racing_line_features:
         return SENSOR_ONLY_REWARD_VERSION
     if config.progress_reward:
@@ -162,6 +231,9 @@ class UpdateMetrics:
     q1_mean: float
     q2_mean: float
     target_q_mean: float
+    rl_actor_loss: float | None = None
+    behaviour_cloning_loss: float | None = None
+    behaviour_cloning_coefficient: float | None = None
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -228,6 +300,8 @@ class NstepTd3Learner:
             config.replay_capacity,
             seed=config.seed + 1,
         )
+        self.elite_replay: NstepReplayBuffer | None = None
+        self.elite_replay_fraction = 0.0
         self.environment_steps = 0
         self.optimizer_steps = 0
         self.actor_updates = 0
@@ -324,6 +398,50 @@ class NstepTd3Learner:
     def add_transitions(self, transitions: list[ReplayTransition]) -> None:
         self.replay.extend(transitions)
 
+    @property
+    def elite_replay_size(self) -> int:
+        return 0 if self.elite_replay is None else len(self.elite_replay)
+
+    @property
+    def self_imitation_coefficient(self) -> float:
+        initial = self.config.self_imitation_initial_coefficient
+        final = self.config.self_imitation_final_coefficient
+        progress = min(
+            1.0,
+            self.actor_updates
+            / float(self.config.self_imitation_decay_actor_updates),
+        )
+        return float(initial + (final - initial) * progress)
+
+    def configure_elite_replay(
+        self,
+        *,
+        capacity: int,
+        fraction: float,
+    ) -> None:
+        """Enable bounded sampling from self-generated successful episodes."""
+        requested_fraction = float(fraction)
+        if not 0.0 < requested_fraction <= MAX_ELITE_REPLAY_FRACTION:
+            raise ValueError(
+                "elite replay fraction must be in (0, "
+                f"{MAX_ELITE_REPLAY_FRACTION:g}]"
+            )
+        self.elite_replay = NstepReplayBuffer(
+            self.config.observation_size,
+            self.config.action_size,
+            int(capacity),
+            seed=self.config.seed + 4,
+        )
+        self.elite_replay_fraction = requested_fraction
+
+    def add_elite_transitions(
+        self,
+        transitions: list[ReplayTransition],
+    ) -> None:
+        if self.elite_replay is None:
+            raise RuntimeError("elite replay is not configured")
+        self.elite_replay.extend(transitions)
+
     def train_for_interaction(
         self,
         *,
@@ -350,6 +468,7 @@ class NstepTd3Learner:
         *,
         allow_actor_update: bool = True,
     ) -> UpdateMetrics:
+        batch, elite_size = self._sample_training_batch_with_elite_size()
         (
             observations,
             actions,
@@ -357,7 +476,7 @@ class NstepTd3Learner:
             next_observations,
             terminated,
             n_steps,
-        ) = self.replay.sample(self.config.batch_size, self.device)
+        ) = batch
 
         with torch.no_grad():
             target_noise = self._normal_noise(actions.shape)
@@ -390,19 +509,45 @@ class NstepTd3Learner:
 
         self.optimizer_steps += 1
         actor_loss_value: float | None = None
+        rl_actor_loss_value: float | None = None
+        behaviour_cloning_loss_value: float | None = None
+        behaviour_cloning_coefficient_value: float | None = None
         delayed_update = self.optimizer_steps % self.config.policy_delay == 0
         if allow_actor_update and delayed_update:
             self.critic.requires_grad_(False)
-            actor_loss = -self.critic.first(
+            predicted_actions = self.actor(observations)
+            rl_actor_loss = -self.critic.first(
                 observations,
-                self.actor(observations),
+                predicted_actions,
             ).mean()
+            actor_loss = rl_actor_loss
+            if (
+                elite_size > 0
+                and self.config.self_imitation_initial_coefficient > 0.0
+            ):
+                behaviour_cloning_loss = functional.mse_loss(
+                    predicted_actions[-elite_size:],
+                    actions[-elite_size:],
+                )
+                behaviour_cloning_coefficient = (
+                    self.self_imitation_coefficient
+                )
+                actor_loss = actor_loss + (
+                    behaviour_cloning_coefficient * behaviour_cloning_loss
+                )
+                behaviour_cloning_loss_value = float(
+                    behaviour_cloning_loss.detach().item()
+                )
+                behaviour_cloning_coefficient_value = float(
+                    behaviour_cloning_coefficient
+                )
             self.actor_optimizer.zero_grad(set_to_none=True)
             actor_loss.backward()
             self.actor_optimizer.step()
             self.critic.requires_grad_(True)
             self.actor_updates += 1
             actor_loss_value = float(actor_loss.detach().item())
+            rl_actor_loss_value = float(rl_actor_loss.detach().item())
             self._soft_update(self.actor, self.actor_target)
         if delayed_update:
             self._soft_update(self.critic, self.critic_target)
@@ -413,6 +558,37 @@ class NstepTd3Learner:
             q1_mean=float(q1.detach().mean().item()),
             q2_mean=float(q2.detach().mean().item()),
             target_q_mean=float(target_q.detach().mean().item()),
+            rl_actor_loss=rl_actor_loss_value,
+            behaviour_cloning_loss=behaviour_cloning_loss_value,
+            behaviour_cloning_coefficient=(
+                behaviour_cloning_coefficient_value
+            ),
+        )
+
+    def _sample_training_batch(self) -> tuple[torch.Tensor, ...]:
+        batch, _elite_size = self._sample_training_batch_with_elite_size()
+        return batch
+
+    def _sample_training_batch_with_elite_size(
+        self,
+    ) -> tuple[tuple[torch.Tensor, ...], int]:
+        elite_size = 0
+        if self.elite_replay is not None and self.elite_replay_size > 0:
+            elite_size = min(
+                int(self.config.batch_size * self.elite_replay_fraction),
+                self.elite_replay_size,
+            )
+        ordinary_size = self.config.batch_size - elite_size
+        ordinary_batch = self.replay.sample(ordinary_size, self.device)
+        if elite_size == 0 or self.elite_replay is None:
+            return ordinary_batch, 0
+        elite_batch = self.elite_replay.sample(elite_size, self.device)
+        return (
+            tuple(
+                torch.cat((ordinary, elite), dim=0)
+                for ordinary, elite in zip(ordinary_batch, elite_batch)
+            ),
+            elite_size,
         )
 
     @torch.no_grad()
@@ -486,6 +662,29 @@ class NstepTd3Learner:
         os.replace(temporary, target)
         return target
 
+    def save_elite_replay(self, path: str | Path) -> Path:
+        if self.elite_replay is None:
+            raise RuntimeError("elite replay is not configured")
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(f"{target.suffix}.tmp")
+        torch.save(
+            {
+                "version": ELITE_REPLAY_VERSION,
+                "model_family": self.model_family,
+                "observation_version": self.observation_version,
+                "action_version": self.action_version,
+                "reward_version": self.reward_version,
+                "n_steps": self.config.n_steps,
+                "gamma": self.config.gamma,
+                "fraction": self.elite_replay_fraction,
+                "replay": self.elite_replay.state_dict(),
+            },
+            temporary,
+        )
+        os.replace(temporary, target)
+        return target
+
     def save_network_components(
         self,
         directory: str | Path,
@@ -506,6 +705,149 @@ class NstepTd3Learner:
         if not isinstance(state, dict):
             raise ValueError("invalid Agent 7 replay checkpoint")
         self.replay.load_state_dict(state)
+
+    def load_elite_replay(self, path: str | Path) -> None:
+        if self.elite_replay is None:
+            raise RuntimeError("elite replay is not configured")
+        payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            raise ValueError("invalid elite replay checkpoint")
+        expected_contract = {
+            "version": ELITE_REPLAY_VERSION,
+            "model_family": self.model_family,
+            "observation_version": self.observation_version,
+            "action_version": self.action_version,
+            "reward_version": self.reward_version,
+        }
+        mismatches = [
+            name
+            for name, expected in expected_contract.items()
+            if payload.get(name) != expected
+        ]
+        if mismatches:
+            raise ValueError(
+                "elite replay contract mismatch: " + ", ".join(mismatches)
+            )
+        if int(payload.get("n_steps", -1)) != self.config.n_steps:
+            raise ValueError("elite replay N-step horizon differs")
+        saved_gamma = float(payload.get("gamma", -1.0))
+        if not math.isclose(saved_gamma, self.config.gamma):
+            raise ValueError("elite replay discount factor differs")
+        saved_fraction = float(payload.get("fraction", -1.0))
+        if not math.isclose(saved_fraction, self.elite_replay_fraction):
+            raise ValueError("elite replay sampling fraction differs")
+        state = payload.get("replay")
+        if not isinstance(state, dict):
+            raise ValueError("elite replay checkpoint is missing replay data")
+        self.elite_replay.load_state_dict(state)
+
+    def import_legacy_elite_replay_for_stability(
+        self,
+        path: str | Path,
+    ) -> int:
+        """Migrate clean V1 lap traces into the stability reward contract."""
+        if self.elite_replay is None:
+            raise RuntimeError("elite replay is not configured")
+        if not self.config.stability_reward:
+            raise RuntimeError("legacy elite migration requires stability reward")
+        payload = torch.load(Path(path), map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            raise ValueError("invalid legacy elite replay checkpoint")
+        expected_contract = {
+            "version": ELITE_REPLAY_VERSION,
+            "model_family": self.model_family,
+            "observation_version": self.observation_version,
+            "action_version": ACTION_VERSION,
+            "reward_version": SENSOR_ONLY_REWARD_VERSION,
+        }
+        mismatches = [
+            name
+            for name, expected in expected_contract.items()
+            if payload.get(name) != expected
+        ]
+        if mismatches:
+            raise ValueError(
+                "legacy elite replay contract mismatch: " + ", ".join(mismatches)
+            )
+        if int(payload.get("n_steps", -1)) != self.config.n_steps:
+            raise ValueError("legacy elite replay N-step horizon differs")
+        saved_gamma = float(payload.get("gamma", -1.0))
+        if not math.isclose(saved_gamma, self.config.gamma):
+            raise ValueError("legacy elite replay discount factor differs")
+        source_state = payload.get("replay")
+        if not isinstance(source_state, dict):
+            raise ValueError("legacy elite replay is missing replay data")
+
+        state = {
+            name: value.copy() if isinstance(value, np.ndarray) else value
+            for name, value in source_state.items()
+        }
+        size = int(state["size"])
+        observations = np.asarray(state["observations"], dtype=np.float32)[:size]
+        actions = np.asarray(state["actions"], dtype=np.float32)[:size]
+        next_observations = np.asarray(
+            state["next_observations"],
+            dtype=np.float32,
+        )[:size]
+        steps = np.asarray(state["steps"], dtype=np.float32)[:size, 0]
+        episode_ends = np.flatnonzero(np.rint(steps).astype(np.int64) == 1)
+        if episode_ends.size == 0:
+            raise ValueError("legacy elite replay contains no complete episode")
+
+        latest_base_offset = (
+            HISTORY_OBSERVATIONS - 1
+        ) * BASE_OBSERVATION_SIZE
+        one_step_rewards = np.empty(size, dtype=np.float64)
+        for index in range(size):
+            current_base = next_observations[index][
+                latest_base_offset : latest_base_offset + BASE_OBSERVATION_SIZE
+            ]
+            reward = calculate_sensor_stability_reward(
+                {
+                    "speedX": float(current_base[0]) * MAX_SPEED_KMH,
+                    "angle": float(current_base[7]) * math.pi,
+                    "trackPos": float(current_base[8]),
+                },
+                physical_failure=False,
+                lap_completed=bool(index in episode_ends),
+                previous_steer=float(observations[index][-ACTION_SIZE]),
+                current_steer=float(actions[index][0]),
+                centering_coefficient=(
+                    self.config.stability_centering_coefficient
+                ),
+                steering_rate_cost_coefficient=(
+                    self.config.steering_rate_cost_coefficient
+                ),
+            )
+            one_step_rewards[index] = reward.total
+
+        migrated_returns = np.asarray(
+            state["returns"],
+            dtype=np.float32,
+        ).copy()
+        migrated_terminated = np.zeros((size, 1), dtype=np.float32)
+        for index in range(size):
+            end_position = int(np.searchsorted(episode_ends, index))
+            if end_position >= episode_ends.size:
+                raise ValueError(
+                    "legacy elite replay ends with an incomplete episode"
+                )
+            episode_end = int(episode_ends[end_position])
+            horizon = int(round(float(steps[index])))
+            final_index = index + horizon - 1
+            if horizon < 1 or final_index > episode_end:
+                raise ValueError("legacy elite replay has invalid N-step ordering")
+            migrated_returns[index, 0] = sum(
+                (self.config.gamma**offset) * one_step_rewards[index + offset]
+                for offset in range(horizon)
+            )
+            if final_index == episode_end:
+                migrated_terminated[index, 0] = 1.0
+
+        state["returns"] = migrated_returns
+        state["terminated"] = migrated_terminated
+        self.elite_replay.load_state_dict(state)
+        return int(episode_ends.size)
 
     @classmethod
     def from_actor_checkpoint(
