@@ -18,7 +18,8 @@ class GuiThemeTests(unittest.TestCase):
     def test_light_theme_defines_shared_navigation_and_surface_styles(self):
         stylesheet = build_stylesheet(LIGHT_THEME)
 
-        self.assertIn("QTabWidget#primaryNavigation", stylesheet)
+        self.assertIn("QFrame#primaryNavigationHeader", stylesheet)
+        self.assertIn('QPushButton[navigationItem="true"]', stylesheet)
         self.assertIn('QFrame[metricCard="true"]', stylesheet)
         self.assertIn('QFrame[pipelineStep="true"]', stylesheet)
         self.assertIn("QScrollArea > QWidget > QWidget", stylesheet)

@@ -56,6 +56,7 @@ try:
         discover_run_history,
         load_project_options,
     )
+    from .navigation import PrimaryNavigation
     from .race_worker import RaceWorker
     from .racing_line_model import (
         RacingLineProfile,
@@ -103,6 +104,7 @@ except ImportError:
         discover_run_history,
         load_project_options,
     )
+    from navigation import PrimaryNavigation
     from race_worker import RaceWorker
     from racing_line_model import (
         RacingLineProfile,
@@ -171,7 +173,7 @@ class MainWindow(QMainWindow):
         self.dyna_q_value_labels: dict[str, QLabel] = {}
         self.run_history_table = QTableWidget(0, 8)
         self.run_history_source_label = QLabel()
-        self.tabs: QTabWidget | None = None
+        self.tabs: PrimaryNavigation | None = None
         self.review_tab_index = 0
         self.compare_tab_index = 0
         self.agents_tab_index = 0
@@ -420,14 +422,32 @@ class MainWindow(QMainWindow):
         self.racing_line_timer.setInterval(60)
 
     def _build_ui(self) -> None:
-        self.tabs = QTabWidget()
-        self.tabs.setObjectName("primaryNavigation")
-        self.tabs.setDocumentMode(True)
-        self.tabs.addTab(self._build_dashboard_tab(), "Dashboard")
-        self.tabs.addTab(self._build_run_history_tab(), "Run History")
-        self.review_tab_index = self.tabs.addTab(self._build_review_tab(), "Review")
-        self.compare_tab_index = self.tabs.addTab(self._build_compare_tab(), "Compare")
-        self.agents_tab_index = self.tabs.addTab(self._build_agents_tab(), "Agents")
+        self.tabs = PrimaryNavigation()
+        self.tabs.addTab(
+            self._build_dashboard_tab(),
+            "Live Telemetry",
+            "Open the live race dashboard",
+        )
+        self.tabs.addTab(
+            self._build_run_history_tab(),
+            "Runs",
+            "Browse saved race runs",
+        )
+        self.review_tab_index = self.tabs.addTab(
+            self._build_review_tab(),
+            "Review",
+            "Review a saved race run",
+        )
+        self.compare_tab_index = self.tabs.addTab(
+            self._build_compare_tab(),
+            "Compare",
+            "Compare two saved race runs",
+        )
+        self.agents_tab_index = self.tabs.addTab(
+            self._build_agents_tab(),
+            "Agent Lab",
+            "Explore the available driving agents",
+        )
 
         self.setCentralWidget(self.tabs)
         self.statusBar().showMessage(self._discovery_summary())

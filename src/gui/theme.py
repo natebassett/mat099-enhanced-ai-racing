@@ -74,10 +74,12 @@ def apply_application_theme(
 
 def build_stylesheet(palette: ThemePalette = LIGHT_THEME) -> str:
     dark = palette is DARK_THEME
-    header = palette.canvas
-    header_hover = palette.surface_alt
-    header_text = palette.text
-    header_muted = palette.muted
+    header = "#11171A" if dark else "#182126"
+    header_hover = "#263137" if dark else "#253138"
+    header_selected = "#202A2F" if dark else "#222D32"
+    header_text = "#F4F7F8"
+    header_muted = "#A9B4BA"
+    header_divider = "#354147"
     hover = "#2B3439" if dark else "#EDF2F3"
     pressed = "#354046" if dark else "#E0E8EA"
     disabled = "#272D31" if dark else "#EEF1F3"
@@ -141,29 +143,50 @@ def build_stylesheet(palette: ThemePalette = LIGHT_THEME) -> str:
         padding: 0 5px;
         color: {palette.muted};
     }}
-    QTabWidget#primaryNavigation {{
+    QFrame#primaryNavigationHeader {{
+        min-height: 56px;
+        max-height: 56px;
         background-color: {header};
-    }}
-    QTabWidget#primaryNavigation::pane {{
         border: 0;
-        background-color: {palette.canvas};
+        border-bottom: 1px solid {header_divider};
     }}
-    QTabWidget#primaryNavigation QTabBar::tab {{
-        min-width: 82px;
-        padding: 10px 18px;
+    QWidget#productLockup {{ background-color: transparent; }}
+    QLabel#productName {{
+        color: {header_text};
+        font-size: 14px;
+        font-weight: 700;
+    }}
+    QLabel#productContext {{
         color: {header_muted};
-        background-color: {header};
-        border: 0;
-        border-bottom: 3px solid transparent;
+        font-size: 8px;
         font-weight: 600;
     }}
-    QTabWidget#primaryNavigation QTabBar::tab:selected {{
-        color: {header_text};
-        border-bottom-color: {palette.accent};
+    QFrame#navigationDivider {{
+        background-color: {header_divider};
+        border: 0;
     }}
-    QTabWidget#primaryNavigation QTabBar::tab:hover {{
+    QPushButton[navigationItem="true"] {{
+        min-height: 54px;
+        padding: 0 15px;
+        color: {header_muted};
+        background-color: transparent;
+        border: 0;
+        border-bottom: 3px solid transparent;
+        border-radius: 0;
+        font-weight: 600;
+    }}
+    QPushButton[navigationItem="true"]:hover {{
         color: {header_text};
         background-color: {header_hover};
+    }}
+    QPushButton[navigationItem="true"]:checked {{
+        color: {header_text};
+        background-color: {header_selected};
+        border-bottom-color: {palette.accent};
+    }}
+    QStackedWidget#primaryPageStack {{
+        background-color: {palette.canvas};
+        border: 0;
     }}
     QTabWidget#contentTabs::pane {{
         background-color: {palette.surface};
