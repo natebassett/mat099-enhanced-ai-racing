@@ -20,6 +20,8 @@ class GuiThemeTests(unittest.TestCase):
 
         self.assertIn("QTabWidget#primaryNavigation", stylesheet)
         self.assertIn('QFrame[metricCard="true"]', stylesheet)
+        self.assertIn('QFrame[pipelineStep="true"]', stylesheet)
+        self.assertIn("QScrollArea > QWidget > QWidget", stylesheet)
         self.assertIn(LIGHT_THEME.accent, stylesheet)
         self.assertIn(LIGHT_THEME.canvas, stylesheet)
 

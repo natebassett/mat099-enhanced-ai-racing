@@ -434,6 +434,7 @@ class MainWindow(QMainWindow):
 
     def _build_dashboard_tab(self) -> QWidget:
         page = QWidget()
+        page.setObjectName("pageCanvas")
         layout = QHBoxLayout(page)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(14)
@@ -938,6 +939,7 @@ class MainWindow(QMainWindow):
 
     def _build_agents_tab(self) -> QWidget:
         page = QWidget()
+        page.setObjectName("pageCanvas")
         layout = QHBoxLayout(page)
         layout.setContentsMargins(18, 18, 18, 18)
 
@@ -974,9 +976,11 @@ class MainWindow(QMainWindow):
 
     def _build_agent_education_detail_panel(self) -> QWidget:
         scroll_area = QScrollArea()
+        scroll_area.setObjectName("agentDetailScroll")
         scroll_area.setWidgetResizable(True)
 
         content = QWidget()
+        content.setObjectName("scrollCanvas")
         layout = QVBoxLayout(content)
         layout.addWidget(
             self._text_group("What This Driver Is Doing", self.agent_education_overview_box)
@@ -1019,7 +1023,7 @@ class MainWindow(QMainWindow):
 
         for index in range(5):
             card = QFrame()
-            card.setFrameShape(QFrame.StyledPanel)
+            card.setProperty("pipelineStep", True)
             card.setMinimumHeight(88)
 
             card_layout = QVBoxLayout(card)

@@ -74,10 +74,10 @@ def apply_application_theme(
 
 def build_stylesheet(palette: ThemePalette = LIGHT_THEME) -> str:
     dark = palette is DARK_THEME
-    header = "#101315" if dark else "#1B2025"
-    header_hover = "#262D31" if dark else "#2A3036"
-    header_text = "#F6F8F9" if dark else "#FFFFFF"
-    header_muted = "#AAB4BB" if dark else "#BCC5CC"
+    header = palette.canvas
+    header_hover = palette.surface_alt
+    header_text = palette.text
+    header_muted = palette.muted
     hover = "#2B3439" if dark else "#EDF2F3"
     pressed = "#354046" if dark else "#E0E8EA"
     disabled = "#272D31" if dark else "#EEF1F3"
@@ -87,6 +87,9 @@ def build_stylesheet(palette: ThemePalette = LIGHT_THEME) -> str:
     QMainWindow, QDialog {{
         background-color: {palette.canvas};
         color: {palette.text};
+    }}
+    QWidget#pageCanvas, QWidget#scrollCanvas {{
+        background-color: {palette.canvas};
     }}
     QWidget {{
         color: {palette.text};
@@ -118,6 +121,12 @@ def build_stylesheet(palette: ThemePalette = LIGHT_THEME) -> str:
         border: 1px solid {palette.border};
         border-radius: 6px;
     }}
+    QFrame[pipelineStep="true"] {{
+        background-color: {palette.surface_alt};
+        border: 0;
+        border-left: 3px solid {palette.accent};
+        border-radius: 3px;
+    }}
     QGroupBox {{
         background-color: {palette.surface};
         border: 1px solid {palette.border};
@@ -131,6 +140,9 @@ def build_stylesheet(palette: ThemePalette = LIGHT_THEME) -> str:
         left: 10px;
         padding: 0 5px;
         color: {palette.muted};
+    }}
+    QTabWidget#primaryNavigation {{
+        background-color: {header};
     }}
     QTabWidget#primaryNavigation::pane {{
         border: 0;
@@ -233,7 +245,13 @@ def build_stylesheet(palette: ThemePalette = LIGHT_THEME) -> str:
         padding: 8px;
         font-weight: 600;
     }}
-    QScrollArea {{ border: 0; background-color: transparent; }}
+    QScrollArea {{
+        border: 0;
+        background-color: {palette.canvas};
+    }}
+    QScrollArea > QWidget > QWidget {{
+        background-color: {palette.canvas};
+    }}
     QSplitter::handle {{
         background-color: {palette.border};
         width: 1px;
