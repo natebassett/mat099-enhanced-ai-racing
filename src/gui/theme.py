@@ -123,6 +123,28 @@ def build_stylesheet(palette: ThemePalette = LIGHT_THEME) -> str:
         color: {palette.muted};
         font-weight: 600;
     }}
+    QLabel#learningModeLabel {{
+        color: {palette.accent};
+        background-color: {palette.selection};
+        border-radius: 4px;
+        padding: 5px 8px;
+        font-weight: 600;
+    }}
+    QLabel#learningStepLabel {{
+        color: {palette.text};
+        font-weight: 600;
+    }}
+    QLabel#learningEquation {{
+        color: {palette.accent};
+        font-family: "Consolas";
+        font-weight: 600;
+    }}
+    QLabel#checkpointEvidence {{
+        color: {palette.muted};
+        background-color: {palette.surface_alt};
+        border-left: 3px solid {palette.accent};
+        padding: 7px 9px;
+    }}
     QFrame[metricCard="true"], QFrame[surface="true"] {{
         background-color: {palette.surface};
         border: 1px solid {palette.border};
@@ -133,6 +155,11 @@ def build_stylesheet(palette: ThemePalette = LIGHT_THEME) -> str:
         border: 0;
         border-left: 3px solid {palette.accent};
         border-radius: 3px;
+    }}
+    QFrame[learningExplanation="true"] {{
+        background-color: {palette.surface};
+        border: 1px solid {palette.border};
+        border-radius: 5px;
     }}
     QGroupBox {{
         background-color: {palette.surface};

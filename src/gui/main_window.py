@@ -58,6 +58,7 @@ try:
         load_project_options,
     )
     from .navigation import PrimaryNavigation
+    from .learning_visualizer import LearningVisualizerPanel
     from .race_worker import RaceWorker
     from .racing_line_model import (
         RacingLineProfile,
@@ -106,6 +107,7 @@ except ImportError:
         load_project_options,
     )
     from navigation import PrimaryNavigation
+    from learning_visualizer import LearningVisualizerPanel
     from race_worker import RaceWorker
     from racing_line_model import (
         RacingLineProfile,
@@ -222,6 +224,7 @@ class MainWindow(QMainWindow):
         self.agent_education_strengths_box = QTextEdit()
         self.agent_education_failure_box = QTextEdit()
         self.agent_education_tracks_box = QTextEdit()
+        self.learning_visualizer = LearningVisualizerPanel()
         self.agent_pipeline_labels: list[QLabel] = []
         self.racing_line_track_combo = QComboBox()
         self.racing_line_play_button = QPushButton("Play")
@@ -1086,6 +1089,13 @@ class MainWindow(QMainWindow):
         tabs.setObjectName("agentLabTabs")
         tabs.addTab(self._build_agent_driving_page(), "How It Drives")
         tabs.addTab(self._build_agent_learning_page(), "How It Learns")
+        tabs.addTab(
+            self._agent_lab_scroll_page(
+                self.learning_visualizer,
+                "learningVisualizerScroll",
+            ),
+            "Learning Visualiser",
+        )
         tabs.addTab(self._build_agent_limits_page(), "Use & Limits")
         return tabs
 
@@ -1511,6 +1521,7 @@ class MainWindow(QMainWindow):
                 label.setText("--")
             for label in self.agent_pipeline_labels:
                 label.setText("--")
+            self.learning_visualizer.set_agent(None)
             self._sync_racing_line_visualizer(None)
             return
 
@@ -1550,6 +1561,7 @@ class MainWindow(QMainWindow):
                 label.setText(profile.decision_steps[index])
             else:
                 label.setText("--")
+        self.learning_visualizer.set_agent(agent.agent_type, agent.name)
         self._sync_racing_line_visualizer(agent)
 
     def _set_text_box(self, box: QTextEdit, lines: tuple[str, ...]) -> None:

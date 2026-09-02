@@ -45,7 +45,12 @@ class AgentLabLayoutTests(unittest.TestCase):
         self.assertIsNotNone(tabs)
         self.assertEqual(
             [tabs.tabText(index) for index in range(tabs.count())],
-            ["How It Drives", "How It Learns", "Use & Limits"],
+            [
+                "How It Drives",
+                "How It Learns",
+                "Learning Visualiser",
+                "Use & Limits",
+            ],
         )
 
     def test_agent_lab_pages_scroll_vertically_without_horizontal_overflow(self) -> None:
@@ -53,6 +58,7 @@ class AgentLabLayoutTests(unittest.TestCase):
         for object_name in (
             "agentDrivingScroll",
             "agentLearningScroll",
+            "learningVisualizerScroll",
             "agentLimitsScroll",
         ):
             scroll = page.findChild(QScrollArea, object_name)
