@@ -74,6 +74,9 @@ data/evaluation/agent7_n_step_td3_v3/
 models/agent7_n_step_td3_v4/
 models/training_runs/agent7_n_step_td3_v4/
 data/evaluation/agent7_n_step_td3_v4/
+models/agent7_n_step_td3_v5/
+models/training_runs/agent7_n_step_td3_v5/
+data/evaluation/agent7_n_step_td3_v5/
 ```
 
 It does not load or overwrite any Agent 6 model or earlier Agent 7 checkpoint.
@@ -168,6 +171,56 @@ Evaluate a promoted v4 candidate independently with:
 
 ```powershell
 python scripts\evaluate_n_step_td3_agent.py --policy-path models\agent7_n_step_td3_v4\best_evaluation.pt --repeats 10 --racing-line-path data\racing_lines\g-track-3-agent7-smooth-v1.json
+```
+
+### Pace v5 experiment
+
+V5 is a separate fresh-training contract intended to challenge the map-aware
+agent without changing the reliable v3 policy. It retains the same TD3 network,
+three-step replay, full-track episodes, telemetry history, and racing-line
+curvature observations. It makes only two control/objective changes:
+
+```text
+physical_steer = clip(actor_steer, -1, 1) * 0.3
+reward_v5 = clipped_signed_progress_m - 10 * physical_failure
+            + 1000 * lap_completed
+```
+
+The progress delta is clipped to `+/-5 m` per interaction to reject impossible
+telemetry jumps. V5 has no racing-line adherence reward, target-speed feature,
+teacher action, behaviour cloning, curriculum, actor rollback, safety probe, or
+hardcoded control intervention. The racing-line JSON speed fields are ignored;
+only line geometry is observed.
+
+V5's initial random replay collection holds each sampled action for 10
+interactions (about 200 ms at 50 Hz). Eighty percent of those segments apply
+positive longitudinal input and 20 percent explore braking or coasting. This
+keeps the warm-up reward-free and stochastic while ensuring its replay contains
+launches instead of 50 Hz throttle/brake alternation.
+
+V5 must start with fresh actor/critic weights and fresh replay because the
+bounded physical action and progress objective are new contracts. The trainer
+rejects resume checkpoints and replay imports in this mode. Its default budget
+is one million learning interactions, with passive three-run evaluation every
+50,000 interactions. Evaluation may save a better reliability or pace
+checkpoint but never changes the live learner.
+
+Run a short contract validation before committing to an overnight run:
+
+```powershell
+python scripts\train_n_step_td3_agent.py --pace-v5 --total-timesteps 50000 --seed 0 --racing-line-path data\racing_lines\g-track-3-agent7-smooth-v1.json --no-tensorboard
+```
+
+Run the intended one-million-interaction experiment:
+
+```powershell
+python scripts\train_n_step_td3_agent.py --pace-v5 --seed 0 --racing-line-path data\racing_lines\g-track-3-agent7-smooth-v1.json --no-tensorboard
+```
+
+Evaluate the protected v5 reliability champion independently:
+
+```powershell
+python scripts\evaluate_n_step_td3_agent.py --policy-path models\agent7_n_step_td3_v5\best_evaluation.pt --repeats 10 --racing-line-path data\racing_lines\g-track-3-agent7-smooth-v1.json
 ```
 
 Evaluation keeps two independent full checkpoints. `best_evaluation.pt` is the

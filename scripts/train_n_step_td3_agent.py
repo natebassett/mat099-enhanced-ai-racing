@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 
@@ -21,9 +21,8 @@ if str(SRC_ROOT) not in sys.path:
 
 from n_step_td3.environment import EpisodeSummary, NstepTorcsEnvironment
 from n_step_td3.contracts import (
-    ACTION_VERSION,
+    DEFAULT_PACE_STEERING_LIMIT,
     DEFAULT_STEERING_RATE_COST_COEFFICIENT,
-    OBSERVATION_VERSION,
     REWARD_VERSION,
 )
 from n_step_td3.learner import (
@@ -47,7 +46,91 @@ STEERING_RATE_V4_MODEL_DIR = (
 STEERING_RATE_V4_RUNS_DIR = (
     PROJECT_ROOT / "models" / "training_runs" / "agent7_n_step_td3_v4"
 )
+PACE_V5_MODEL_DIR = PROJECT_ROOT / "models" / "agent7_n_step_td3_v5"
+PACE_V5_RUNS_DIR = (
+    PROJECT_ROOT / "models" / "training_runs" / "agent7_n_step_td3_v5"
+)
+SENSOR_ONLY_MODEL_DIR = PROJECT_ROOT / "models" / "agent8_sensor_n_step_td3"
+SENSOR_ONLY_RUNS_DIR = (
+    PROJECT_ROOT / "models" / "training_runs" / "agent8_sensor_n_step_td3"
+)
+SENSOR_ONLY_BEST_EVALUATION_PATH = SENSOR_ONLY_MODEL_DIR / "best_evaluation.pt"
+SENSOR_ONLY_BEST_PACE_PATH = SENSOR_ONLY_MODEL_DIR / "best_pace.pt"
+SENSOR_STEERING_V2_MODEL_DIR = (
+    PROJECT_ROOT / "models" / "agent8_sensor_n_step_td3_v2_steer070"
+)
+SENSOR_STEERING_V2_RUNS_DIR = (
+    PROJECT_ROOT
+    / "models"
+    / "training_runs"
+    / "agent8_sensor_n_step_td3_v2_steer070"
+)
+SENSOR_STEERING_V2_LIMIT = 0.7
+SENSOR_STEERING_V2_ACTOR_LEARNING_RATE = 1e-5
+SENSOR_CLEAN_OBSERVATION_V3_MODEL_DIR = (
+    PROJECT_ROOT / "models" / "agent8_sensor_n_step_td3_v3_clean_observation"
+)
+SENSOR_CLEAN_OBSERVATION_V3_RUNS_DIR = (
+    PROJECT_ROOT
+    / "models"
+    / "training_runs"
+    / "agent8_sensor_n_step_td3_v3_clean_observation"
+)
+SENSOR_CLEAN_OBSERVATION_V3_ACTOR_LEARNING_RATE = 1e-5
+SENSOR_V1_CONTINUATION_MODEL_DIR = (
+    PROJECT_ROOT / "models" / "agent8_sensor_n_step_td3_v1_continuation"
+)
+SENSOR_V1_CONTINUATION_RUNS_DIR = (
+    PROJECT_ROOT
+    / "models"
+    / "training_runs"
+    / "agent8_sensor_n_step_td3_v1_continuation"
+)
+SENSOR_V1_STABILITY_MODEL_DIR = (
+    PROJECT_ROOT / "models" / "agent8_sensor_n_step_td3_v1_stability"
+)
+SENSOR_V1_STABILITY_RUNS_DIR = (
+    PROJECT_ROOT
+    / "models"
+    / "training_runs"
+    / "agent8_sensor_n_step_td3_v1_stability"
+)
+SENSOR_V1_CLEAN_RELIABILITY_MODEL_DIR = (
+    PROJECT_ROOT / "models" / "agent8_sensor_n_step_td3_v1_clean_reliability"
+)
+SENSOR_V1_CLEAN_RELIABILITY_RUNS_DIR = (
+    PROJECT_ROOT
+    / "models"
+    / "training_runs"
+    / "agent8_sensor_n_step_td3_v1_clean_reliability"
+)
+SENSOR_V1_CLEAN_RELIABILITY_ACTOR_LEARNING_RATE = 3e-6
+SENSOR_V1_CLEAN_RELIABILITY_EVALUATION_REPEATS = 10
+SENSOR_V1_CLEAN_RELIABILITY_COMPLETION_RATE = 0.8
+SENSOR_V1_CLEAN_RELIABILITY_MEDIAN_SECONDS = 90.0
+SENSOR_V1_ROBUST_PACE_MODEL_DIR = (
+    PROJECT_ROOT / "models" / "agent8_sensor_n_step_td3_v1_robust_pace"
+)
+SENSOR_V1_ROBUST_PACE_RUNS_DIR = (
+    PROJECT_ROOT
+    / "models"
+    / "training_runs"
+    / "agent8_sensor_n_step_td3_v1_robust_pace"
+)
+SENSOR_V1_ROBUST_PACE_ACTOR_LEARNING_RATE = 3e-6
+SENSOR_V1_ROBUST_PACE_EVALUATION_REPEATS = 10
+SENSOR_V1_ROBUST_PACE_COMPLETION_RATE = 0.8
+SENSOR_V1_ROBUST_PACE_MEDIAN_SECONDS = 90.0
+SENSOR_V1_ROBUST_PACE_NOISY_EPISODE_FRACTION = 0.25
+SENSOR_V1_ROBUST_PACE_NOISY_OBSERVATION_STD = 0.025
 DEFAULT_TRAIN_FREQUENCY = 4
+PACE_V5_TOTAL_TIMESTEPS = 1_000_000
+PACE_V5_EVALUATION_INTERVAL = 50_000
+PACE_V5_WARMUP_ACTION_HOLD_INTERACTIONS = 10
+PACE_V5_WARMUP_THROTTLE_PROBABILITY = 0.8
+PACE_V5_WARMUP_MIN_THROTTLE = 0.25
+SENSOR_ONLY_WARMUP_ACTION_HOLD_INTERACTIONS = 10
+SENSOR_ONLY_WARMUP_STEERING_LIMIT = 0.3
 FINE_TUNE_TRAIN_FREQUENCY = 8
 FINE_TUNE_REPLAY_WARMUP_SIZE = 30_000
 FINE_TUNE_CRITIC_WARMUP_UPDATES = 2_000
@@ -408,7 +491,7 @@ class CsvRunLogger:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train the independent Agent 7 N-step TD3 racer."
+        description="Train an independent N-step TD3 racing policy."
     )
     parser.add_argument("--total-timesteps", type=int)
     parser.add_argument("--track", default="g-track-3")
@@ -453,12 +536,98 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--pace-v5",
+        action="store_true",
+        help=(
+            "Train a fresh v5 pace policy with bounded physical steering and "
+            "a minimal progress reward. Resume checkpoints are intentionally "
+            "not accepted."
+        ),
+    )
+    parser.add_argument(
+        "--sensor-only",
+        action="store_true",
+        help=(
+            "Train the separate Agent 8 policy from TORCS telemetry and track "
+            "sensors without loading racing-line geometry."
+        ),
+    )
+    parser.add_argument(
+        "--sensor-steering-v2",
+        action="store_true",
+        help=(
+            "Create an isolated Agent 8 v2 continuation from a sensor-only "
+            "actor with a reduced physical steering scale and fresh critic/replay."
+        ),
+    )
+    parser.add_argument(
+        "--sensor-steering-limit",
+        type=float,
+        default=SENSOR_STEERING_V2_LIMIT,
+        help=(
+            "Absolute TORCS steering scale for --sensor-steering-v2 "
+            f"(default: {SENSOR_STEERING_V2_LIMIT:g})."
+        ),
+    )
+    parser.add_argument(
+        "--sensor-clean-observation-v3",
+        action="store_true",
+        help=(
+            "Create an isolated Agent 8 v3 continuation from a sensor-only "
+            "actor with a fresh critic/replay and app-matched clean observations."
+        ),
+    )
+    parser.add_argument(
+        "--sensor-v1-pace-continuation",
+        action="store_true",
+        help=(
+            "Resume a complete Agent 8 V1 pace checkpoint with its original "
+            "sensor-only learning contract in isolated output directories."
+        ),
+    )
+    parser.add_argument(
+        "--sensor-v1-stability-continuation",
+        action="store_true",
+        help=(
+            "Refine a complete Agent 8 pace checkpoint with small actor updates "
+            "and passive completion-first evaluation in isolated directories."
+        ),
+    )
+    parser.add_argument(
+        "--sensor-v1-clean-reliability-continuation",
+        action="store_true",
+        help=(
+            "Transfer an Agent 8 pace actor into an isolated, app-matched clean "
+            "sensor run that promotes only reliable sub-90-second policies."
+        ),
+    )
+    parser.add_argument(
+        "--sensor-v1-robust-pace-continuation",
+        action="store_true",
+        help=(
+            "Transfer an Agent 8 pace actor into a fresh critic/replay run "
+            "with mostly clean training episodes, a small fixed noisy-episode "
+            "mix, and clean-only promotion."
+        ),
+    )
+    parser.add_argument(
+        "--pace-steering-limit",
+        type=float,
+        default=DEFAULT_PACE_STEERING_LIMIT,
+        help=(
+            "Absolute TORCS steering limit used by --pace-v5 "
+            f"(default: {DEFAULT_PACE_STEERING_LIMIT:g})."
+        ),
+    )
+    parser.add_argument(
         "--fine-tune-actor-learning-rate",
         type=float,
         default=None,
         help=(
             "Actor learning rate used by conservative modes "
-            f"(default: {FINE_TUNE_ACTOR_LEARNING_RATE:g}, or "
+            f"(default: {FINE_TUNE_ACTOR_LEARNING_RATE:g}, "
+            f"{SENSOR_STEERING_V2_ACTOR_LEARNING_RATE:g} for Agent 8 v2, or "
+            f"{SENSOR_CLEAN_OBSERVATION_V3_ACTOR_LEARNING_RATE:g} for Agent 8 v3, or "
             f"{STEERING_RATE_V4_ACTOR_LEARNING_RATE:g} for v4)."
         ),
     )
@@ -520,7 +689,7 @@ def build_parser() -> argparse.ArgumentParser:
             "feature-specific reference profile; 0 disables noise."
         ),
     )
-    parser.add_argument("--evaluation-interval", type=int, default=10_000)
+    parser.add_argument("--evaluation-interval", type=int)
     parser.add_argument(
         "--evaluation-repeats",
         type=int,
@@ -567,24 +736,117 @@ def build_parser() -> argparse.ArgumentParser:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.fine_tune and args.steering_rate_v4:
-        parser.error("--fine-tune and --steering-rate-v4 are mutually exclusive")
+    selected_modes = sum(
+        bool(value)
+        for value in (
+            args.fine_tune,
+            args.steering_rate_v4,
+            args.pace_v5,
+        )
+    )
+    if selected_modes > 1 or (args.sensor_only and selected_modes > 0):
+        parser.error(
+            "--fine-tune, --steering-rate-v4, --pace-v5, and --sensor-only "
+            "are mutually exclusive"
+        )
+    if args.sensor_steering_v2 and not args.sensor_only:
+        parser.error("--sensor-steering-v2 requires --sensor-only")
+    if args.sensor_clean_observation_v3 and not args.sensor_only:
+        parser.error("--sensor-clean-observation-v3 requires --sensor-only")
+    if args.sensor_v1_pace_continuation and not args.sensor_only:
+        parser.error("--sensor-v1-pace-continuation requires --sensor-only")
+    if args.sensor_v1_stability_continuation and not args.sensor_only:
+        parser.error("--sensor-v1-stability-continuation requires --sensor-only")
+    if args.sensor_v1_clean_reliability_continuation and not args.sensor_only:
+        parser.error(
+            "--sensor-v1-clean-reliability-continuation requires --sensor-only"
+        )
+    if args.sensor_v1_robust_pace_continuation and not args.sensor_only:
+        parser.error(
+            "--sensor-v1-robust-pace-continuation requires --sensor-only"
+        )
+    if args.sensor_steering_v2 and args.sensor_clean_observation_v3:
+        parser.error(
+            "--sensor-steering-v2 and --sensor-clean-observation-v3 "
+            "are mutually exclusive"
+        )
+    if args.sensor_v1_pace_continuation and (
+        args.sensor_steering_v2
+        or args.sensor_clean_observation_v3
+        or args.sensor_v1_robust_pace_continuation
+    ):
+        parser.error(
+            "--sensor-v1-pace-continuation cannot be combined with Agent 8 "
+            "v2 or v3 experiment modes"
+        )
+    if args.sensor_v1_stability_continuation and (
+        args.sensor_steering_v2
+        or args.sensor_clean_observation_v3
+        or args.sensor_v1_pace_continuation
+        or args.sensor_v1_clean_reliability_continuation
+        or args.sensor_v1_robust_pace_continuation
+    ):
+        parser.error(
+            "--sensor-v1-stability-continuation cannot be combined with other "
+            "Agent 8 experiment modes"
+        )
+    if args.sensor_v1_clean_reliability_continuation and (
+        args.sensor_steering_v2
+        or args.sensor_clean_observation_v3
+        or args.sensor_v1_pace_continuation
+        or args.sensor_v1_stability_continuation
+        or args.sensor_v1_robust_pace_continuation
+    ):
+        parser.error(
+            "--sensor-v1-clean-reliability-continuation cannot be combined with "
+            "other Agent 8 experiment modes"
+        )
+    if args.sensor_v1_robust_pace_continuation and (
+        args.sensor_steering_v2
+        or args.sensor_clean_observation_v3
+        or args.sensor_v1_pace_continuation
+        or args.sensor_v1_stability_continuation
+        or args.sensor_v1_clean_reliability_continuation
+    ):
+        parser.error(
+            "--sensor-v1-robust-pace-continuation cannot be combined with "
+            "other Agent 8 experiment modes"
+        )
     if args.total_timesteps is None:
         args.total_timesteps = (
             STEERING_RATE_V4_TOTAL_TIMESTEPS
             if args.steering_rate_v4
+            else PACE_V5_TOTAL_TIMESTEPS
+            if args.pace_v5
             else 500_000
+        )
+    if args.evaluation_interval is None:
+        args.evaluation_interval = (
+            PACE_V5_EVALUATION_INTERVAL if args.pace_v5 else 10_000
         )
     if args.evaluation_repeats is None:
         args.evaluation_repeats = (
             STEERING_RATE_V4_EVALUATION_REPEATS
             if args.steering_rate_v4
+            else SENSOR_V1_CLEAN_RELIABILITY_EVALUATION_REPEATS
+            if (
+                args.sensor_v1_clean_reliability_continuation
+                or args.sensor_v1_robust_pace_continuation
+            )
             else 3
         )
     if args.fine_tune_actor_learning_rate is None:
         args.fine_tune_actor_learning_rate = (
             STEERING_RATE_V4_ACTOR_LEARNING_RATE
             if args.steering_rate_v4
+            else SENSOR_STEERING_V2_ACTOR_LEARNING_RATE
+            if args.sensor_steering_v2
+            else SENSOR_CLEAN_OBSERVATION_V3_ACTOR_LEARNING_RATE
+            if args.sensor_clean_observation_v3
+            else SENSOR_V1_CLEAN_RELIABILITY_ACTOR_LEARNING_RATE
+            if args.sensor_v1_clean_reliability_continuation
+            else SENSOR_V1_ROBUST_PACE_ACTOR_LEARNING_RATE
+            if args.sensor_v1_robust_pace_continuation
             else FINE_TUNE_ACTOR_LEARNING_RATE
         )
     if args.fine_tune_critic_warmup_updates is None:
@@ -601,7 +863,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.train_frequency is None:
         if args.steering_rate_v4:
             args.train_frequency = STEERING_RATE_V4_TRAIN_FREQUENCY
-        elif args.fine_tune:
+        elif (
+            args.fine_tune
+            or args.sensor_steering_v2
+            or args.sensor_clean_observation_v3
+            or args.sensor_v1_stability_continuation
+            or args.sensor_v1_clean_reliability_continuation
+            or args.sensor_v1_robust_pace_continuation
+        ):
             args.train_frequency = FINE_TUNE_TRAIN_FREQUENCY
         else:
             args.train_frequency = DEFAULT_TRAIN_FREQUENCY
@@ -638,9 +907,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--fine-tune-actor-learning-rate must be positive and finite"
         )
     if args.resume_best:
-        args.resume = BEST_EVALUATION_PATH
+        args.resume = (
+            SENSOR_ONLY_BEST_EVALUATION_PATH
+            if args.sensor_only
+            else BEST_EVALUATION_PATH
+        )
     elif args.resume_pace:
-        args.resume = BEST_PACE_PATH
+        args.resume = (
+            SENSOR_ONLY_BEST_PACE_PATH
+            if args.sensor_only
+            else BEST_PACE_PATH
+        )
     if args.fine_tune and args.resume is None:
         parser.error(
             "--fine-tune requires --resume, --resume-best, or --resume-pace"
@@ -649,6 +926,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--steering-rate-v4 requires --resume-best")
     if args.steering_rate_v4 and args.evaluation_repeats < 10:
         parser.error("--steering-rate-v4 requires at least 10 evaluation repeats")
+    if args.pace_v5 and args.resume is not None:
+        parser.error("--pace-v5 starts from fresh weights and cannot resume")
+    if args.pace_v5 and args.replay_buffer_path is not None:
+        parser.error("--pace-v5 starts with fresh replay and cannot import replay")
+    if args.sensor_only and args.racing_line_path is not None:
+        parser.error("--sensor-only cannot accept --racing-line-path")
+    if (
+        not math.isfinite(args.pace_steering_limit)
+        or not 0.0 < args.pace_steering_limit < 1.0
+    ):
+        parser.error("--pace-steering-limit must be finite and in (0, 1)")
+    if (
+        not math.isfinite(args.sensor_steering_limit)
+        or not 0.0 < args.sensor_steering_limit < 1.0
+    ):
+        parser.error("--sensor-steering-limit must be finite and in (0, 1)")
     if (
         not math.isfinite(args.steering_rate_cost_coefficient)
         or args.steering_rate_cost_coefficient <= 0.0
@@ -665,6 +958,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
     if args.resume is not None and not args.resume.is_file():
         parser.error(f"--resume checkpoint does not exist: {args.resume}")
+    if args.sensor_steering_v2 and args.resume is None:
+        parser.error("--sensor-steering-v2 requires a --resume checkpoint")
+    if args.sensor_clean_observation_v3 and args.resume is None:
+        parser.error(
+            "--sensor-clean-observation-v3 requires a --resume checkpoint"
+        )
+    if args.sensor_v1_pace_continuation and args.resume is None:
+        parser.error("--sensor-v1-pace-continuation requires a --resume checkpoint")
+    if args.sensor_v1_stability_continuation and args.resume is None:
+        parser.error(
+            "--sensor-v1-stability-continuation requires a --resume checkpoint"
+        )
+    if args.sensor_v1_clean_reliability_continuation and args.resume is None:
+        parser.error(
+            "--sensor-v1-clean-reliability-continuation requires a --resume "
+            "checkpoint"
+        )
+    if args.sensor_v1_robust_pace_continuation and args.resume is None:
+        parser.error(
+            "--sensor-v1-robust-pace-continuation requires a --resume "
+            "checkpoint"
+        )
     if args.racing_line_path is not None and not args.racing_line_path.is_file():
         parser.error(
             f"--racing-line-path does not exist: {args.racing_line_path}"
@@ -674,6 +989,62 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         or args.observation_noise_std < 0.0
     ):
         parser.error("--observation-noise-std must be finite and non-negative")
+    if args.sensor_clean_observation_v3 and args.observation_noise_std != 0.0:
+        parser.error(
+            "--sensor-clean-observation-v3 requires "
+            "--observation-noise-std 0"
+        )
+    if (
+        args.sensor_v1_pace_continuation
+        and args.observation_noise_std != 0.025
+    ):
+        parser.error(
+            "--sensor-v1-pace-continuation requires "
+            "--observation-noise-std 0.025"
+        )
+    if (
+        args.sensor_v1_stability_continuation
+        and args.observation_noise_std != 0.025
+    ):
+        parser.error(
+            "--sensor-v1-stability-continuation requires "
+            "--observation-noise-std 0.025"
+        )
+    if (
+        args.sensor_v1_clean_reliability_continuation
+        and args.observation_noise_std != 0.0
+    ):
+        parser.error(
+            "--sensor-v1-clean-reliability-continuation requires "
+            "--observation-noise-std 0"
+        )
+    if (
+        args.sensor_v1_robust_pace_continuation
+        and args.observation_noise_std != 0.0
+    ):
+        parser.error(
+            "--sensor-v1-robust-pace-continuation requires "
+            "--observation-noise-std 0"
+        )
+    if (
+        args.sensor_v1_clean_reliability_continuation
+        and args.evaluation_repeats
+        < SENSOR_V1_CLEAN_RELIABILITY_EVALUATION_REPEATS
+    ):
+        parser.error(
+            "--sensor-v1-clean-reliability-continuation requires at least "
+            f"{SENSOR_V1_CLEAN_RELIABILITY_EVALUATION_REPEATS} evaluation "
+            "repeats"
+        )
+    if (
+        args.sensor_v1_robust_pace_continuation
+        and args.evaluation_repeats
+        < SENSOR_V1_ROBUST_PACE_EVALUATION_REPEATS
+    ):
+        parser.error(
+            "--sensor-v1-robust-pace-continuation requires at least "
+            f"{SENSOR_V1_ROBUST_PACE_EVALUATION_REPEATS} evaluation repeats"
+        )
     if (
         args.replay_buffer_path is not None
         and not args.replay_buffer_path.is_file()
@@ -706,6 +1077,11 @@ def config_from_args(args: argparse.Namespace) -> NstepTd3Config:
             if args.steering_rate_v4
             else 0.0
         ),
+        physical_steering_limit=(
+            args.pace_steering_limit if args.pace_v5 else 1.0
+        ),
+        progress_reward=bool(args.pace_v5),
+        racing_line_features=not args.sensor_only,
         seed=args.seed,
     )
 
@@ -744,11 +1120,95 @@ def initialize_steering_rate_v4_learner(
     return learner
 
 
+def initialize_sensor_actor_transfer_learner(
+    args: argparse.Namespace,
+    *,
+    physical_steering_limit: float,
+) -> NstepTd3Learner:
+    """Transfer a sensor-policy actor while intentionally resetting TD3 state."""
+    if args.resume is None:
+        raise ValueError("sensor actor transfer requires a source checkpoint")
+    source_checkpoint = load_actor_checkpoint(args.resume, device="cpu")
+    source_config = NstepTd3Config(**source_checkpoint["config"])
+    if source_config.racing_line_features:
+        raise ValueError("sensor actor transfer requires a sensor-only checkpoint")
+
+    target_config = replace(
+        source_config,
+        actor_learning_rate=args.fine_tune_actor_learning_rate,
+        critic_learning_rate=args.critic_learning_rate,
+        exploration_noise=min(source_config.exploration_noise, 0.05),
+        longitudinal_exploration_noise=min(
+            source_config.longitudinal_exploration_noise,
+            0.05,
+        ),
+        physical_steering_limit=physical_steering_limit,
+        seed=args.seed,
+    )
+    learner = NstepTd3Learner(target_config, device=args.device)
+    learner.actor.load_state_dict(source_checkpoint["actor"])
+    learner.actor_target.load_state_dict(source_checkpoint["actor"])
+    return learner
+
+
+def initialize_sensor_steering_v2_learner(
+    args: argparse.Namespace,
+) -> NstepTd3Learner:
+    """Transfer only a sensor-policy actor into the scaled-action experiment."""
+    if not args.sensor_steering_v2:
+        raise ValueError("Agent 8 v2 transfer mode was not selected")
+    return initialize_sensor_actor_transfer_learner(
+        args,
+        physical_steering_limit=args.sensor_steering_limit,
+    )
+
+
+def initialize_sensor_clean_observation_v3_learner(
+    args: argparse.Namespace,
+) -> NstepTd3Learner:
+    """Transfer the actor into the GUI's unperturbed sensor contract."""
+    if not args.sensor_clean_observation_v3:
+        raise ValueError("Agent 8 clean-observation v3 mode was not selected")
+    return initialize_sensor_actor_transfer_learner(
+        args,
+        physical_steering_limit=1.0,
+    )
+
+
+def initialize_sensor_v1_clean_reliability_learner(
+    args: argparse.Namespace,
+) -> NstepTd3Learner:
+    """Reuse a pace actor while relearning value estimates on clean sensors."""
+    if not args.sensor_v1_clean_reliability_continuation:
+        raise ValueError("Agent 8 clean-reliability mode was not selected")
+    return initialize_sensor_actor_transfer_learner(
+        args,
+        physical_steering_limit=1.0,
+    )
+
+
+def initialize_sensor_v1_robust_pace_learner(
+    args: argparse.Namespace,
+) -> NstepTd3Learner:
+    """Reuse the pace actor while rebuilding TD3 state for robust deployment."""
+    if not args.sensor_v1_robust_pace_continuation:
+        raise ValueError("Agent 8 robust-pace mode was not selected")
+    return initialize_sensor_actor_transfer_learner(
+        args,
+        physical_steering_limit=1.0,
+    )
+
+
 def evaluate_once(
     environment: NstepTorcsEnvironment,
     learner: NstepTd3Learner,
+    *,
+    cold_start: bool = False,
 ) -> EpisodeSummary:
-    observation, _ = environment.reset()
+    if cold_start:
+        observation, _ = environment.reset(force_relaunch=True)
+    else:
+        observation, _ = environment.reset()
     done = False
     while not done:
         action = learner.select_action(observation, deterministic=True)
@@ -773,11 +1233,25 @@ def evaluate_and_record(
     mode: str = "evaluation",
     allow_promotion: bool = True,
     promotion_gate: EvaluationPromotionGate | None = None,
+    cold_start_each_rollout: bool = False,
+    evaluation_candidate_dir: Path | None = None,
 ) -> tuple[list[EpisodeSummary], float]:
     if repeats < 1:
         raise ValueError("evaluation repeats must be positive")
+    learner_config = getattr(learner, "config", None)
+    has_racing_line = bool(
+        getattr(learner_config, "racing_line_features", True)
+    )
+    agent_label = "Agent 7" if has_racing_line else "Agent 8"
 
-    evaluations = [evaluate_once(environment, learner) for _ in range(repeats)]
+    evaluations = [
+        evaluate_once(
+            environment,
+            learner,
+            cold_start=cold_start_each_rollout,
+        )
+        for _ in range(repeats)
+    ]
     for evaluation in evaluations:
         logger.write_episode(
             evaluation,
@@ -830,6 +1304,28 @@ def evaluate_and_record(
         f"max={maximum_distance:.1f}m "
         f"laps={completed_runs}/{repeats}{lap_summary}"
     )
+    if evaluation_candidate_dir is not None:
+        evaluation_candidate_dir.mkdir(parents=True, exist_ok=True)
+        candidate_path = evaluation_candidate_dir / (
+            f"{mode}_step_{learner.environment_steps:010d}.pt"
+        )
+        learner.save(candidate_path)
+        _write_json(
+            candidate_path.with_suffix(".json"),
+            {
+                "checkpoint": str(candidate_path),
+                "global_step": learner.environment_steps,
+                "mode": mode,
+                "cold_start_each_rollout": cold_start_each_rollout,
+                "completion_rate": score.completion_rate,
+                "median_lap_time_seconds": score.median_lap_time_seconds,
+                "fastest_lap_time_seconds": score.fastest_lap_time_seconds,
+                "median_distance_m": score.median_distance_m,
+                "minimum_distance_m": minimum_distance,
+                "maximum_distance_m": maximum_distance,
+            },
+        )
+        print(f"Saved evaluation candidate: {candidate_path}")
     promotion_permitted = (
         promotion_gate is None or promotion_gate.permits(score)
     )
@@ -862,7 +1358,7 @@ def evaluate_and_record(
             else f", median_lap={score.median_lap_time_seconds:.2f}s"
         )
         print(
-            "New Agent 7 evaluation champion: "
+            f"New {agent_label} evaluation champion: "
             f"completion={score.completion_rate:.0%}{pace_summary}, "
             f"median_distance={median_distance:.1f}m"
         )
@@ -870,7 +1366,7 @@ def evaluate_and_record(
         learner.save(model_dir / "best_pace.pt")
         learner.save(model_dir / "best_lap.pt")
         print(
-            "New Agent 7 pace champion: fastest clean evaluation lap="
+            f"New {agent_label} pace champion: fastest clean evaluation lap="
             f"{score.fastest_lap_time_seconds:.3f}s"
         )
     elif allow_promotion and not promotion_permitted:
@@ -895,7 +1391,18 @@ def collect_replay_warmup(
     use_random_actions: bool,
     deterministic_policy_actions: bool = False,
     target_replay_size: int | None = None,
+    random_action_hold_interactions: int = 1,
+    launch_capable_random_actions: bool = False,
+    random_action_steering_limit: float | None = None,
+    before_episode_reset: Callable[[], None] | None = None,
 ) -> tuple[np.ndarray, int]:
+    if random_action_hold_interactions < 1:
+        raise ValueError("random action hold interactions must be positive")
+    if random_action_steering_limit is not None and (
+        not np.isfinite(random_action_steering_limit)
+        or not 0.0 < random_action_steering_limit <= 1.0
+    ):
+        raise ValueError("random action steering limit must be in (0, 1]")
     target_size = (
         learner.config.replay_start_size
         if target_replay_size is None
@@ -903,18 +1410,35 @@ def collect_replay_warmup(
     )
     if target_size > learner.config.replay_capacity:
         raise ValueError("replay warm-up target exceeds replay capacity")
+    if before_episode_reset is not None:
+        before_episode_reset()
     observation, _ = environment.reset()
     accumulator.reset()
     interactions = 0
+    held_random_action: np.ndarray | None = None
+    held_random_action_steps = 0
     while len(learner.replay) < target_size:
-        action = (
-            learner.random_action()
-            if use_random_actions
-            else learner.select_action(
+        if use_random_actions:
+            if held_random_action is None or held_random_action_steps == 0:
+                held_random_action = learner.random_action()
+                if launch_capable_random_actions:
+                    held_random_action = pace_v5_warmup_action(
+                        held_random_action
+                    )
+                if random_action_steering_limit is not None:
+                    held_random_action[0] = np.clip(
+                        held_random_action[0],
+                        -random_action_steering_limit,
+                        random_action_steering_limit,
+                    )
+                held_random_action_steps = random_action_hold_interactions
+            action = held_random_action.copy()
+            held_random_action_steps -= 1
+        else:
+            action = learner.select_action(
                 observation,
                 deterministic=deterministic_policy_actions,
             )
-        )
         next_observation, reward, terminated, truncated, _info = (
             environment.step(action)
         )
@@ -953,9 +1477,43 @@ def collect_replay_warmup(
             f"{target_size:,} | "
             f"{summary.termination_reason} {summary.distance_m:.1f}m"
         )
+        if before_episode_reset is not None:
+            before_episode_reset()
         observation, _ = environment.reset()
         accumulator.reset()
+        held_random_action = None
+        held_random_action_steps = 0
     return observation, interactions
+
+
+def pace_v5_warmup_action(random_action: np.ndarray) -> np.ndarray:
+    """Bias held random segments toward launch without prescribing a policy."""
+    action = np.asarray(random_action, dtype=np.float32).reshape(-1).copy()
+    if action.size < 2:
+        raise ValueError("v5 warm-up requires steering and longitudinal actions")
+    uniform_draw = (float(np.clip(action[1], -1.0, 1.0)) + 1.0) / 2.0
+    brake_probability = 1.0 - PACE_V5_WARMUP_THROTTLE_PROBABILITY
+    if uniform_draw < brake_probability:
+        action[1] = -uniform_draw / brake_probability
+    else:
+        throttle_draw = (
+            uniform_draw - brake_probability
+        ) / PACE_V5_WARMUP_THROTTLE_PROBABILITY
+        action[1] = PACE_V5_WARMUP_MIN_THROTTLE + throttle_draw * (
+            1.0 - PACE_V5_WARMUP_MIN_THROTTLE
+        )
+    return np.clip(action, -1.0, 1.0).astype(np.float32)
+
+
+def select_sensor_v1_robust_pace_noise(
+    random_source: np.random.Generator,
+) -> float:
+    """Choose the next training episode's observation-noise contract."""
+    return (
+        SENSOR_V1_ROBUST_PACE_NOISY_OBSERVATION_STD
+        if random_source.random() < SENSOR_V1_ROBUST_PACE_NOISY_EPISODE_FRACTION
+        else 0.0
+    )
 
 
 def _next_boundary(current: int, interval: int) -> int:
@@ -1025,16 +1583,85 @@ def _record_tensorboard_episode(writer: Any, summary: EpisodeSummary, step: int,
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = (
-        STEERING_RATE_V4_RUNS_DIR if args.steering_rate_v4 else RUNS_DIR
-    ) / timestamp
-    model_dir = (
-        STEERING_RATE_V4_MODEL_DIR if args.steering_rate_v4 else MODEL_DIR
+    agent_label = (
+        "Agent 8 v2"
+        if args.sensor_steering_v2
+        else "Agent 8 v3 clean observation"
+        if args.sensor_clean_observation_v3
+        else "Agent 8 v1 pace continuation"
+        if args.sensor_v1_pace_continuation
+        else "Agent 8 v1 stability continuation"
+        if args.sensor_v1_stability_continuation
+        else "Agent 8 v1 clean reliability continuation"
+        if args.sensor_v1_clean_reliability_continuation
+        else "Agent 8 v1 robust pace continuation"
+        if args.sensor_v1_robust_pace_continuation
+        else "Agent 8"
+        if args.sensor_only
+        else "Agent 7"
     )
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if args.sensor_steering_v2:
+        run_root = SENSOR_STEERING_V2_RUNS_DIR
+        model_dir = SENSOR_STEERING_V2_MODEL_DIR
+    elif args.sensor_clean_observation_v3:
+        run_root = SENSOR_CLEAN_OBSERVATION_V3_RUNS_DIR
+        model_dir = SENSOR_CLEAN_OBSERVATION_V3_MODEL_DIR
+    elif args.sensor_v1_pace_continuation:
+        run_root = SENSOR_V1_CONTINUATION_RUNS_DIR
+        model_dir = SENSOR_V1_CONTINUATION_MODEL_DIR
+    elif args.sensor_v1_stability_continuation:
+        run_root = SENSOR_V1_STABILITY_RUNS_DIR
+        model_dir = SENSOR_V1_STABILITY_MODEL_DIR
+    elif args.sensor_v1_clean_reliability_continuation:
+        run_root = SENSOR_V1_CLEAN_RELIABILITY_RUNS_DIR
+        model_dir = SENSOR_V1_CLEAN_RELIABILITY_MODEL_DIR
+    elif args.sensor_v1_robust_pace_continuation:
+        run_root = SENSOR_V1_ROBUST_PACE_RUNS_DIR
+        model_dir = SENSOR_V1_ROBUST_PACE_MODEL_DIR
+    elif args.sensor_only:
+        run_root = SENSOR_ONLY_RUNS_DIR
+        model_dir = SENSOR_ONLY_MODEL_DIR
+    elif args.pace_v5:
+        run_root = PACE_V5_RUNS_DIR
+        model_dir = PACE_V5_MODEL_DIR
+    elif args.steering_rate_v4:
+        run_root = STEERING_RATE_V4_RUNS_DIR
+        model_dir = STEERING_RATE_V4_MODEL_DIR
+    else:
+        run_root = RUNS_DIR
+        model_dir = MODEL_DIR
+    run_dir = run_root / timestamp
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.steering_rate_v4:
+    if args.sensor_steering_v2:
+        learner = initialize_sensor_steering_v2_learner(args)
+        print(
+            "Initialized Agent 8 v2 from sensor-only actor parameters with "
+            f"fresh critic/replay and physical steering limited to +/-"
+            f"{learner.config.physical_steering_limit:g}: {args.resume}"
+        )
+    elif args.sensor_clean_observation_v3:
+        learner = initialize_sensor_clean_observation_v3_learner(args)
+        print(
+            "Initialized Agent 8 v3 from sensor-only actor parameters with "
+            f"fresh critic/replay and clean observations: {args.resume}"
+        )
+    elif args.sensor_v1_clean_reliability_continuation:
+        learner = initialize_sensor_v1_clean_reliability_learner(args)
+        print(
+            "Initialized Agent 8 clean-reliability continuation from pace "
+            "actor parameters only, with fresh critic/replay and app-matched "
+            f"clean observations: {args.resume}"
+        )
+    elif args.sensor_v1_robust_pace_continuation:
+        learner = initialize_sensor_v1_robust_pace_learner(args)
+        print(
+            "Initialized Agent 8 robust-pace continuation from pace actor "
+            "parameters only, with fresh critic/replay, clean deployment "
+            f"observations, and a fixed noisy-episode mix: {args.resume}"
+        )
+    elif args.steering_rate_v4:
         learner = initialize_steering_rate_v4_learner(args)
         print(
             "Initialized Agent 7 v4 from protected v3 actor parameters only: "
@@ -1043,19 +1670,20 @@ def main(argv: list[str] | None = None) -> None:
         )
     elif args.resume is not None:
         learner = NstepTd3Learner.load(args.resume, device=args.device)
-        print(f"Resuming Agent 7 from {args.resume}")
+        print(f"Resuming {agent_label} from {args.resume}")
         if args.seed_was_explicit:
             learner.reseed_training_noise(args.seed)
             print(
                 f"Reseeded Agent 7 training noise with seed {args.seed}; "
                 "checkpoint weights and optimizer state are unchanged."
             )
-        if args.fine_tune:
+        if args.fine_tune or args.sensor_v1_stability_continuation:
             learner.enable_fine_tuning(
                 actor_learning_rate=args.fine_tune_actor_learning_rate,
             )
             print(
-                "Enabled Agent 7 pace fine-tuning: actor learning rate="
+                f"Enabled {agent_label} conservative policy refinement: "
+                "actor learning rate="
                 f"{learner.config.actor_learning_rate:g}, action noise="
                 f"{learner.config.exploration_noise:g}, policy delay="
                 f"{learner.config.policy_delay}, train frequency="
@@ -1063,13 +1691,25 @@ def main(argv: list[str] | None = None) -> None:
             )
     else:
         learner = NstepTd3Learner(config_from_args(args), device=args.device)
-        print("Starting Agent 7 N-step TD3 from random network weights.")
+        if args.sensor_only:
+            print(
+                "Starting Agent 8 sensor-only N-step TD3 from random network "
+                "weights without a racing-line map."
+            )
+        elif args.pace_v5:
+            print(
+                "Starting Agent 7 v5 pace racer from fresh random network "
+                "weights and fresh replay."
+            )
+        else:
+            print("Starting Agent 7 N-step TD3 from random network weights.")
     synchronise_recorded_evaluation(learner, model_dir)
     synchronise_recorded_pace(learner, model_dir)
     if args.replay_buffer_path is not None:
         learner.load_replay(args.replay_buffer_path)
         print(
-            f"Loaded Agent 7 replay buffer with {len(learner.replay):,} transitions."
+            f"Loaded {agent_label} replay buffer with "
+            f"{len(learner.replay):,} transitions."
         )
     elif args.resume is not None:
         print(
@@ -1077,7 +1717,15 @@ def main(argv: list[str] | None = None) -> None:
             "the protected checkpoint remains unchanged unless evaluation improves."
         )
 
-    conservative_mode = bool(args.fine_tune or args.steering_rate_v4)
+    conservative_mode = bool(
+        args.fine_tune
+        or args.steering_rate_v4
+        or args.sensor_steering_v2
+        or args.sensor_clean_observation_v3
+        or args.sensor_v1_stability_continuation
+        or args.sensor_v1_clean_reliability_continuation
+        or args.sensor_v1_robust_pace_continuation
+    )
     replay_warmup_size = learner.config.replay_start_size
     critic_warmup_updates = 0
     if conservative_mode:
@@ -1086,7 +1734,15 @@ def main(argv: list[str] | None = None) -> None:
             args.fine_tune_replay_warmup_size,
         )
         critic_warmup_updates = args.fine_tune_critic_warmup_updates
-    if args.resume is None:
+    if (
+        args.sensor_steering_v2
+        or args.sensor_clean_observation_v3
+        or conservative_mode
+    ):
+        replay_warmup_action_mode = "deterministic_policy"
+    elif args.pace_v5 or args.sensor_only:
+        replay_warmup_action_mode = "held_launch_biased_random"
+    elif args.resume is None:
         replay_warmup_action_mode = "random"
     elif conservative_mode:
         replay_warmup_action_mode = "deterministic_policy"
@@ -1104,8 +1760,37 @@ def main(argv: list[str] | None = None) -> None:
         ),
         "fine_tune": bool(args.fine_tune),
         "steering_rate_v4": bool(args.steering_rate_v4),
+        "pace_v5": bool(args.pace_v5),
+        "sensor_only": bool(args.sensor_only),
+        "sensor_steering_v2": bool(args.sensor_steering_v2),
+        "sensor_steering_limit": (
+            args.sensor_steering_limit if args.sensor_steering_v2 else None
+        ),
+        "sensor_clean_observation_v3": bool(
+            args.sensor_clean_observation_v3
+        ),
+        "sensor_v1_pace_continuation": bool(args.sensor_v1_pace_continuation),
+        "sensor_v1_stability_continuation": bool(
+            args.sensor_v1_stability_continuation
+        ),
+        "sensor_v1_clean_reliability_continuation": bool(
+            args.sensor_v1_clean_reliability_continuation
+        ),
+        "sensor_v1_robust_pace_continuation": bool(
+            args.sensor_v1_robust_pace_continuation
+        ),
         "actor_initialization": (
-            "v3_actor_only" if args.steering_rate_v4 else "checkpoint_resume"
+            "sensor_v2_actor_only"
+            if args.sensor_steering_v2
+            else "sensor_clean_observation_v3_actor_only"
+            if args.sensor_clean_observation_v3
+            else "sensor_v1_clean_reliability_actor_only"
+            if args.sensor_v1_clean_reliability_continuation
+            else "sensor_v1_robust_pace_actor_only"
+            if args.sensor_v1_robust_pace_continuation
+            else "v3_actor_only"
+            if args.steering_rate_v4
+            else "checkpoint_resume"
             if args.resume is not None
             else "random"
         ),
@@ -1118,28 +1803,84 @@ def main(argv: list[str] | None = None) -> None:
             else None
         ),
         "promotion_completion_rate": (
-            1.0 if args.steering_rate_v4 else None
+            1.0
+            if args.steering_rate_v4
+            else SENSOR_V1_CLEAN_RELIABILITY_COMPLETION_RATE
+            if (
+                args.sensor_v1_clean_reliability_continuation
+                or args.sensor_v1_robust_pace_continuation
+            )
+            else None
         ),
         "promotion_median_lap_time_seconds": (
             args.steering_rate_promotion_median_seconds
             if args.steering_rate_v4
+            else SENSOR_V1_CLEAN_RELIABILITY_MEDIAN_SECONDS
+            if (
+                args.sensor_v1_clean_reliability_continuation
+                or args.sensor_v1_robust_pace_continuation
+            )
             else None
         ),
         "replay_warmup_size": replay_warmup_size,
         "replay_warmup_action_mode": replay_warmup_action_mode,
+        "replay_warmup_action_hold_interactions": (
+            1
+            if (
+                args.sensor_steering_v2
+                or args.sensor_clean_observation_v3
+                or args.sensor_v1_clean_reliability_continuation
+                or args.sensor_v1_robust_pace_continuation
+            )
+            else PACE_V5_WARMUP_ACTION_HOLD_INTERACTIONS
+            if args.pace_v5
+            else SENSOR_ONLY_WARMUP_ACTION_HOLD_INTERACTIONS
+            if args.sensor_only
+            else 1
+        ),
+        "replay_warmup_throttle_probability": (
+            None
+            if (
+                args.sensor_steering_v2
+                or args.sensor_clean_observation_v3
+                or args.sensor_v1_clean_reliability_continuation
+                or args.sensor_v1_robust_pace_continuation
+            )
+            else PACE_V5_WARMUP_THROTTLE_PROBABILITY
+            if args.pace_v5 or args.sensor_only
+            else None
+        ),
+        "replay_warmup_steering_limit": (
+            None
+            if (
+                args.sensor_steering_v2
+                or args.sensor_clean_observation_v3
+                or args.sensor_v1_clean_reliability_continuation
+                or args.sensor_v1_robust_pace_continuation
+            )
+            else SENSOR_ONLY_WARMUP_STEERING_LIMIT
+            if args.sensor_only
+            else None
+        ),
         "critic_only_warmup_updates": critic_warmup_updates,
         "replay_source": (
             "fresh" if args.replay_buffer_path is None else str(args.replay_buffer_path)
         ),
         "device": str(learner.device),
         "algorithm": "N-step TD3",
-        "observation_version": OBSERVATION_VERSION,
-        "action_version": ACTION_VERSION,
+        "model_family": learner.model_family,
+        "observation_version": learner.observation_version,
+        "action_version": learner.action_version,
         "reward_version": learner.reward_version,
         "source_design": "https://github.com/raphaelsenn/torcsRL",
         "source_revision_reviewed": "043e806e260507d1d5eef161004bc350f9d7f471",
         "source_code_copied": False,
-        "racing_line_features": True,
+        "racing_line_features": learner.config.racing_line_features,
+        "racing_line_reward_shaping": bool(
+            learner.config.racing_line_features
+            and not learner.config.progress_reward
+        ),
+        "target_speed_features": False,
         "racing_line_path": (
             None
             if args.racing_line_path is None
@@ -1150,6 +1891,22 @@ def main(argv: list[str] | None = None) -> None:
         "actor_rollback": False,
         "internal_policy_probes": False,
         "observation_noise_std": args.observation_noise_std,
+        "training_noisy_episode_fraction": (
+            SENSOR_V1_ROBUST_PACE_NOISY_EPISODE_FRACTION
+            if args.sensor_v1_robust_pace_continuation
+            else 0.0
+        ),
+        "training_noisy_observation_std": (
+            SENSOR_V1_ROBUST_PACE_NOISY_OBSERVATION_STD
+            if args.sensor_v1_robust_pace_continuation
+            else 0.0
+        ),
+        "evaluation_observation_noise_std": 0.0
+        if args.sensor_v1_robust_pace_continuation
+        else args.observation_noise_std,
+        "cold_start_evaluation_rollouts": bool(
+            args.sensor_v1_robust_pace_continuation
+        ),
         "evaluation_repeats": args.evaluation_repeats,
         "train_frequency": args.train_frequency,
         "effective_update_to_data_ratio": (
@@ -1171,7 +1928,23 @@ def main(argv: list[str] | None = None) -> None:
         steering_rate_cost_coefficient=(
             learner.config.steering_rate_cost_coefficient
         ),
+        physical_steering_limit=learner.config.physical_steering_limit,
+        progress_reward=learner.config.progress_reward,
+        racing_line_features=learner.config.racing_line_features,
     )
+    observation_noise_rng = np.random.default_rng(args.seed + 89_761)
+
+    def prepare_training_episode() -> None:
+        noise_std = args.observation_noise_std
+        if args.sensor_v1_robust_pace_continuation:
+            noise_std = select_sensor_v1_robust_pace_noise(
+                observation_noise_rng
+            )
+        environment.set_observation_noise_std(noise_std)
+
+    def prepare_evaluation() -> None:
+        if args.sensor_v1_robust_pace_continuation:
+            environment.set_observation_noise_std(0.0)
     accumulator = NstepTransitionAccumulator(
         learner.config.n_steps,
         learner.config.gamma,
@@ -1194,6 +1967,7 @@ def main(argv: list[str] | None = None) -> None:
         if args.steering_rate_v4
         else None
     )
+    cold_start_evaluations = bool(args.sensor_v1_robust_pace_continuation)
     promotion_gate = (
         EvaluationPromotionGate(
             required_completion_rate=1.0,
@@ -1202,16 +1976,36 @@ def main(argv: list[str] | None = None) -> None:
             ),
         )
         if args.steering_rate_v4
+        else EvaluationPromotionGate(
+            required_completion_rate=SENSOR_V1_CLEAN_RELIABILITY_COMPLETION_RATE,
+            maximum_median_lap_time_seconds=(
+                SENSOR_V1_CLEAN_RELIABILITY_MEDIAN_SECONDS
+            ),
+        )
+        if args.sensor_v1_clean_reliability_continuation
+        or args.sensor_v1_robust_pace_continuation
         else None
     )
+    observation_noise_summary = (
+        "25% of training episodes use the original 0.025 sensor-noise "
+        "profile; evaluation is clean-only, "
+        if args.sensor_v1_robust_pace_continuation
+        else ""
+    )
 
+    observation_summary = (
+        "racing-line geometry observations"
+        if learner.config.racing_line_features
+        else "TORCS telemetry and track-sensor observations only"
+    )
     print(
-        "Agent 7 protocol: torcsRL-aligned N-step TD3 core, full track, "
+        f"{agent_label} protocol: torcsRL-aligned N-step TD3 core, full track, "
         f"{learner.config.n_steps}-step replay, "
         f"{replay_warmup_size:,}-transition replay warm-up, "
         f"replay actions={replay_warmup_action_mode}, "
-        "racing-line state/reward shaping, "
+        f"{observation_summary}, "
         f"observation noise profile level={args.observation_noise_std:g}, "
+        f"{observation_noise_summary}"
         "training action noise sigma="
         f"(steer={learner.config.exploration_noise:g}, "
         "longitudinal="
@@ -1221,10 +2015,13 @@ def main(argv: list[str] | None = None) -> None:
         "no actor rollback, "
         f"reward={learner.reward_version}, steering-rate coefficient="
         f"{learner.config.steering_rate_cost_coefficient:g}, "
+        "physical steering limit=+/-"
+        f"{learner.config.physical_steering_limit:g}, "
         f"actor-update ceiling={actor_update_limit}, "
         f"critic-only warm-up={critic_warmup_updates:,} updates, "
         f"automatic {args.evaluation_repeats}-run median evaluation every "
-        f"{args.evaluation_interval:,} steps."
+        f"{args.evaluation_interval:,} steps; cold-start evaluations="
+        f"{cold_start_evaluations}."
     )
     try:
         if (
@@ -1236,6 +2033,7 @@ def main(argv: list[str] | None = None) -> None:
                 "Establishing a passive lap-aware evaluation baseline for this "
                 f"checkpoint ({args.evaluation_repeats} deterministic runs)."
             )
+            prepare_evaluation()
             baseline_evaluations, _baseline_median = evaluate_and_record(
                 environment,
                 learner,
@@ -1245,6 +2043,7 @@ def main(argv: list[str] | None = None) -> None:
                 repeats=args.evaluation_repeats,
                 mode="evaluation_baseline",
                 allow_promotion=False,
+                cold_start_each_rollout=cold_start_evaluations,
             )
             baseline_score = summarise_evaluations(baseline_evaluations)
             record_best_evaluation_score(learner, baseline_score)
@@ -1265,6 +2064,27 @@ def main(argv: list[str] | None = None) -> None:
             use_random_actions=args.resume is None,
             deterministic_policy_actions=conservative_mode,
             target_replay_size=replay_warmup_size,
+            random_action_hold_interactions=(
+                1
+                if (
+                    args.sensor_steering_v2
+                    or args.sensor_clean_observation_v3
+                    or args.sensor_v1_clean_reliability_continuation
+                    or args.sensor_v1_robust_pace_continuation
+                )
+                else PACE_V5_WARMUP_ACTION_HOLD_INTERACTIONS
+                if args.pace_v5
+                else SENSOR_ONLY_WARMUP_ACTION_HOLD_INTERACTIONS
+                if args.sensor_only
+                else 1
+            ),
+            launch_capable_random_actions=args.pace_v5 or args.sensor_only,
+            random_action_steering_limit=(
+                SENSOR_ONLY_WARMUP_STEERING_LIMIT
+                if args.sensor_only
+                else None
+            ),
+            before_episode_reset=prepare_training_episode,
         )
         if warmup_interactions:
             print(
@@ -1273,7 +2093,7 @@ def main(argv: list[str] | None = None) -> None:
             )
         if critic_warmup_updates:
             print(
-                "Adapting Agent 7 critic to fresh replay with the actor frozen: "
+                f"Adapting {agent_label} critic to fresh replay with the actor frozen: "
                 f"{critic_warmup_updates:,} gradient updates."
             )
             critic_metrics = learner.train_critic_only(critic_warmup_updates)
@@ -1359,7 +2179,7 @@ def main(argv: list[str] | None = None) -> None:
                 learner.best_training_distance_m = summary.distance_m
                 learner.save(model_dir / "best_distance.pt")
                 print(
-                    f"New Agent 7 training frontier: {summary.distance_m:.1f}m"
+                    f"New {agent_label} training frontier: {summary.distance_m:.1f}m"
                 )
             print(
                 f"Train {run_steps:,}/{args.total_timesteps:,} | "
@@ -1370,6 +2190,7 @@ def main(argv: list[str] | None = None) -> None:
             )
 
             if learner.environment_steps >= next_evaluation:
+                prepare_evaluation()
                 evaluate_and_record(
                     environment,
                     learner,
@@ -1378,6 +2199,12 @@ def main(argv: list[str] | None = None) -> None:
                     model_dir,
                     repeats=args.evaluation_repeats,
                     promotion_gate=promotion_gate,
+                    cold_start_each_rollout=cold_start_evaluations,
+                    evaluation_candidate_dir=(
+                        run_dir / "evaluation_candidates"
+                        if args.sensor_v1_robust_pace_continuation
+                        else None
+                    ),
                 )
                 last_evaluation_step = learner.environment_steps
                 while learner.environment_steps >= next_evaluation:
@@ -1391,10 +2218,12 @@ def main(argv: list[str] | None = None) -> None:
                 while learner.environment_steps >= next_checkpoint:
                     next_checkpoint += args.checkpoint_interval
 
+            prepare_training_episode()
             observation, _ = environment.reset()
             accumulator.reset()
 
         if last_evaluation_step != learner.environment_steps:
+            prepare_evaluation()
             evaluate_and_record(
                 environment,
                 learner,
@@ -1403,6 +2232,12 @@ def main(argv: list[str] | None = None) -> None:
                 model_dir,
                 repeats=args.evaluation_repeats,
                 promotion_gate=promotion_gate,
+                cold_start_each_rollout=cold_start_evaluations,
+                evaluation_candidate_dir=(
+                    run_dir / "evaluation_candidates"
+                    if args.sensor_v1_robust_pace_continuation
+                    else None
+                ),
             )
             last_evaluation_step = learner.environment_steps
 
@@ -1411,7 +2246,10 @@ def main(argv: list[str] | None = None) -> None:
         print(f"\nTraining interrupted; saved {interrupted_path}")
     except Exception:
         learner.save(model_dir / "emergency.pt")
-        print("Saved Agent 7 emergency checkpoint before propagating the error.")
+        print(
+            f"Saved {agent_label} emergency checkpoint before propagating "
+            "the error."
+        )
         raise
     finally:
         if pending_metrics:
@@ -1425,8 +2263,8 @@ def main(argv: list[str] | None = None) -> None:
         if writer is not None:
             writer.close()
 
-    print(f"Saved Agent 7 model to {model_dir / 'latest.pt'}")
-    print(f"Saved Agent 7 run logs to {run_dir}")
+    print(f"Saved {agent_label} model to {model_dir / 'latest.pt'}")
+    print(f"Saved {agent_label} run logs to {run_dir}")
 
 
 if __name__ == "__main__":

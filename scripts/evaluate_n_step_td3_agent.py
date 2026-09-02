@@ -21,7 +21,6 @@ if str(SRC_ROOT) not in sys.path:
 from agents.n_step_td3_agent import default_model_path
 from n_step_td3.contracts import (
     ACTION_VERSION,
-    OBSERVATION_VERSION,
     REWARD_VERSION,
 )
 from n_step_td3.environment import NstepTorcsEnvironment
@@ -37,6 +36,12 @@ from n_step_td3.racing_line import LOOKAHEAD_DISTANCES_M
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data" / "evaluation" / "agent7_n_step_td3_v3"
 STEERING_RATE_V4_OUTPUT_DIR = (
     PROJECT_ROOT / "data" / "evaluation" / "agent7_n_step_td3_v4"
+)
+PACE_V5_OUTPUT_DIR = (
+    PROJECT_ROOT / "data" / "evaluation" / "agent7_n_step_td3_v5"
+)
+SENSOR_ONLY_OUTPUT_DIR = (
+    PROJECT_ROOT / "data" / "evaluation" / "agent8_sensor_n_step_td3"
 )
 TRACE_CURVATURE_COLUMNS = tuple(
     f"lookahead_curvature_{int(distance)}m"
@@ -55,6 +60,7 @@ TRACE_COLUMNS = (
     "racing_line_error",
     "minimum_track_sensor_m",
     "raw_steer",
+    "control_steer",
     "steering_delta",
     "raw_longitudinal",
     "control_accel",
@@ -65,6 +71,8 @@ TRACE_COLUMNS = (
     "reward_racing_line_factor",
     "reward_steering_rate_penalty",
     "reward_terminal_penalty",
+    "reward_progress_m",
+    "reward_lap_completion_bonus",
     *TRACE_CURVATURE_COLUMNS,
     "physical_failure",
     "termination_reason",
@@ -73,7 +81,7 @@ TRACE_COLUMNS = (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Evaluate an Agent 7 N-step TD3 checkpoint."
+        description="Evaluate an N-step TD3 racing checkpoint."
     )
     parser.add_argument(
         "--policy-path",
@@ -91,6 +99,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Observation-noise profile level: 0.025 selects torcsRL's "
             "feature-specific reference profile; 0 disables noise."
+        ),
+    )
+    parser.add_argument(
+        "--physical-steering-limit",
+        type=float,
+        help=(
+            "Override the checkpoint's physical TORCS steering scale for this "
+            "evaluation only. The actor weights, reward, and observations are "
+            "unchanged."
         ),
     )
     parser.add_argument("--seed", type=int, default=10_000)
@@ -121,6 +138,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         or args.observation_noise_std < 0.0
     ):
         parser.error("--observation-noise-std must be finite and non-negative")
+    if args.physical_steering_limit is not None and (
+        not math.isfinite(args.physical_steering_limit)
+        or not 0.0 < args.physical_steering_limit <= 1.0
+    ):
+        parser.error(
+            "--physical-steering-limit must be finite and in (0, 1]"
+        )
     if args.racing_line_path is not None and not args.racing_line_path.is_file():
         parser.error(
             f"--racing-line-path does not exist: {args.racing_line_path}"
@@ -154,6 +178,7 @@ def build_trace_row(
         "racing_line_error": float(info["racing_line_error"]),
         "minimum_track_sensor_m": float(info["minimum_track_sensor_m"]),
         "raw_steer": float(info["raw_steer"]),
+        "control_steer": float(info["control_steer"]),
         "steering_delta": float(info["steering_delta"]),
         "raw_longitudinal": float(info["raw_longitudinal"]),
         "control_accel": float(info["control_accel"]),
@@ -168,6 +193,10 @@ def build_trace_row(
             info["reward_steering_rate_penalty"]
         ),
         "reward_terminal_penalty": float(info["reward_terminal_penalty"]),
+        "reward_progress_m": float(info["reward_progress_m"]),
+        "reward_lap_completion_bonus": float(
+            info["reward_lap_completion_bonus"]
+        ),
     }
     curvature = np.asarray(info["lookahead_curvature"], dtype=np.float32)
     if curvature.shape != (len(TRACE_CURVATURE_COLUMNS),):
@@ -188,6 +217,9 @@ class DeterministicCheckpointPolicy:
         checkpoint = load_actor_checkpoint(path, device="cpu")
         config = NstepTd3Config(**checkpoint["config"])
         self.config = config
+        self.model_family = str(checkpoint["model_family"])
+        self.observation_version = str(checkpoint["observation_version"])
+        self.action_version = str(checkpoint.get("action_version", ACTION_VERSION))
         self.reward_version = str(checkpoint.get("reward_version", REWARD_VERSION))
         self.device = resolve_device(device)
         self.actor = Actor(
@@ -211,7 +243,19 @@ class DeterministicCheckpointPolicy:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     policy = DeterministicCheckpointPolicy(args.policy_path, args.device)
-    if (
+    physical_steering_limit = (
+        policy.config.physical_steering_limit
+        if args.physical_steering_limit is None
+        else args.physical_steering_limit
+    )
+    if args.output_dir == DEFAULT_OUTPUT_DIR and not policy.config.racing_line_features:
+        args.output_dir = SENSOR_ONLY_OUTPUT_DIR
+    elif (
+        args.output_dir == DEFAULT_OUTPUT_DIR
+        and policy.config.progress_reward
+    ):
+        args.output_dir = PACE_V5_OUTPUT_DIR
+    elif (
         args.output_dir == DEFAULT_OUTPUT_DIR
         and policy.config.steering_rate_cost_coefficient > 0.0
     ):
@@ -226,6 +270,9 @@ def main(argv: list[str] | None = None) -> None:
         steering_rate_cost_coefficient=(
             policy.config.steering_rate_cost_coefficient
         ),
+        physical_steering_limit=physical_steering_limit,
+        progress_reward=policy.config.progress_reward,
+        racing_line_features=policy.config.racing_line_features,
     )
     rows: list[dict[str, object]] = []
     trace_rows: list[dict[str, object]] = []
@@ -246,7 +293,7 @@ def main(argv: list[str] | None = None) -> None:
                 done = terminated or truncated
             summary = environment.last_summary
             if summary is None:
-                raise RuntimeError("Agent 7 evaluation ended without a summary")
+                raise RuntimeError("N-step TD3 evaluation ended without a summary")
             row = {"repeat": repeat, **summary.as_dict()}
             rows.append(row)
             print(
@@ -269,11 +316,23 @@ def main(argv: list[str] | None = None) -> None:
     summary_record = {
         "policy_path": str(args.policy_path.resolve()),
         "track": args.track,
-        "observation_version": OBSERVATION_VERSION,
-        "action_version": ACTION_VERSION,
+        "model_family": policy.model_family,
+        "observation_version": policy.observation_version,
+        "action_version": policy.action_version,
         "reward_version": policy.reward_version,
         "steering_rate_cost_coefficient": (
             policy.config.steering_rate_cost_coefficient
+        ),
+        "physical_steering_limit": physical_steering_limit,
+        "checkpoint_physical_steering_limit": (
+            policy.config.physical_steering_limit
+        ),
+        "progress_reward": policy.config.progress_reward,
+        "racing_line_features": policy.config.racing_line_features,
+        "racing_line_path": (
+            None
+            if environment.racing_line_path is None
+            else str(environment.racing_line_path)
         ),
         "deterministic": True,
         "repeats": args.repeats,
@@ -314,7 +373,7 @@ def main(argv: list[str] | None = None) -> None:
         "n/a" if median_lap_time is None else f"{float(median_lap_time):.3f}s"
     )
     print(
-        "Agent 7 verdict: "
+        f"{'Agent 7' if policy.config.racing_line_features else 'Agent 8'} verdict: "
         f"median={summary_record['median_distance_m']:.1f}m, "
         f"minimum={summary_record['minimum_distance_m']:.1f}m, "
         f"maximum={summary_record['maximum_distance_m']:.1f}m, "

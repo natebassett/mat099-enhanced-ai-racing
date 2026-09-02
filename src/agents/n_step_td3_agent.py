@@ -9,16 +9,20 @@ import torch
 from n_step_td3.contracts import (
     ACTION_SIZE,
     ACTION_VERSION,
-    MODEL_FAMILY,
     OBSERVATION_SIZE,
-    OBSERVATION_VERSION,
     REWARD_VERSION,
     HistoryEncoder,
     build_base_observation,
     decode_action,
     finite_float,
 )
-from n_step_td3.learner import NstepTd3Config, load_actor_checkpoint
+from n_step_td3.learner import (
+    NstepTd3Config,
+    load_actor_checkpoint,
+    model_family_for_config,
+    observation_version_for_config,
+    reward_version_for_config,
+)
 from n_step_td3.networks import Actor
 from n_step_td3.racing_line import RacingLineFeatureMap, default_racing_line_path
 
@@ -49,6 +53,7 @@ class NstepTd3Agent:
     track_length_m = 2843.0934
     max_steps = 15_000
     target_laps = 1
+    default_model_candidates = DEFAULT_MODEL_CANDIDATES
 
     def __init__(
         self,
@@ -61,20 +66,39 @@ class NstepTd3Agent:
         racing_line_path: str | Path | None = None,
     ) -> None:
         self.seed = int(seed)
-        self.policy_path = Path(policy_path) if policy_path else default_model_path()
+        self.policy_path = (
+            Path(policy_path) if policy_path else self.default_model_path()
+        )
         self.device = torch.device(device)
-        self.racing_line_path = Path(
-            racing_line_path or DEFAULT_RACING_LINE_PATH
-        )
-        if not self.racing_line_path.is_file():
-            raise FileNotFoundError(
-                "Agent 7 requires the torcsRL-style racing-line features: "
-                f"{self.racing_line_path}"
+        if self.requires_racing_line:
+            self.racing_line_path = Path(
+                racing_line_path or DEFAULT_RACING_LINE_PATH
             )
-        self.racing_line = RacingLineFeatureMap.from_json(
-            self.racing_line_path
+            if not self.racing_line_path.is_file():
+                raise FileNotFoundError(
+                    f"{self.name} requires racing-line features: "
+                    f"{self.racing_line_path}"
+                )
+            self.racing_line = RacingLineFeatureMap.from_json(
+                self.racing_line_path
+            )
+            self.track_length_m = self.racing_line.track_length_m
+        else:
+            if racing_line_path is not None:
+                raise ValueError(
+                    f"{self.name} cannot accept a racing-line path"
+                )
+            self.racing_line_path = None
+            self.racing_line = None
+        self.policy_config = NstepTd3Config(
+            racing_line_features=self.requires_racing_line
         )
-        self.track_length_m = self.racing_line.track_length_m
+        self.model_family = model_family_for_config(self.policy_config)
+        self.observation_version = observation_version_for_config(
+            self.policy_config
+        )
+        self.action_version = ACTION_VERSION
+        self.reward_version = reward_version_for_config(self.policy_config)
         self.policy = policy
         self.policy_loaded = policy is not None
         if self.policy is None:
@@ -91,10 +115,10 @@ class NstepTd3Agent:
             policy_path = str(self.policy_path)
         return {
             "algorithm": "N-step TD3",
-            "model_family": MODEL_FAMILY,
-            "observation_version": OBSERVATION_VERSION,
-            "action_version": ACTION_VERSION,
-            "reward_version": REWARD_VERSION,
+            "model_family": self.model_family,
+            "observation_version": self.observation_version,
+            "action_version": self.action_version,
+            "reward_version": self.reward_version,
             "observation_size": OBSERVATION_SIZE,
             "action_size": ACTION_SIZE,
             "n_steps": 3,
@@ -104,9 +128,16 @@ class NstepTd3Agent:
             "teacher": None,
             "behaviour_cloning": False,
             "racing_line_imitation": False,
-            "racing_line_observation": True,
-            "racing_line_reward_shaping": True,
-            "racing_line_path": str(self.racing_line_path),
+            "racing_line_observation": self.requires_racing_line,
+            "racing_line_reward_shaping": bool(
+                self.requires_racing_line
+                and not self.policy_config.progress_reward
+            ),
+            "racing_line_path": (
+                None
+                if self.racing_line_path is None
+                else str(self.racing_line_path)
+            ),
             "automatic_gear_shift": True,
             "implementation": "independent_torcsrl_informed",
         }
@@ -145,10 +176,17 @@ class NstepTd3Agent:
                 telemetry,
                 previous_telemetry=self.previous_telemetry,
                 racing_line=self.racing_line,
+                include_racing_line_features=self.requires_racing_line,
             )
         )
         raw_action = np.clip(self._predict(observation), -1.0, 1.0)
-        controls = decode_action(raw_action, telemetry)
+        controls = decode_action(
+            raw_action,
+            telemetry,
+            physical_steering_limit=(
+                self.policy_config.physical_steering_limit
+            ),
+        )
         self.history.record_action(raw_action)
         self.last_raw_action = raw_action.copy()
         self.last_controls = dict(controls)
@@ -179,6 +217,7 @@ class NstepTd3Agent:
         return {
             "nstep_td3_policy_loaded": self.policy_loaded,
             "nstep_td3_raw_steer": float(self.last_raw_action[0]),
+            "nstep_td3_control_steer": float(self.last_controls["steer"]),
             "nstep_td3_raw_longitudinal": float(self.last_raw_action[1]),
         }
 
@@ -189,14 +228,23 @@ class NstepTd3Agent:
         if not self.policy_path.is_file():
             if require_policy:
                 raise FileNotFoundError(
-                    "Agent 7 model not found. Train N-Step TD3 first: "
+                    f"{self.name} model not found. Train it first: "
                     f"{self.policy_path}"
                 )
             return None
         checkpoint = load_actor_checkpoint(self.policy_path, device="cpu")
         config = NstepTd3Config(**checkpoint["config"])
+        if config.racing_line_features != self.requires_racing_line:
+            raise ValueError(
+                f"{self.name} checkpoint uses a different observation contract"
+            )
+        self.policy_config = config
+        self.model_family = str(checkpoint["model_family"])
+        self.observation_version = str(checkpoint["observation_version"])
+        self.action_version = str(checkpoint["action_version"])
+        self.reward_version = str(checkpoint.get("reward_version", REWARD_VERSION))
         if config.observation_size != OBSERVATION_SIZE:
-            raise ValueError("Agent 7 model uses a different observation size")
+            raise ValueError(f"{self.name} model uses a different observation size")
         actor = Actor(
             config.observation_size,
             config.action_size,
@@ -224,9 +272,13 @@ class NstepTd3Agent:
         action[: min(ACTION_SIZE, supplied.size)] = supplied[:ACTION_SIZE]
         return np.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
 
+    @classmethod
+    def default_model_path(cls) -> Path:
+        return next(
+            (path for path in cls.default_model_candidates if path.is_file()),
+            cls.default_model_candidates[0],
+        )
+
 
 def default_model_path() -> Path:
-    return next(
-        (path for path in DEFAULT_MODEL_CANDIDATES if path.is_file()),
-        DEFAULT_MODEL_CANDIDATES[0],
-    )
+    return NstepTd3Agent.default_model_path()

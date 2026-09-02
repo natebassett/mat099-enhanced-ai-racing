@@ -14,10 +14,19 @@ MODEL_FAMILY = "agent7_n_step_td3_racer"
 OBSERVATION_VERSION = "agent7_torcsrl_history_v3"
 ACTION_VERSION = "agent7_signed_steer_longitudinal_v1"
 REWARD_VERSION = "agent7_torcsrl_racing_line_velocity_v3"
+SENSOR_ONLY_MODEL_FAMILY = "agent8_sensor_n_step_td3_racer"
+SENSOR_ONLY_OBSERVATION_VERSION = "agent8_torcs_sensor_history_v1"
+SENSOR_ONLY_REWARD_VERSION = "agent8_centerline_velocity_v1"
 STEERING_RATE_REWARD_VERSION = (
     "agent7_torcsrl_racing_line_velocity_steering_rate_v4"
 )
+PACE_ACTION_VERSION = "agent7_bounded_steer_longitudinal_v5"
+PACE_REWARD_VERSION = "agent7_progress_per_interaction_v5"
 DEFAULT_STEERING_RATE_COST_COEFFICIENT = 0.0025
+DEFAULT_PACE_STEERING_LIMIT = 0.3
+PACE_FAILURE_PENALTY = -10.0
+PACE_LAP_COMPLETION_BONUS = 1_000.0
+MAX_ABSOLUTE_PROGRESS_PER_INTERACTION_M = 5.0
 
 MAX_SPEED_KMH = 250.0
 MAX_ACCELERATION_MPS2 = 50.0
@@ -94,6 +103,7 @@ def build_base_observation(
     *,
     previous_telemetry: Mapping[str, Any] | None = None,
     racing_line: RacingLineFeatureMap | None = None,
+    include_racing_line_features: bool = True,
 ) -> np.ndarray:
     speed = np.asarray(
         [
@@ -132,10 +142,24 @@ def build_base_observation(
         / MAX_WHEEL_SPIN
     ) * 2.0 - 1.0
 
-    if racing_line is None:
+    if not include_racing_line_features:
+        if racing_line is not None:
+            raise ValueError(
+                "sensor-only observations cannot accept a racing-line map"
+            )
+        racing_line_difference = np.zeros(1, dtype=np.float32)
+        lookahead_curvature = np.zeros(
+            LOOKAHEAD_DISTANCES_M.shape,
+            dtype=np.float32,
+        )
+    elif racing_line is None:
         target_track_position = 0.0
         lookahead_curvature = np.zeros(
             LOOKAHEAD_DISTANCES_M.shape,
+            dtype=np.float32,
+        )
+        racing_line_difference = np.asarray(
+            [finite_float(telemetry.get("trackPos")) / 2.0],
             dtype=np.float32,
         )
     else:
@@ -144,16 +168,16 @@ def build_base_observation(
         )
         target_track_position = line_sample.target_track_position
         lookahead_curvature = line_sample.lookahead_curvature
-    racing_line_difference = np.asarray(
-        [
-            (
-                finite_float(telemetry.get("trackPos"))
-                - target_track_position
-            )
-            / 2.0
-        ],
-        dtype=np.float32,
-    )
+        racing_line_difference = np.asarray(
+            [
+                (
+                    finite_float(telemetry.get("trackPos"))
+                    - target_track_position
+                )
+                / 2.0
+            ],
+            dtype=np.float32,
+        )
 
     observation = np.concatenate(
         (
@@ -319,7 +343,12 @@ def automatic_gear(gear: Any, rpm: Any) -> int:
 def decode_action(
     raw_action: np.ndarray,
     telemetry: Mapping[str, Any],
+    *,
+    physical_steering_limit: float = 1.0,
 ) -> dict[str, float | int]:
+    steering_limit = float(physical_steering_limit)
+    if not math.isfinite(steering_limit) or not 0.0 < steering_limit <= 1.0:
+        raise ValueError("physical steering limit must be finite and in (0, 1]")
     values = np.zeros(ACTION_SIZE, dtype=np.float32)
     supplied = np.asarray(raw_action, dtype=np.float32).reshape(-1)
     values[: min(ACTION_SIZE, supplied.size)] = supplied[:ACTION_SIZE]
@@ -327,7 +356,7 @@ def decode_action(
     values = np.clip(values, -1.0, 1.0)
     longitudinal = float(values[1])
     return {
-        "steer": float(values[0]),
+        "steer": float(values[0]) * steering_limit,
         "accel": max(0.0, longitudinal),
         "brake": max(0.0, -longitudinal),
         "gear": automatic_gear(
@@ -344,6 +373,8 @@ class RewardResult:
     racing_line_factor: float
     steering_rate_penalty: float
     terminal_penalty: float
+    progress_m: float = 0.0
+    lap_completion_bonus: float = 0.0
 
 
 def calculate_reward(
@@ -382,4 +413,33 @@ def calculate_reward(
         racing_line_factor=float(racing_line_factor),
         steering_rate_penalty=float(steering_rate_penalty),
         terminal_penalty=0.0,
+    )
+
+
+def calculate_progress_reward(
+    previous_distance_raced_m: Any,
+    current_distance_raced_m: Any,
+    *,
+    physical_failure: bool,
+    lap_completed: bool,
+) -> RewardResult:
+    """Return the minimal v5 pace objective in metres per interaction."""
+    progress_m = float(
+        np.clip(
+            finite_float(current_distance_raced_m)
+            - finite_float(previous_distance_raced_m),
+            -MAX_ABSOLUTE_PROGRESS_PER_INTERACTION_M,
+            MAX_ABSOLUTE_PROGRESS_PER_INTERACTION_M,
+        )
+    )
+    terminal_penalty = PACE_FAILURE_PENALTY if physical_failure else 0.0
+    lap_bonus = PACE_LAP_COMPLETION_BONUS if lap_completed else 0.0
+    return RewardResult(
+        total=progress_m + terminal_penalty + lap_bonus,
+        forward_velocity=0.0,
+        racing_line_factor=0.0,
+        steering_rate_penalty=0.0,
+        terminal_penalty=terminal_penalty,
+        progress_m=progress_m,
+        lap_completion_bonus=lap_bonus,
     )

@@ -110,12 +110,14 @@ def discover_agents() -> list[AgentOption]:
     from agents.rule_based_agent import RuleBasedAgent
     from agents.td3_agent import Td3ScratchAgent
     from agents.n_step_td3_agent import NstepTd3Agent
+    from agents.sensor_n_step_td3_agent import SensorNstepTd3Agent
 
     return [
         _agent_option(DynaQLearningAgent),
         _agent_option(DynaQFinalisedAgent),
         _agent_option(Td3ScratchAgent),
         _agent_option(NstepTd3Agent),
+        _agent_option(SensorNstepTd3Agent),
         _agent_option(MapAwareAgent),
         _agent_option(RuleBasedAgent),
         _agent_option(RandomAgent),

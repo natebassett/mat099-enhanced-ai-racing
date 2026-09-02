@@ -18,7 +18,12 @@ from .contracts import (
     MODEL_FAMILY,
     OBSERVATION_SIZE,
     OBSERVATION_VERSION,
+    PACE_ACTION_VERSION,
+    PACE_REWARD_VERSION,
     REWARD_VERSION,
+    SENSOR_ONLY_MODEL_FAMILY,
+    SENSOR_ONLY_OBSERVATION_VERSION,
+    SENSOR_ONLY_REWARD_VERSION,
     STEERING_RATE_REWARD_VERSION,
 )
 from .networks import Actor, TwinCritic
@@ -58,6 +63,9 @@ class NstepTd3Config:
     policy_delay: int = 2
     gradient_steps_per_interaction: int = 1
     steering_rate_cost_coefficient: float = 0.0
+    physical_steering_limit: float = 1.0
+    progress_reward: bool = False
+    racing_line_features: bool = True
     seed: int = 0
 
     def validate(self) -> None:
@@ -91,6 +99,60 @@ class NstepTd3Config:
             raise ValueError(
                 "steering-rate cost coefficient must be finite and non-negative"
             )
+        if (
+            not math.isfinite(self.physical_steering_limit)
+            or not 0.0 < self.physical_steering_limit <= 1.0
+        ):
+            raise ValueError(
+                "physical steering limit must be finite and in (0, 1]"
+            )
+        if self.progress_reward and self.steering_rate_cost_coefficient > 0.0:
+            raise ValueError(
+                "progress reward cannot be combined with steering-rate shaping"
+            )
+        if self.progress_reward and self.physical_steering_limit >= 1.0:
+            raise ValueError("progress reward requires bounded physical steering")
+        if not self.racing_line_features and self.progress_reward:
+            raise ValueError(
+                "sensor-only training uses the centreline velocity reward"
+            )
+        if (
+            not self.racing_line_features
+            and self.steering_rate_cost_coefficient > 0.0
+        ):
+            raise ValueError(
+                "sensor-only training does not use racing-line fine-tuning modes"
+            )
+
+
+def model_family_for_config(config: NstepTd3Config) -> str:
+    return MODEL_FAMILY if config.racing_line_features else SENSOR_ONLY_MODEL_FAMILY
+
+
+def observation_version_for_config(config: NstepTd3Config) -> str:
+    return (
+        OBSERVATION_VERSION
+        if config.racing_line_features
+        else SENSOR_ONLY_OBSERVATION_VERSION
+    )
+
+
+def action_version_for_config(config: NstepTd3Config) -> str:
+    return (
+        PACE_ACTION_VERSION
+        if config.physical_steering_limit < 1.0
+        else ACTION_VERSION
+    )
+
+
+def reward_version_for_config(config: NstepTd3Config) -> str:
+    if not config.racing_line_features:
+        return SENSOR_ONLY_REWARD_VERSION
+    if config.progress_reward:
+        return PACE_REWARD_VERSION
+    if config.steering_rate_cost_coefficient > 0.0:
+        return STEERING_RATE_REWARD_VERSION
+    return REWARD_VERSION
 
 
 @dataclass(frozen=True)
@@ -128,11 +190,10 @@ class NstepTd3Learner:
     ) -> None:
         config.validate()
         self.config = config
-        self.reward_version = (
-            STEERING_RATE_REWARD_VERSION
-            if config.steering_rate_cost_coefficient > 0.0
-            else REWARD_VERSION
-        )
+        self.model_family = model_family_for_config(config)
+        self.observation_version = observation_version_for_config(config)
+        self.action_version = action_version_for_config(config)
+        self.reward_version = reward_version_for_config(config)
         self.device = (
             resolve_device(device) if isinstance(device, str) else device
         )
@@ -374,9 +435,9 @@ class NstepTd3Learner:
     def checkpoint(self) -> dict[str, Any]:
         return {
             "checkpoint_version": CHECKPOINT_VERSION,
-            "model_family": MODEL_FAMILY,
-            "observation_version": OBSERVATION_VERSION,
-            "action_version": ACTION_VERSION,
+            "model_family": self.model_family,
+            "observation_version": self.observation_version,
+            "action_version": self.action_version,
             "reward_version": self.reward_version,
             "config": asdict(self.config),
             "actor": self.actor.state_dict(),
@@ -457,6 +518,15 @@ class NstepTd3Learner:
         """Initialize a fresh learner from actor parameters only."""
         checkpoint = load_actor_checkpoint(path, device="cpu")
         source_config = NstepTd3Config(**checkpoint["config"])
+        if checkpoint.get("model_family") != model_family_for_config(config):
+            raise ValueError("actor transfer requires the same model family")
+        if (
+            checkpoint.get("observation_version")
+            != observation_version_for_config(config)
+        ):
+            raise ValueError("actor transfer requires the same observation contract")
+        if checkpoint.get("action_version") != action_version_for_config(config):
+            raise ValueError("actor transfer requires the same action contract")
         source_architecture = (
             source_config.observation_size,
             source_config.action_size,
@@ -568,16 +638,14 @@ def load_checkpoint(
     raw_config = checkpoint.get("config")
     if not isinstance(raw_config, Mapping):
         raise ValueError("Agent 7 checkpoint is missing its configuration")
-    coefficient = float(raw_config.get("steering_rate_cost_coefficient", 0.0))
-    expected_reward_version = (
-        STEERING_RATE_REWARD_VERSION if coefficient > 0.0 else REWARD_VERSION
-    )
+    config = NstepTd3Config(**raw_config)
+    config.validate()
     expected = {
         "checkpoint_version": CHECKPOINT_VERSION,
-        "model_family": MODEL_FAMILY,
-        "observation_version": OBSERVATION_VERSION,
-        "action_version": ACTION_VERSION,
-        "reward_version": expected_reward_version,
+        "model_family": model_family_for_config(config),
+        "observation_version": observation_version_for_config(config),
+        "action_version": action_version_for_config(config),
+        "reward_version": reward_version_for_config(config),
     }
     mismatches = [
         name for name, value in expected.items() if checkpoint.get(name) != value
@@ -603,23 +671,29 @@ def load_actor_checkpoint(
     if not isinstance(checkpoint, dict):
         raise ValueError("invalid Agent 7 checkpoint payload")
 
+    raw_config = checkpoint.get("config")
+    if not isinstance(raw_config, Mapping):
+        raise ValueError("Agent 7 checkpoint is missing its configuration")
+    config = NstepTd3Config(**raw_config)
+    config.validate()
+
     mismatches: list[str] = []
-    if checkpoint.get("model_family") != MODEL_FAMILY:
+    if checkpoint.get("model_family") != model_family_for_config(config):
         mismatches.append("model_family")
-    if checkpoint.get("action_version") != ACTION_VERSION:
+    if checkpoint.get("action_version") != action_version_for_config(config):
         mismatches.append("action_version")
-    if checkpoint.get("observation_version") not in (
+    compatible_observation_versions = (
         ACTOR_COMPATIBLE_OBSERVATION_VERSIONS
-    ):
+        if config.racing_line_features
+        else frozenset({SENSOR_ONLY_OBSERVATION_VERSION})
+    )
+    if checkpoint.get("observation_version") not in compatible_observation_versions:
         mismatches.append("observation_version")
     if mismatches:
         raise ValueError(
             "Agent 7 actor contract mismatch: " + ", ".join(mismatches)
         )
 
-    raw_config = checkpoint.get("config")
-    if not isinstance(raw_config, Mapping):
-        raise ValueError("Agent 7 checkpoint is missing its configuration")
     if int(raw_config.get("observation_size", -1)) != OBSERVATION_SIZE:
         raise ValueError("Agent 7 actor uses a different observation size")
     if int(raw_config.get("action_size", -1)) != ACTION_SIZE:

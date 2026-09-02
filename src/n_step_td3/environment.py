@@ -20,12 +20,18 @@ from .contracts import (
     HistoryEncoder,
     apply_observation_noise,
     build_base_observation,
+    calculate_progress_reward,
     calculate_reward,
     decode_action,
     finite_float,
     track_sensors,
 )
-from .racing_line import RacingLineFeatureMap, default_racing_line_path
+from .racing_line import (
+    LOOKAHEAD_DISTANCES_M,
+    RacingLineFeatureMap,
+    RacingLineSample,
+    default_racing_line_path,
+)
 
 
 G_TRACK_3_LENGTH_METRES = 2843.0934
@@ -59,7 +65,7 @@ class EpisodeSummary:
 
 
 class NstepTorcsEnvironment:
-    """Small TORCS boundary dedicated to Agent 7 training and evaluation."""
+    """Small TORCS boundary for the N-step TD3 racing policies."""
 
     track_length_m = G_TRACK_3_LENGTH_METRES
     target_laps = 1
@@ -76,6 +82,9 @@ class NstepTorcsEnvironment:
         racing_line_path: str | Path | None = None,
         racing_line: RacingLineFeatureMap | None = None,
         steering_rate_cost_coefficient: float = 0.0,
+        physical_steering_limit: float = 1.0,
+        progress_reward: bool = False,
+        racing_line_features: bool = True,
         runner: TorcsRunner | None = None,
     ) -> None:
         if max_episode_steps < 1:
@@ -89,6 +98,17 @@ class NstepTorcsEnvironment:
             raise ValueError(
                 "steering-rate cost coefficient must be finite and non-negative"
             )
+        if (
+            not math.isfinite(physical_steering_limit)
+            or not 0.0 < physical_steering_limit <= 1.0
+        ):
+            raise ValueError(
+                "physical steering limit must be finite and in (0, 1]"
+            )
+        if progress_reward and steering_rate_cost_coefficient > 0.0:
+            raise ValueError(
+                "progress reward cannot be combined with steering-rate shaping"
+            )
         self.track_name = str(track_name)
         self.max_episode_steps = int(max_episode_steps)
         self.manual_start = bool(manual_start)
@@ -97,13 +117,24 @@ class NstepTorcsEnvironment:
         self.steering_rate_cost_coefficient = float(
             steering_rate_cost_coefficient
         )
+        self.physical_steering_limit = float(physical_steering_limit)
+        self.progress_reward = bool(progress_reward)
+        self.racing_line_features = bool(racing_line_features)
         self._observation_random = np.random.default_rng(seed)
         if runner is None:
             from runner.torcs_runner import TorcsRunner
 
             runner = TorcsRunner()
         self.runner = runner
-        if racing_line is None:
+        if not self.racing_line_features:
+            if racing_line is not None or racing_line_path is not None:
+                raise ValueError(
+                    "sensor-only TD3 cannot load a racing-line map"
+                )
+            self.racing_line_path = None
+            self.racing_line = None
+            self.track_length_m = G_TRACK_3_LENGTH_METRES
+        elif racing_line is None:
             source = (
                 Path(racing_line_path)
                 if racing_line_path is not None
@@ -111,17 +142,19 @@ class NstepTorcsEnvironment:
             )
             if not source.is_file():
                 raise FileNotFoundError(
-                    "Agent 7 mirrors torcsRL and requires a racing-line file: "
+                    "line-aware N-step TD3 requires a racing-line file: "
                     f"{source}"
                 )
             racing_line = RacingLineFeatureMap.from_json(source)
             self.racing_line_path = source
+            self.racing_line = racing_line
+            self.track_length_m = racing_line.track_length_m
         else:
             self.racing_line_path = (
                 None if racing_line_path is None else Path(racing_line_path)
             )
-        self.racing_line = racing_line
-        self.track_length_m = racing_line.track_length_m
+            self.racing_line = racing_line
+            self.track_length_m = racing_line.track_length_m
         self.history = HistoryEncoder()
         self.episode = 0
         self.current_telemetry: dict[str, Any] | None = None
@@ -166,20 +199,32 @@ class NstepTorcsEnvironment:
         observation = self.history.reset(self._base_observation(telemetry))
         return observation, {"episode": self.episode, "track": self.track_name}
 
+    def set_observation_noise_std(self, value: float) -> None:
+        """Select the normalized-observation noise profile for the next reset."""
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(
+                "observation noise level must be finite and non-negative"
+            )
+        self.observation_noise_std = float(value)
+
     def step(
         self,
         raw_action: np.ndarray,
     ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         if self.current_telemetry is None or self.runner.env is None:
-            raise RuntimeError("reset the Agent 7 environment before stepping")
+            raise RuntimeError("reset the N-step TD3 environment before stepping")
         if self.lap_tracker is None or self.initial_telemetry is None:
             raise RuntimeError("episode tracking was not initialised")
 
         action_values = np.asarray(raw_action, dtype=np.float32).reshape(-1)[:2]
         if action_values.shape != (2,):
-            raise ValueError("Agent 7 expects [steer, signed longitudinal]")
+            raise ValueError("N-step TD3 expects [steer, signed longitudinal]")
         action_values = np.clip(action_values, -1.0, 1.0)
-        controls = decode_action(action_values, self.current_telemetry)
+        controls = decode_action(
+            action_values,
+            self.current_telemetry,
+            physical_steering_limit=self.physical_steering_limit,
+        )
         raw_observation, _runner_reward, server_stopped, _ = (
             self.runner._step_full_control_agent(controls)
         )
@@ -218,19 +263,37 @@ class NstepTorcsEnvironment:
             or self.steps >= self.max_episode_steps
             or (server_stopped and not physical_failure)
         )
-        line_sample = self.racing_line.sample(
-            finite_float(telemetry.get("distFromStart"))
+        line_sample = (
+            self.racing_line.sample(
+                finite_float(telemetry.get("distFromStart"))
+            )
+            if self.racing_line is not None
+            else RacingLineSample(
+                target_track_position=0.0,
+                lookahead_curvature=np.zeros(
+                    LOOKAHEAD_DISTANCES_M.shape,
+                    dtype=np.float32,
+                ),
+            )
         )
-        reward_result = calculate_reward(
-            telemetry,
-            physical_failure=physical_failure,
-            target_track_position=line_sample.target_track_position,
-            previous_steer=self.previous_steer,
-            current_steer=float(action_values[0]),
-            steering_rate_cost_coefficient=(
-                self.steering_rate_cost_coefficient
-            ),
-        )
+        if self.progress_reward:
+            reward_result = calculate_progress_reward(
+                self.current_telemetry.get("distRaced"),
+                telemetry.get("distRaced"),
+                physical_failure=physical_failure,
+                lap_completed=completed_lap is not None,
+            )
+        else:
+            reward_result = calculate_reward(
+                telemetry,
+                physical_failure=physical_failure,
+                target_track_position=line_sample.target_track_position,
+                previous_steer=self.previous_steer,
+                current_steer=float(action_values[0]),
+                steering_rate_cost_coefficient=(
+                    self.steering_rate_cost_coefficient
+                ),
+            )
         steering_delta = float(action_values[0]) - self.previous_steer
 
         self.history.record_action(action_values)
@@ -282,6 +345,7 @@ class NstepTorcsEnvironment:
             "track_position": track_position,
             "minimum_track_sensor_m": float(road.min()),
             "raw_steer": float(action_values[0]),
+            "control_steer": float(controls["steer"]),
             "raw_longitudinal": float(action_values[1]),
             "control_accel": float(controls["accel"]),
             "control_brake": float(controls["brake"]),
@@ -300,6 +364,10 @@ class NstepTorcsEnvironment:
                 reward_result.steering_rate_penalty
             ),
             "reward_terminal_penalty": reward_result.terminal_penalty,
+            "reward_progress_m": reward_result.progress_m,
+            "reward_lap_completion_bonus": (
+                reward_result.lap_completion_bonus
+            ),
             "steering_delta": steering_delta,
             "target_track_position": line_sample.target_track_position,
             "racing_line_error": (
@@ -335,12 +403,17 @@ class NstepTorcsEnvironment:
             telemetry,
             previous_telemetry=previous_telemetry,
             racing_line=self.racing_line,
+            include_racing_line_features=self.racing_line_features,
         )
-        return apply_observation_noise(
+        noisy_observation = apply_observation_noise(
             observation,
             rng=self._observation_random,
             level=self.observation_noise_std,
         )
+        if not self.racing_line_features:
+            masked_feature_count = 1 + LOOKAHEAD_DISTANCES_M.size
+            noisy_observation[-masked_feature_count:] = 0.0
+        return noisy_observation
 
     def close(self) -> None:
         self._close_client()
@@ -368,11 +441,11 @@ class NstepTorcsEnvironment:
                     self.runner.shutdown()
                 if attempt < self.reset_retries:
                     print(
-                        "Agent 7 TORCS connection failed; retrying "
+                        "N-step TD3 TORCS connection failed; retrying "
                         f"[{attempt + 2}/{self.reset_retries + 1}]..."
                     )
                     time.sleep(1.0)
-        raise RuntimeError("Agent 7 could not launch/connect to TORCS") from last_error
+        raise RuntimeError("N-step TD3 could not launch/connect to TORCS") from last_error
 
     def _reset_client(self) -> None:
         last_error: Exception | None = None
@@ -391,7 +464,7 @@ class NstepTorcsEnvironment:
                     self._restart_torcs()
                 if attempt < self.reset_retries:
                     time.sleep(1.0)
-        raise RuntimeError("Agent 7 could not reset TORCS") from last_error
+        raise RuntimeError("N-step TD3 could not reset TORCS") from last_error
 
     def _restart_torcs(self) -> None:
         self._close_client()

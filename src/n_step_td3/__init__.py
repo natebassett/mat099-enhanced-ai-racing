@@ -1,4 +1,4 @@
-"""Independent N-step TD3 implementation for Agent 7."""
+"""Shared N-step TD3 core for the line-aware and sensor-only racers."""
 
 from .contracts import (
     ACTION_SIZE,
