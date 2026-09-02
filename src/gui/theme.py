@@ -119,6 +119,24 @@ def build_stylesheet(palette: ThemePalette = LIGHT_THEME) -> str:
         font-size: 11px;
         font-weight: 600;
     }}
+    QLabel#overviewResultTitle {{
+        color: {palette.text};
+        font-size: 17px;
+        font-weight: 700;
+    }}
+    QLabel#overviewAgentName {{
+        color: {palette.text};
+        font-weight: 600;
+    }}
+    QLabel#resultsInsight {{
+        color: {palette.text};
+        background-color: {palette.surface_alt};
+        border-left: 3px solid {palette.accent};
+        padding: 9px 11px;
+    }}
+    QLabel#resultsWarning {{
+        color: {palette.warning};
+    }}
     QLabel#statusLabel {{
         color: {palette.muted};
         font-weight: 600;

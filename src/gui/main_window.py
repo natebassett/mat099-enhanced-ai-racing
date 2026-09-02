@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 import pyqtgraph as pg
@@ -60,6 +61,7 @@ try:
     from .navigation import PrimaryNavigation
     from .learning_visualizer import LearningVisualizerPanel
     from .race_worker import RaceWorker
+    from .results_view import ResultsView
     from .racing_line_model import (
         RacingLineProfile,
         RacingLineVisualProfile,
@@ -109,6 +111,7 @@ except ImportError:
     from navigation import PrimaryNavigation
     from learning_visualizer import LearningVisualizerPanel
     from race_worker import RaceWorker
+    from results_view import ResultsView
     from racing_line_model import (
         RacingLineProfile,
         RacingLineVisualProfile,
@@ -177,6 +180,7 @@ class MainWindow(QMainWindow):
         self.run_history_table = QTableWidget(0, 8)
         self.run_history_source_label = QLabel()
         self.tabs: PrimaryNavigation | None = None
+        self.results_tab_index = 0
         self.review_tab_index = 0
         self.compare_tab_index = 0
         self.agents_tab_index = 0
@@ -225,6 +229,7 @@ class MainWindow(QMainWindow):
         self.agent_education_failure_box = QTextEdit()
         self.agent_education_tracks_box = QTextEdit()
         self.learning_visualizer = LearningVisualizerPanel()
+        self.results_view = ResultsView(Path(__file__).resolve().parents[2])
         self.agent_pipeline_labels: list[QLabel] = []
         self.racing_line_track_combo = QComboBox()
         self.racing_line_play_button = QPushButton("Play")
@@ -441,6 +446,11 @@ class MainWindow(QMainWindow):
             self._build_run_history_tab(),
             "Runs",
             "Browse saved race runs",
+        )
+        self.results_tab_index = self.tabs.addTab(
+            self.results_view,
+            "Results",
+            "Inspect evaluation evidence and learning progress",
         )
         self.review_tab_index = self.tabs.addTab(
             self._build_review_tab(),
