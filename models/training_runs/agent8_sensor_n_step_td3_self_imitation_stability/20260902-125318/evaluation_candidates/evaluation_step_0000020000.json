@@ -1,0 +1,12 @@
+{
+  "checkpoint": "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\training_runs\\agent8_sensor_n_step_td3_self_imitation_stability\\20260902-125318\\evaluation_candidates\\evaluation_step_0000020000.pt",
+  "global_step": 20000,
+  "mode": "evaluation",
+  "cold_start_each_rollout": true,
+  "completion_rate": 0.1,
+  "median_lap_time_seconds": 83.524,
+  "fastest_lap_time_seconds": 83.524,
+  "median_distance_m": 2051.2250000000004,
+  "minimum_distance_m": 2031.21,
+  "maximum_distance_m": 2944.22
+}

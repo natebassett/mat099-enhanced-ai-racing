@@ -1,0 +1,7 @@
+mode,policy_controlled,global_step,episode,steps,reward,distance_m,max_speed_kmh,average_speed_kmh,off_track_steps,damage_delta,laps_completed,best_lap_time_seconds,termination_reason
+replay_warmup,True,70268,1,9195,1364.6827651413894,2943.26,74.7132,55.3763661547035,0,0.0,1,190.756,lap_completed
+training,True,72262,2,2801,405.1958119886303,947.387,86.7764,59.13714116571586,1,0.0,0,,off_track
+training,True,74494,3,2232,257.0583792967441,799.554,84.9032,62.2778026799596,1,0.0,0,,off_track
+evaluation,True,75268,5,561,67.3391986541886,160.47,79.7296,49.47744820545451,1,0.0,0,,off_track
+evaluation,True,75268,6,2888,446.37520086604246,990.988,92.2467,59.76224825251378,1,0.0,0,,off_track
+evaluation,True,75268,7,5329,841.7519075171575,2035.7,88.694,64.80780342902214,1,0.0,0,,off_track
