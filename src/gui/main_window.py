@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSplitter,
     QSlider,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -76,6 +77,7 @@ try:
         summarize_run_explanation,
     )
     from .track_view import RoadSensorWidget, TrackPositionWidget
+    from .theme import LIGHT_THEME
 except ImportError:
     from agent_education_model import (
         AgentEducationProfile,
@@ -122,6 +124,7 @@ except ImportError:
         summarize_run_explanation,
     )
     from track_view import RoadSensorWidget, TrackPositionWidget
+    from theme import LIGHT_THEME
 
 
 @dataclass(frozen=True)
@@ -138,7 +141,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Enhanced AI Racing Telemetry Dashboard")
-        self.resize(1280, 760)
+        self.resize(1440, 860)
+        self.setMinimumSize(1120, 700)
 
         self.project_options: ProjectOptions = load_project_options()
 
@@ -285,6 +289,21 @@ class MainWindow(QMainWindow):
         self._update_dyna_q_panel_visibility()
 
     def _configure_controls(self) -> None:
+        for combo in (
+            self.agent_combo,
+            self.track_combo,
+            self.car_combo,
+            self.agent_education_combo,
+            self.racing_line_track_combo,
+            self.compare_track_combo,
+            self.compare_run_a_combo,
+            self.compare_run_b_combo,
+        ):
+            combo.setSizeAdjustPolicy(
+                QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+            )
+            combo.setMinimumContentsLength(16)
+
         self._populate_combo(self.agent_combo, self.project_options.agents)
         self._populate_combo(self.agent_education_combo, self.project_options.agents)
         self._populate_racing_line_tracks()
@@ -293,6 +312,16 @@ class MainWindow(QMainWindow):
         self._select_combo_item(self.car_combo, "car_id", "car1-ow1")
 
         self.stop_button.setEnabled(False)
+        self.start_button.setProperty("primary", True)
+        self.stop_button.setProperty("danger", True)
+        self.start_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
+        )
+        self.stop_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop)
+        )
+        self.start_button.setToolTip("Start the selected TORCS race")
+        self.stop_button.setToolTip("Stop the active race safely")
         self.status_label.setObjectName("statusLabel")
 
         self.explanation_status_label.setObjectName("explanationStatus")
@@ -392,6 +421,8 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.tabs = QTabWidget()
+        self.tabs.setObjectName("primaryNavigation")
+        self.tabs.setDocumentMode(True)
         self.tabs.addTab(self._build_dashboard_tab(), "Dashboard")
         self.tabs.addTab(self._build_run_history_tab(), "Run History")
         self.review_tab_index = self.tabs.addTab(self._build_review_tab(), "Review")
@@ -404,6 +435,8 @@ class MainWindow(QMainWindow):
     def _build_dashboard_tab(self) -> QWidget:
         page = QWidget()
         layout = QHBoxLayout(page)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_control_panel())
@@ -612,6 +645,8 @@ class MainWindow(QMainWindow):
     def _build_run_history_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
 
         title = QLabel("Run History")
         title.setFont(_section_font())
@@ -647,6 +682,7 @@ class MainWindow(QMainWindow):
     def _build_review_tab(self) -> QWidget:
         page = QWidget()
         layout = QHBoxLayout(page)
+        layout.setContentsMargins(18, 18, 18, 18)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_review_replay_panel())
@@ -775,6 +811,7 @@ class MainWindow(QMainWindow):
     def _build_compare_tab(self) -> QWidget:
         page = QWidget()
         layout = QHBoxLayout(page)
+        layout.setContentsMargins(18, 18, 18, 18)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_compare_replay_panel())
@@ -902,6 +939,7 @@ class MainWindow(QMainWindow):
     def _build_agents_tab(self) -> QWidget:
         page = QWidget()
         layout = QHBoxLayout(page)
+        layout.setContentsMargins(18, 18, 18, 18)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_agent_education_left_panel())
@@ -1070,7 +1108,7 @@ class MainWindow(QMainWindow):
 
     def _metric_card(self, metric: MetricSpec) -> QFrame:
         card = QFrame()
-        card.setFrameShape(QFrame.StyledPanel)
+        card.setProperty("metricCard", True)
         card.setMinimumHeight(82)
 
         layout = QVBoxLayout(card)
@@ -1088,7 +1126,7 @@ class MainWindow(QMainWindow):
 
     def _review_metric_card(self, metric: MetricSpec) -> QFrame:
         card = QFrame()
-        card.setFrameShape(QFrame.StyledPanel)
+        card.setProperty("metricCard", True)
         card.setMinimumHeight(72)
 
         layout = QVBoxLayout(card)
@@ -1107,10 +1145,14 @@ class MainWindow(QMainWindow):
     def _build_plot(self, title: str, left_axis_label: str) -> pg.PlotWidget:
         plot = pg.PlotWidget()
         plot.setTitle(title)
-        plot.setBackground("w")
+        plot.setBackground(LIGHT_THEME.plot_background())
         plot.setLabel("left", left_axis_label)
         plot.setLabel("bottom", "lap time", units="s")
         plot.showGrid(x=True, y=True, alpha=0.25)
+        for axis_name in ("left", "bottom"):
+            axis = plot.getAxis(axis_name)
+            axis.setTextPen(LIGHT_THEME.muted)
+            axis.setPen(LIGHT_THEME.border_strong)
         plot.hideButtons()
         plot.setMenuEnabled(False)
         plot.setMouseEnabled(x=False, y=False)
