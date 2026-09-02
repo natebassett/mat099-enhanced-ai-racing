@@ -1,0 +1,55 @@
+{
+  "policy_path": "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\agent7_n_step_td3\\best_evaluation.pt",
+  "track": "g-track-3",
+  "deterministic": true,
+  "repeats": 3,
+  "median_distance_m": 367.861,
+  "minimum_distance_m": 363.503,
+  "maximum_distance_m": 369.502,
+  "mean_reward": 208.37662612682968,
+  "completed_laps": 0,
+  "episodes": [
+    {
+      "repeat": 1,
+      "episode": 1,
+      "steps": 543,
+      "reward": 206.61293381160272,
+      "distance_m": 363.503,
+      "max_speed_kmh": 204.941,
+      "average_speed_kmh": 113.63559147734817,
+      "off_track_steps": 1,
+      "damage_delta": 0.0,
+      "laps_completed": 0,
+      "best_lap_time_seconds": null,
+      "termination_reason": "off_track"
+    },
+    {
+      "repeat": 2,
+      "episode": 2,
+      "steps": 549,
+      "reward": 208.0806477423162,
+      "distance_m": 367.861,
+      "max_speed_kmh": 204.083,
+      "average_speed_kmh": 113.76910621712204,
+      "off_track_steps": 1,
+      "damage_delta": 0.0,
+      "laps_completed": 0,
+      "best_lap_time_seconds": null,
+      "termination_reason": "off_track"
+    },
+    {
+      "repeat": 3,
+      "episode": 3,
+      "steps": 550,
+      "reward": 210.4362968265701,
+      "distance_m": 369.502,
+      "max_speed_kmh": 204.839,
+      "average_speed_kmh": 114.01157945127271,
+      "off_track_steps": 1,
+      "damage_delta": 0.0,
+      "laps_completed": 0,
+      "best_lap_time_seconds": null,
+      "termination_reason": "off_track"
+    }
+  ]
+}

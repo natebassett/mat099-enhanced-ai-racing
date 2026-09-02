@@ -1,0 +1,11 @@
+policy_path,repeat,seed,reason,steps,laps,best_lap_seconds,progress_m,total_score,max_speed_kmh,average_speed_kmh,off_track_steps
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,1,4269337120,wrong direction,2272,0,,1093.92,185336.4729135479,128.337,81.84203827068653,30
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,2,1163809559,car stuck,3617,0,,1421.36,246177.02051620747,118.31,68.12742015758903,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,3,3105478518,car stuck,3621,0,,1417.98,245366.70605253126,120.511,67.82870548163503,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,4,760316424,car stuck,1716,0,,510.94,86174.06015588055,119.59600000000002,50.25609939025634,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,5,3304760160,out of bounds,801,0,,324.339,56094.02999531923,122.188,70.90609212858926,8
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v5_robust.zip,1,4269337120,car stuck,1688,0,,509.007,85673.62690957158,122.078,50.79053772926548,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v5_robust.zip,2,1163809559,car stuck,1703,0,,496.646,83313.50215255769,117.41999999999999,48.9607233810334,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v5_robust.zip,3,3105478518,car stuck,1746,0,,517.907,87385.29447308238,122.412,50.08444504244002,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v5_robust.zip,4,760316424,car stuck,3690,0,,1415.27,244684.10533483964,119.64300000000001,66.37856079701898,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v5_robust.zip,5,3304760160,car stuck,3874,0,,1421.82,244613.63496120117,120.852,63.20516488564781,0

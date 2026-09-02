@@ -1,0 +1,39 @@
+{
+  "policy_path": "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\agent7_n_step_td3_v3\\best_evaluation.pt",
+  "track": "g-track-3",
+  "observation_version": "agent7_torcsrl_history_v3",
+  "action_version": "agent7_signed_steer_longitudinal_v1",
+  "reward_version": "agent7_torcsrl_racing_line_velocity_v3",
+  "deterministic": true,
+  "repeats": 1,
+  "median_distance_m": 2942.97,
+  "minimum_distance_m": 2942.97,
+  "maximum_distance_m": 2942.97,
+  "mean_reward": 1495.6516876457151,
+  "completed_laps": 1,
+  "completion_rate": 1.0,
+  "median_lap_time_seconds": 105.038,
+  "fastest_lap_time_seconds": 105.038,
+  "episodes": [
+    {
+      "repeat": 1,
+      "episode": 1,
+      "steps": 5014,
+      "reward": 1495.6516876457151,
+      "distance_m": 2942.97,
+      "max_speed_kmh": 122.889,
+      "average_speed_kmh": 98.76792207736324,
+      "off_track_steps": 0,
+      "damage_delta": 0.0,
+      "laps_completed": 1,
+      "best_lap_time_seconds": 105.038,
+      "termination_reason": "lap_completed"
+    }
+  ],
+  "trace_distance_range_m": [
+    2350.0,
+    2850.0
+  ],
+  "trace_rows": 788,
+  "trace_csv": "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\data\\evaluation\\agent7_n_step_td3_v3\\n_step_td3_trace_20260830-202819.csv"
+}

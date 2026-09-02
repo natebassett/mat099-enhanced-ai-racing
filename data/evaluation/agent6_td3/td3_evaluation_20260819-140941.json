@@ -1,0 +1,370 @@
+{
+  "episodes": {
+    "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\agent6_td3_lr_decay_v1_best_distance.zip": [
+      {
+        "average_speed_kmh": 78.66500591308666,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 148.935,
+        "off_track_steps": 42,
+        "progress_m": 1859.65,
+        "reason": "car stuck",
+        "repeat": 1,
+        "steps": 4027,
+        "total_score": 316102.6081045935
+      },
+      {
+        "average_speed_kmh": 78.66500591308666,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 148.935,
+        "off_track_steps": 42,
+        "progress_m": 1859.65,
+        "reason": "car stuck",
+        "repeat": 2,
+        "steps": 4027,
+        "total_score": 316102.6081045935
+      },
+      {
+        "average_speed_kmh": 78.66500591308666,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 148.935,
+        "off_track_steps": 42,
+        "progress_m": 1859.65,
+        "reason": "car stuck",
+        "repeat": 3,
+        "steps": 4027,
+        "total_score": 316102.6081045935
+      }
+    ],
+    "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\checkpoints\\agent6_td3_lr_decay_v1\\agent6_td3_scratch_100000_steps.zip": [
+      {
+        "average_speed_kmh": 37.972696572550056,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 103.055,
+        "off_track_steps": 0,
+        "progress_m": 183.417,
+        "reason": "car stuck",
+        "repeat": 1,
+        "steps": 800,
+        "total_score": 30281.760609812176
+      },
+      {
+        "average_speed_kmh": 37.972696572550056,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 103.055,
+        "off_track_steps": 0,
+        "progress_m": 183.417,
+        "reason": "car stuck",
+        "repeat": 2,
+        "steps": 800,
+        "total_score": 30281.760609812176
+      },
+      {
+        "average_speed_kmh": 37.972696572550056,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 103.055,
+        "off_track_steps": 0,
+        "progress_m": 183.417,
+        "reason": "car stuck",
+        "repeat": 3,
+        "steps": 800,
+        "total_score": 30281.760609812176
+      }
+    ],
+    "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\checkpoints\\agent6_td3_lr_decay_v1\\agent6_td3_scratch_125000_steps.zip": [
+      {
+        "average_speed_kmh": 40.91545492824507,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 113.257,
+        "off_track_steps": 18,
+        "progress_m": 237.412,
+        "reason": "wrong direction",
+        "repeat": 1,
+        "steps": 963,
+        "total_score": 38810.95640932915
+      },
+      {
+        "average_speed_kmh": 40.91545492824507,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 113.257,
+        "off_track_steps": 18,
+        "progress_m": 237.412,
+        "reason": "wrong direction",
+        "repeat": 2,
+        "steps": 963,
+        "total_score": 38810.95640932915
+      },
+      {
+        "average_speed_kmh": 40.91545492824507,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 113.257,
+        "off_track_steps": 18,
+        "progress_m": 237.412,
+        "reason": "wrong direction",
+        "repeat": 3,
+        "steps": 963,
+        "total_score": 38810.95640932915
+      }
+    ],
+    "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\checkpoints\\agent6_td3_lr_decay_v1\\agent6_td3_scratch_150000_steps.zip": [
+      {
+        "average_speed_kmh": 45.481146787746205,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 130.741,
+        "off_track_steps": 18,
+        "progress_m": 238.793,
+        "reason": "out of bounds",
+        "repeat": 1,
+        "steps": 914,
+        "total_score": 41401.5056395047
+      },
+      {
+        "average_speed_kmh": 45.481146787746205,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 130.741,
+        "off_track_steps": 18,
+        "progress_m": 238.793,
+        "reason": "out of bounds",
+        "repeat": 2,
+        "steps": 914,
+        "total_score": 41401.5056395047
+      },
+      {
+        "average_speed_kmh": 45.481146787746205,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 130.741,
+        "off_track_steps": 18,
+        "progress_m": 238.793,
+        "reason": "out of bounds",
+        "repeat": 3,
+        "steps": 914,
+        "total_score": 41401.5056395047
+      }
+    ],
+    "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\checkpoints\\agent6_td3_lr_decay_v1\\agent6_td3_scratch_25000_steps.zip": [
+      {
+        "average_speed_kmh": 44.70102758249403,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 110.51299999999999,
+        "off_track_steps": 63,
+        "progress_m": 118.179,
+        "reason": "out of bounds",
+        "repeat": 1,
+        "steps": 417,
+        "total_score": 18027.259231497486
+      },
+      {
+        "average_speed_kmh": 61.25132344062499,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 139.576,
+        "off_track_steps": 6,
+        "progress_m": 161.416,
+        "reason": "out of bounds",
+        "repeat": 2,
+        "steps": 448,
+        "total_score": 27229.07395113376
+      },
+      {
+        "average_speed_kmh": 61.25132344062499,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 139.576,
+        "off_track_steps": 6,
+        "progress_m": 161.416,
+        "reason": "out of bounds",
+        "repeat": 3,
+        "steps": 448,
+        "total_score": 27229.07395113376
+      }
+    ],
+    "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\checkpoints\\agent6_td3_lr_decay_v1\\agent6_td3_scratch_50000_steps.zip": [
+      {
+        "average_speed_kmh": 79.99661406462394,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 149.854,
+        "off_track_steps": 4,
+        "progress_m": 172.011,
+        "reason": "out of bounds",
+        "repeat": 1,
+        "steps": 359,
+        "total_score": 28465.80414703341
+      },
+      {
+        "average_speed_kmh": 79.99661406462394,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 149.854,
+        "off_track_steps": 4,
+        "progress_m": 172.011,
+        "reason": "out of bounds",
+        "repeat": 2,
+        "steps": 359,
+        "total_score": 28465.80414703341
+      },
+      {
+        "average_speed_kmh": 79.99661406462394,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 149.854,
+        "off_track_steps": 4,
+        "progress_m": 172.011,
+        "reason": "out of bounds",
+        "repeat": 3,
+        "steps": 359,
+        "total_score": 28465.80414703341
+      }
+    ],
+    "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\checkpoints\\agent6_td3_lr_decay_v1\\agent6_td3_scratch_75000_steps.zip": [
+      {
+        "average_speed_kmh": 31.467736500469957,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 73.8155,
+        "off_track_steps": 0,
+        "progress_m": 141.164,
+        "reason": "car stuck",
+        "repeat": 1,
+        "steps": 749,
+        "total_score": 23521.209016585588
+      },
+      {
+        "average_speed_kmh": 31.467736500469957,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 73.8155,
+        "off_track_steps": 0,
+        "progress_m": 141.164,
+        "reason": "car stuck",
+        "repeat": 2,
+        "steps": 749,
+        "total_score": 23521.209016585588
+      },
+      {
+        "average_speed_kmh": 31.467736500469957,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 73.8155,
+        "off_track_steps": 0,
+        "progress_m": 141.164,
+        "reason": "car stuck",
+        "repeat": 3,
+        "steps": 749,
+        "total_score": 23521.209016585588
+      }
+    ]
+  },
+  "summaries": [
+    {
+      "best_lap_seconds": null,
+      "completed_laps": 0,
+      "completed_repeats": 0,
+      "deterministic": true,
+      "maximum_progress_m": 1859.65,
+      "mean_total_score": 316102.6081045935,
+      "median_off_track_steps": 42.0,
+      "median_progress_m": 1859.65,
+      "minimum_progress_m": 1859.65,
+      "policy_path": "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\agent6_td3_lr_decay_v1_best_distance.zip",
+      "repeats": 3,
+      "track": "g-track-3"
+    },
+    {
+      "best_lap_seconds": null,
+      "completed_laps": 0,
+      "completed_repeats": 0,
+      "deterministic": true,
+      "maximum_progress_m": 161.416,
+      "mean_total_score": 24161.80237792167,
+      "median_off_track_steps": 6.0,
+      "median_progress_m": 161.416,
+      "minimum_progress_m": 118.179,
+      "policy_path": "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\checkpoints\\agent6_td3_lr_decay_v1\\agent6_td3_scratch_25000_steps.zip",
+      "repeats": 3,
+      "track": "g-track-3"
+    },
+    {
+      "best_lap_seconds": null,
+      "completed_laps": 0,
+      "completed_repeats": 0,
+      "deterministic": true,
+      "maximum_progress_m": 172.011,
+      "mean_total_score": 28465.80414703341,
+      "median_off_track_steps": 4.0,
+      "median_progress_m": 172.011,
+      "minimum_progress_m": 172.011,
+      "policy_path": "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\checkpoints\\agent6_td3_lr_decay_v1\\agent6_td3_scratch_50000_steps.zip",
+      "repeats": 3,
+      "track": "g-track-3"
+    },
+    {
+      "best_lap_seconds": null,
+      "completed_laps": 0,
+      "completed_repeats": 0,
+      "deterministic": true,
+      "maximum_progress_m": 141.164,
+      "mean_total_score": 23521.209016585588,
+      "median_off_track_steps": 0.0,
+      "median_progress_m": 141.164,
+      "minimum_progress_m": 141.164,
+      "policy_path": "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\checkpoints\\agent6_td3_lr_decay_v1\\agent6_td3_scratch_75000_steps.zip",
+      "repeats": 3,
+      "track": "g-track-3"
+    },
+    {
+      "best_lap_seconds": null,
+      "completed_laps": 0,
+      "completed_repeats": 0,
+      "deterministic": true,
+      "maximum_progress_m": 183.417,
+      "mean_total_score": 30281.760609812176,
+      "median_off_track_steps": 0.0,
+      "median_progress_m": 183.417,
+      "minimum_progress_m": 183.417,
+      "policy_path": "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\checkpoints\\agent6_td3_lr_decay_v1\\agent6_td3_scratch_100000_steps.zip",
+      "repeats": 3,
+      "track": "g-track-3"
+    },
+    {
+      "best_lap_seconds": null,
+      "completed_laps": 0,
+      "completed_repeats": 0,
+      "deterministic": true,
+      "maximum_progress_m": 237.412,
+      "mean_total_score": 38810.95640932915,
+      "median_off_track_steps": 18.0,
+      "median_progress_m": 237.412,
+      "minimum_progress_m": 237.412,
+      "policy_path": "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\checkpoints\\agent6_td3_lr_decay_v1\\agent6_td3_scratch_125000_steps.zip",
+      "repeats": 3,
+      "track": "g-track-3"
+    },
+    {
+      "best_lap_seconds": null,
+      "completed_laps": 0,
+      "completed_repeats": 0,
+      "deterministic": true,
+      "maximum_progress_m": 238.793,
+      "mean_total_score": 41401.5056395047,
+      "median_off_track_steps": 18.0,
+      "median_progress_m": 238.793,
+      "minimum_progress_m": 238.793,
+      "policy_path": "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\checkpoints\\agent6_td3_lr_decay_v1\\agent6_td3_scratch_150000_steps.zip",
+      "repeats": 3,
+      "track": "g-track-3"
+    }
+  ]
+}

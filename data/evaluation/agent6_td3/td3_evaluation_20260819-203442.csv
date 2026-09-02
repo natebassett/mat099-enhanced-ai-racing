@@ -1,0 +1,16 @@
+policy_path,repeat,seed,reason,steps,laps,best_lap_seconds,progress_m,total_score,max_speed_kmh,average_speed_kmh,off_track_steps
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v2_best_distance.zip,1,2101606466,out of bounds,2569,0,,1325.3,224978.61929207557,154.15,88.30906953701809,90
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v2_best_distance.zip,2,2660676369,car stuck,3606,0,,1438.18,245334.10794195498,151.578,68.21004005984479,59
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v2_best_distance.zip,3,3000463575,out of bounds,2356,0,,1189.51,202157.2581595622,157.771,86.00196897283516,11
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v2_best_distance.zip,4,1611510062,out of bounds,2386,0,,1189.78,202025.5808097185,158.682,84.85333186873443,11
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v2_best_distance.zip,5,3402402747,wrong direction,729,0,,257.248,42871.782754676584,124.513,59.35617114650202,31
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v2_best_reward.zip,1,2101606466,car stuck,3422,0,,1430.36,247014.48714570224,127.154,72.26141167329052,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v2_best_reward.zip,2,2660676369,car stuck,3386,0,,1425.45,246416.83691902392,129.098,72.85783242380391,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v2_best_reward.zip,3,3000463575,car stuck,3722,0,,1439.5,249506.01552645053,127.633,67.10749462627605,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v2_best_reward.zip,4,1611510062,car stuck,3306,0,,1435.61,248168.73153215522,137.434,75.15250318239556,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v2_best_reward.zip,5,3402402747,car stuck,3384,0,,1427.69,246737.93980894878,129.182,72.99293716105218,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,1,2101606466,car stuck,2554,0,,500.91,82851.43477652015,72.6401,32.53809727328776,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,2,2660676369,car stuck,2693,0,,488.14,81747.97332011779,69.3184,30.49211479812414,32
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,3,3000463575,car stuck,1337,0,,166.011,27589.49313047316,46.4623,20.86963919708305,17
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,4,1611510062,car stuck,2458,0,,500.587,82908.000019061,71.4629,33.82986200220091,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,5,3402402747,car stuck,2529,0,,499.419,82629.95115668255,72.3794,32.77258448994833,6

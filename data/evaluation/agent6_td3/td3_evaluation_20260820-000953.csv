@@ -1,0 +1,11 @@
+policy_path,repeat,seed,reason,steps,laps,best_lap_seconds,progress_m,total_score,max_speed_kmh,average_speed_kmh,off_track_steps
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,1,2101606466,car stuck,3422,0,,1430.36,247014.48714570224,127.154,72.26141167329052,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,2,2660676369,car stuck,3386,0,,1425.45,246416.83691902392,129.098,72.85783242380391,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,3,3000463575,car stuck,3722,0,,1439.5,249506.01552645053,127.633,67.10749462627605,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,4,1611510062,out of bounds,1770,0,,767.156,128924.2878667856,124.172,73.72462312994354,4
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,5,3402402747,car stuck,3384,0,,1427.69,246737.93980894878,129.182,72.99293716105218,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v4_safe_best_distance.zip,1,2101606466,car stuck,3426,0,,1423.8,245823.34831299077,125.045,71.82741451050771,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v4_safe_best_distance.zip,2,2660676369,car stuck,1733,0,,513.002,86543.08844773102,120.038,49.976438416503164,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v4_safe_best_distance.zip,3,3000463575,car stuck,3617,0,,1425.84,246696.74167320158,122.731,68.27439336798442,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v4_safe_best_distance.zip,4,1611510062,car stuck,2066,0,,532.306,90426.83717195952,122.949,43.805335112589646,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_sector_v4_safe_best_distance.zip,5,3402402747,car stuck,3403,0,,1419.1,244977.07809206698,125.067,72.05867409756083,0

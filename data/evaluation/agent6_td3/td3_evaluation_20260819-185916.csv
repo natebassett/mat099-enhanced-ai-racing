@@ -1,0 +1,6 @@
+policy_path,repeat,seed,reason,steps,laps,best_lap_seconds,progress_m,total_score,max_speed_kmh,average_speed_kmh,off_track_steps
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,1,2101606466,out of bounds,336,0,,74.7849,12077.985372204776,98.3459,37.11271736458334,9
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,2,2660676369,wrong direction,365,0,,88.2969,13339.671106297226,98.5319,38.2055537290411,30
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,3,3000463575,out of bounds,4482,0,,1923.91,323528.93359697395,126.45100000000001,72.4142595370593,41
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,4,1611510062,out of bounds,4128,0,,1923.09,325443.08126454643,140.354,79.10280740172013,40
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,5,3402402747,out of bounds,334,0,,74.0862,11821.245434193277,98.8578,36.90593797994012,8

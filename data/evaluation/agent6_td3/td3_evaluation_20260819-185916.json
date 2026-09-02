@@ -1,0 +1,96 @@
+{
+  "episodes": {
+    "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\agent6_td3_scratch_racer_best_evaluation.zip": [
+      {
+        "average_speed_kmh": 37.11271736458334,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 98.3459,
+        "off_track_steps": 9,
+        "progress_m": 74.7849,
+        "reason": "out of bounds",
+        "repeat": 1,
+        "seed": 2101606466,
+        "steps": 336,
+        "total_score": 12077.985372204776
+      },
+      {
+        "average_speed_kmh": 38.2055537290411,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 98.5319,
+        "off_track_steps": 30,
+        "progress_m": 88.2969,
+        "reason": "wrong direction",
+        "repeat": 2,
+        "seed": 2660676369,
+        "steps": 365,
+        "total_score": 13339.671106297226
+      },
+      {
+        "average_speed_kmh": 72.4142595370593,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 126.45100000000001,
+        "off_track_steps": 41,
+        "progress_m": 1923.91,
+        "reason": "out of bounds",
+        "repeat": 3,
+        "seed": 3000463575,
+        "steps": 4482,
+        "total_score": 323528.93359697395
+      },
+      {
+        "average_speed_kmh": 79.10280740172013,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 140.354,
+        "off_track_steps": 40,
+        "progress_m": 1923.09,
+        "reason": "out of bounds",
+        "repeat": 4,
+        "seed": 1611510062,
+        "steps": 4128,
+        "total_score": 325443.08126454643
+      },
+      {
+        "average_speed_kmh": 36.90593797994012,
+        "best_lap_seconds": null,
+        "laps": 0,
+        "max_speed_kmh": 98.8578,
+        "off_track_steps": 8,
+        "progress_m": 74.0862,
+        "reason": "out of bounds",
+        "repeat": 5,
+        "seed": 3402402747,
+        "steps": 334,
+        "total_score": 11821.245434193277
+      }
+    ]
+  },
+  "summaries": [
+    {
+      "best_lap_seconds": null,
+      "completed_laps": 0,
+      "completed_repeats": 0,
+      "deterministic": true,
+      "evaluation_protocol": "agent6_seeded_steering_robustness_v1",
+      "evaluation_seeds": [
+        2101606466,
+        2660676369,
+        3000463575,
+        1611510062,
+        3402402747
+      ],
+      "maximum_progress_m": 1923.91,
+      "mean_total_score": 137242.18335484312,
+      "median_off_track_steps": 30.0,
+      "median_progress_m": 88.2969,
+      "minimum_progress_m": 74.0862,
+      "policy_path": "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\agent6_td3_scratch_racer_best_evaluation.zip",
+      "repeats": 5,
+      "steering_noise_std": 0.006,
+      "track": "g-track-3"
+    }
+  ]
+}

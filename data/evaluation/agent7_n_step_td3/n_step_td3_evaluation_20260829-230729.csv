@@ -1,0 +1,4 @@
+repeat,episode,steps,reward,distance_m,max_speed_kmh,average_speed_kmh,off_track_steps,damage_delta,laps_completed,best_lap_time_seconds,termination_reason
+1,1,539,208.37940045086614,365.705,210.973,115.05449113951761,1,0.0,0,,off_track
+2,2,544,209.6213191130343,370.282,206.541,115.34744266948539,1,0.0,0,,off_track
+3,3,543,212.30710894283186,370.641,208.19,115.69813765046044,1,0.0,0,,off_track

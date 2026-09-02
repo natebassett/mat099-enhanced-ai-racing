@@ -1,0 +1,83 @@
+{
+  "policy_path": "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\models\\agent7_n_step_td3\\best_distance.pt",
+  "track": "g-track-3",
+  "deterministic": true,
+  "repeats": 5,
+  "median_distance_m": 184.538,
+  "minimum_distance_m": 177.805,
+  "maximum_distance_m": 342.065,
+  "mean_reward": 104.16199984246705,
+  "completed_laps": 0,
+  "episodes": [
+    {
+      "repeat": 1,
+      "episode": 1,
+      "steps": 393,
+      "reward": 88.49205330957223,
+      "distance_m": 184.42,
+      "max_speed_kmh": 153.949,
+      "average_speed_kmh": 77.50921117608141,
+      "off_track_steps": 1,
+      "damage_delta": 0.0,
+      "laps_completed": 0,
+      "best_lap_time_seconds": null,
+      "termination_reason": "off_track"
+    },
+    {
+      "repeat": 2,
+      "episode": 2,
+      "steps": 393,
+      "reward": 85.98544089956147,
+      "distance_m": 184.538,
+      "max_speed_kmh": 154.34,
+      "average_speed_kmh": 77.55387891145038,
+      "off_track_steps": 1,
+      "damage_delta": 0.0,
+      "laps_completed": 0,
+      "best_lap_time_seconds": null,
+      "termination_reason": "off_track"
+    },
+    {
+      "repeat": 3,
+      "episode": 3,
+      "steps": 394,
+      "reward": 87.20656807517393,
+      "distance_m": 184.713,
+      "max_speed_kmh": 153.596,
+      "average_speed_kmh": 77.42677975177666,
+      "off_track_steps": 1,
+      "damage_delta": 0.0,
+      "laps_completed": 0,
+      "best_lap_time_seconds": null,
+      "termination_reason": "off_track"
+    },
+    {
+      "repeat": 4,
+      "episode": 4,
+      "steps": 386,
+      "reward": 85.492740906722,
+      "distance_m": 177.805,
+      "max_speed_kmh": 153.562,
+      "average_speed_kmh": 76.28669259637309,
+      "off_track_steps": 1,
+      "damage_delta": 0.0,
+      "laps_completed": 0,
+      "best_lap_time_seconds": null,
+      "termination_reason": "off_track"
+    },
+    {
+      "repeat": 5,
+      "episode": 5,
+      "steps": 556,
+      "reward": 173.63319602130565,
+      "distance_m": 342.065,
+      "max_speed_kmh": 197.112,
+      "average_speed_kmh": 106.0214280255396,
+      "off_track_steps": 1,
+      "damage_delta": 0.0,
+      "laps_completed": 0,
+      "best_lap_time_seconds": null,
+      "termination_reason": "off_track"
+    }
+  ]
+}

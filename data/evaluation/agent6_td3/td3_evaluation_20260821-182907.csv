@@ -1,0 +1,31 @@
+policy_path,repeat,seed,trial,order_position,reason,steps,laps,best_lap_seconds,progress_m,total_score,max_speed_kmh,average_speed_kmh,off_track_steps
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,1,2479274972,1,1,out of bounds,2229,0,,1117.18,191749.3327650158,136.548,86.56419629519954,5
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,1,2479274972,2,2,car stuck,3431,0,,1435.62,247906.64205675316,130.03,72.34014274555521,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,1,2479274972,3,1,out of bounds,822,0,,339.154,58983.21065017856,124.508,72.35912987347945,10
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,2,4091832959,1,2,car stuck,3502,0,,1430.05,246987.50630098316,129.335,70.61056256339265,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,2,4091832959,2,1,car stuck,3502,0,,1430.05,246987.50630098316,129.335,70.61056256339265,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,2,4091832959,3,2,car stuck,3502,0,,1430.05,246987.50630098316,129.335,70.61056256339265,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,3,3342519599,1,1,car stuck,3383,0,,1431.22,247256.1529099722,129.459,73.17401599349711,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,3,3342519599,2,2,car stuck,3383,0,,1431.22,247256.1529099722,129.459,73.17401599349711,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,3,3342519599,3,1,car stuck,3383,0,,1431.22,247256.1529099722,129.459,73.17401599349711,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,4,4079634514,1,2,car stuck,3431,0,,1426.44,246757.48479900666,128.294,72.00152974030888,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,4,4079634514,2,1,car stuck,3431,0,,1426.44,246757.48479900666,128.294,72.00152974030888,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,4,4079634514,3,2,car stuck,3431,0,,1426.44,246757.48479900666,128.294,72.00152974030888,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,5,3423197543,1,1,car stuck,3363,0,,1428.74,246710.0582228516,130.166,73.44268754891465,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,5,3423197543,2,2,car stuck,3363,0,,1428.74,246710.0582228516,130.166,73.44268754891465,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,5,3423197543,3,1,car stuck,3363,0,,1428.74,246710.0582228516,130.166,73.44268754891465,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,1,2479274972,1,2,car stuck,3431,0,,1435.62,247906.64205675316,130.03,72.34014274555521,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,1,2479274972,2,1,out of bounds,2187,0,,1098.11,187527.53595520215,142.056,86.41808310745311,24
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,1,2479274972,3,2,car stuck,3431,0,,1435.62,247906.64205675316,130.03,72.34014274555521,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,2,4091832959,1,1,car stuck,3502,0,,1430.05,246987.50630098316,129.335,70.61056256339265,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,2,4091832959,2,2,car stuck,3502,0,,1430.05,246987.50630098316,129.335,70.61056256339265,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,2,4091832959,3,1,car stuck,3502,0,,1430.05,246987.50630098316,129.335,70.61056256339265,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,3,3342519599,1,2,car stuck,3383,0,,1431.22,247256.1529099722,129.459,73.17401599349711,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,3,3342519599,2,1,car stuck,3383,0,,1431.22,247256.1529099722,129.459,73.17401599349711,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,3,3342519599,3,2,car stuck,3383,0,,1431.22,247256.1529099722,129.459,73.17401599349711,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,4,4079634514,1,1,car stuck,3431,0,,1426.44,246757.48479900666,128.294,72.00152974030888,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,4,4079634514,2,2,car stuck,3431,0,,1426.44,246757.48479900666,128.294,72.00152974030888,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,4,4079634514,3,1,car stuck,3431,0,,1426.44,246757.48479900666,128.294,72.00152974030888,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,5,3423197543,1,2,car stuck,3363,0,,1428.74,246710.0582228516,130.166,73.44268754891465,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,5,3423197543,2,1,car stuck,3363,0,,1428.74,246710.0582228516,130.166,73.44268754891465,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,5,3423197543,3,2,car stuck,3363,0,,1428.74,246710.0582228516,130.166,73.44268754891465,0

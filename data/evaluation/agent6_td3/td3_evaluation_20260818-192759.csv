@@ -1,0 +1,4 @@
+policy_path,repeat,reason,steps,laps,best_lap_seconds,progress_m,total_score,max_speed_kmh,average_speed_kmh,off_track_steps
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_distance.zip,1,car stuck,1091,0,,83.5342,14054.449253426526,46.6546,12.882480644088018,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_distance.zip,2,car stuck,1091,0,,83.5342,14054.449253426526,46.6546,12.882480644088018,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_distance.zip,3,car stuck,1091,0,,83.5342,14054.449253426526,46.6546,12.882480644088018,0

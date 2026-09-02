@@ -1,0 +1,11 @@
+policy_path,repeat,seed,reason,steps,laps,best_lap_seconds,progress_m,total_score,max_speed_kmh,average_speed_kmh,off_track_steps
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,1,2479274972,car stuck,3431,0,,1435.62,247906.64205675316,130.03,72.34014274555521,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,2,4091832959,car stuck,3502,0,,1430.05,246987.50630098316,129.335,70.61056256339265,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,3,3342519599,car stuck,3383,0,,1431.22,247256.1529099722,129.459,73.17401599349711,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,4,4079634514,out of bounds,2087,0,,882.8,147535.1985817146,120.877,71.36919729420211,20
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer.zip,5,3423197543,car stuck,3363,0,,1428.74,246710.0582228516,130.166,73.44268754891465,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,1,2479274972,car stuck,3431,0,,1435.62,247906.64205675316,130.03,72.34014274555521,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,2,4091832959,car stuck,3502,0,,1430.05,246987.50630098316,129.335,70.61056256339265,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,3,3342519599,car stuck,3383,0,,1431.22,247256.1529099722,129.459,73.17401599349711,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,4,4079634514,car stuck,3431,0,,1426.44,246757.48479900666,128.294,72.00152974030888,0
+C:\Users\natha\OneDrive\Desktop\MAT099\mat099-enhanced-ai-racing\models\agent6_td3_scratch_racer_best_evaluation.zip,5,3423197543,car stuck,3363,0,,1428.74,246710.0582228516,130.166,73.44268754891465,0
