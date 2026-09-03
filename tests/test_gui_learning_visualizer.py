@@ -46,7 +46,7 @@ class LearningVisualizerModelTests(unittest.TestCase):
         self.assertEqual(dyna.kind, "dyna_q")
         self.assertTrue(any(step.active_group == "q_update" for step in dyna.steps))
         self.assertEqual(map_aware.kind, "static")
-        self.assertIn("no neural weights", map_aware.status)
+        self.assertIn("nothing is trained", map_aware.status)
         self.assertEqual(map_aware.steps[-1].active_group, "no_update")
 
     def test_reads_native_actor_checkpoint_without_modifying_it(self) -> None:

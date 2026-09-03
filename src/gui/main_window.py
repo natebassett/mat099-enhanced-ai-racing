@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pyqtgraph as pg
 from PySide6.QtCore import QEvent, Qt, QThread, QTimer
@@ -67,6 +67,7 @@ try:
     from .navigation import PrimaryNavigation
     from .learning_visualizer import LearningVisualizerPanel
     from .i18n import tr, translate_widget_tree
+    from .novice_education import build_novice_agent_guide
     from .race_worker import RaceWorker
     from .results_view import ResultsView
     from .settings_model import GuiSettings, SettingsStore
@@ -128,6 +129,7 @@ except ImportError:
     from navigation import PrimaryNavigation
     from learning_visualizer import LearningVisualizerPanel
     from i18n import tr, translate_widget_tree
+    from novice_education import build_novice_agent_guide
     from race_worker import RaceWorker
     from results_view import ResultsView
     from settings_model import GuiSettings, SettingsStore
@@ -170,14 +172,20 @@ class MetricSpec:
 class MainWindow(QMainWindow):
     """Desktop GUI shell with real project option discovery."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        progress_callback: Callable[[int, str], None] | None = None,
+    ) -> None:
         super().__init__()
+        self._startup_progress_callback = progress_callback
         self.setWindowTitle("Enhanced AI Racing Telemetry Dashboard")
         self.resize(1440, 860)
         self.setMinimumSize(1120, 700)
 
         self.project_root = Path(__file__).resolve().parents[2]
+        self._report_startup(30, "Finding drivers, tracks, and saved races...")
         self.project_options: ProjectOptions = load_project_options(self.project_root)
+        self._report_startup(46, "Preparing the telemetry workspace...")
         self.settings_store = SettingsStore(
             self.project_root / "data" / "generated" / "gui_settings.json"
         )
@@ -257,7 +265,7 @@ class MainWindow(QMainWindow):
         self.agent_education_title_label = QLabel("Agent Guide")
         self.agent_education_badge_label = QLabel("Idle")
         self.agent_education_headline_label = QLabel("Select an agent.")
-        self.agent_algorithm_button = QPushButton("Open Technical Guide")
+        self.agent_algorithm_button = QPushButton("See equations and code")
         self.agent_education_fact_labels: dict[str, QLabel] = {}
         self.agent_education_metadata_box = QTextEdit()
         self.agent_education_overview_box = QTextEdit()
@@ -268,7 +276,14 @@ class MainWindow(QMainWindow):
         self.agent_education_failure_box = QTextEdit()
         self.agent_education_tracks_box = QTextEdit()
         self.learning_visualizer = LearningVisualizerPanel()
-        self.results_view = ResultsView(self.project_root)
+        self.agent_lab_tabs: QTabWidget | None = None
+        self.results_view = ResultsView(
+            self.project_root,
+            palette=self.visual_palette,
+            chart_palette=self.chart_palette,
+            load_immediately=self.app_settings.start_page == "Results",
+        )
+        self._report_startup(64, "Building the learning and results pages...")
         self.settings_view = SettingsView(
             agents=self.project_options.agents,
             tracks=self.project_options.tracks,
@@ -340,17 +355,25 @@ class MainWindow(QMainWindow):
         self._last_explanation_step: int | None = None
         self._last_explanation_lap_time: float | None = None
         self._last_explanation_event_key: str | None = None
+        self._agent_lab_loaded = False
+        self._results_load_scheduled = False
 
         self._configure_controls()
         self._build_ui()
+        self._report_startup(82, "Connecting controls and live telemetry...")
         self._refresh_compare_options()
-        self._update_agent_education()
         self._connect_signals()
         self._update_selection_details()
         self._update_dyna_q_panel_visibility()
         self._apply_plot_theme(self.visual_palette)
         self._apply_language(self.app_settings.language)
         self._refresh_settings_storage_summary()
+        self._ensure_current_page_loaded()
+        self._report_startup(96, "Finishing the dashboard...")
+
+    def _report_startup(self, value: int, message: str) -> None:
+        if self._startup_progress_callback is not None:
+            self._startup_progress_callback(value, message)
 
     def _configure_controls(self) -> None:
         for combo in (
@@ -1112,14 +1135,16 @@ class MainWindow(QMainWindow):
         title = QLabel("Agent Lab")
         title.setObjectName("pageTitle")
         title.setFont(_section_font())
-        subtitle = QLabel("See how each driver turns information into action.")
+        subtitle = QLabel(
+            "Pick a driver to see what it notices, how it decides, and whether it learns."
+        )
         subtitle.setObjectName("pageSubtitle")
         subtitle.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(subtitle)
         layout.addWidget(self._combo_group("Driver", self.agent_education_combo))
 
-        profile_group = QGroupBox("Profile")
+        profile_group = QGroupBox("Meet This Driver")
         profile_layout = QVBoxLayout(profile_group)
         profile_layout.addWidget(self.agent_education_title_label)
         profile_layout.addWidget(self.agent_education_badge_label)
@@ -1129,7 +1154,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._build_agent_quick_facts())
         self.agent_algorithm_button.setProperty("primary", True)
         self.agent_algorithm_button.setToolTip(
-            "Open equations, pseudocode, implementation notes, and source excerpts"
+            "Open the optional technical guide with equations, pseudocode, and source excerpts"
         )
         layout.addWidget(self.agent_algorithm_button)
         layout.addStretch(1)
@@ -1143,16 +1168,21 @@ class MainWindow(QMainWindow):
         layout.setHorizontalSpacing(10)
         layout.setVerticalSpacing(10)
 
-        for index, label_text in enumerate(
-            ("Approach", "Learns from", "Policy", "Racing line")
+        for index, (fact_key, visible_label) in enumerate(
+            (
+                ("Approach", "Driver style"),
+                ("Learns from", "How it improves"),
+                ("Policy", "Makes decisions with"),
+                ("Racing line", "Track guide"),
+            )
         ):
-            label = QLabel(label_text)
+            label = QLabel(visible_label)
             label.setObjectName("metricLabel")
             value = QLabel("--")
             value.setObjectName("factValue")
             value.setWordWrap(True)
             value.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-            self.agent_education_fact_labels[label_text] = value
+            self.agent_education_fact_labels[fact_key] = value
             row = index // 2
             column = (index % 2) * 2
             layout.addWidget(label, row * 2, column, 1, 2)
@@ -1161,17 +1191,19 @@ class MainWindow(QMainWindow):
 
     def _build_agent_education_detail_panel(self) -> QTabWidget:
         tabs = QTabWidget()
+        self.agent_lab_tabs = tabs
         tabs.setObjectName("agentLabTabs")
-        tabs.addTab(self._build_agent_driving_page(), "How It Drives")
-        tabs.addTab(self._build_agent_learning_page(), "How It Learns")
+        tabs.addTab(self._build_agent_driving_page(), "Driving")
+        tabs.addTab(self._build_agent_learning_page(), "Learning")
         tabs.addTab(
             self._agent_lab_scroll_page(
                 self.learning_visualizer,
                 "learningVisualizerScroll",
             ),
-            "Learning Visualiser",
+            "Inside the Brain",
         )
-        tabs.addTab(self._build_agent_limits_page(), "Use & Limits")
+        tabs.addTab(self._build_agent_limits_page(), "Strengths & Limits")
+        tabs.currentChanged.connect(self._handle_agent_lab_page_changed)
         return tabs
 
     def _build_agent_driving_page(self) -> QScrollArea:
@@ -1181,10 +1213,10 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(14, 12, 14, 14)
         layout.setSpacing(10)
         layout.addWidget(
-            self._text_group("Driving Strategy", self.agent_education_overview_box)
+            self._text_group("The Simple Version", self.agent_education_overview_box)
         )
 
-        decision_group = QGroupBox("Decision Flow")
+        decision_group = QGroupBox("One Decision, Step by Step")
         decision_layout = QVBoxLayout(decision_group)
         decision_layout.addWidget(self._build_agent_pipeline())
         layout.addWidget(decision_group)
@@ -1199,16 +1231,16 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(14, 12, 14, 14)
         layout.setSpacing(10)
         layout.addWidget(
-            self._text_group("Learning Method", self.agent_education_learning_box)
+            self._text_group("How Learning Works", self.agent_education_learning_box)
         )
 
         detail_row = QHBoxLayout()
         detail_row.setSpacing(10)
         detail_row.addWidget(
-            self._text_group("Information Available", self.agent_education_signals_box)
+            self._text_group("What It Can See", self.agent_education_signals_box)
         )
         detail_row.addWidget(
-            self._text_group("What To Remember", self.agent_education_takeaways_box)
+            self._text_group("In Plain English", self.agent_education_takeaways_box)
         )
         layout.addLayout(detail_row)
         layout.addStretch(1)
@@ -1224,20 +1256,20 @@ class MainWindow(QMainWindow):
         first_row = QHBoxLayout()
         first_row.setSpacing(10)
         first_row.addWidget(
-            self._text_group("Strengths", self.agent_education_strengths_box)
+            self._text_group("What It Does Well", self.agent_education_strengths_box)
         )
         first_row.addWidget(
-            self._text_group("Failure Signs", self.agent_education_failure_box)
+            self._text_group("What Can Go Wrong", self.agent_education_failure_box)
         )
         layout.addLayout(first_row)
 
         second_row = QHBoxLayout()
         second_row.setSpacing(10)
         second_row.addWidget(
-            self._text_group("Track Fit", self.agent_education_tracks_box)
+            self._text_group("Where It Works", self.agent_education_tracks_box)
         )
         second_row.addWidget(
-            self._text_group("Project Metadata", self.agent_education_metadata_box)
+            self._text_group("Technical Details", self.agent_education_metadata_box)
         )
         layout.addLayout(second_row)
         layout.addStretch(1)
@@ -1449,6 +1481,54 @@ class MainWindow(QMainWindow):
         self.settings_view.reset_run_history_requested.connect(
             self._handle_reset_run_history
         )
+        if self.tabs is not None:
+            self.tabs.currentChanged.connect(self._handle_primary_page_changed)
+        self.settings_view.tabs.currentChanged.connect(
+            self._handle_settings_page_changed
+        )
+
+    def _handle_primary_page_changed(self, index: int) -> None:
+        if index == self.agents_tab_index:
+            self._ensure_agent_lab_loaded()
+        elif index == self.results_tab_index:
+            self._schedule_results_load()
+        elif (
+            index == self.settings_tab_index
+            and self.settings_view.tabs.currentIndex() == 1
+        ):
+            self._schedule_results_load()
+
+    def _handle_settings_page_changed(self, index: int) -> None:
+        if index == 1:
+            self._schedule_results_load()
+
+    def _ensure_current_page_loaded(self) -> None:
+        if self.tabs is not None:
+            self._handle_primary_page_changed(self.tabs.currentIndex())
+
+    def _ensure_agent_lab_loaded(self) -> None:
+        if self._agent_lab_loaded:
+            return
+        self._agent_lab_loaded = True
+        self._update_agent_education()
+
+    def _handle_agent_lab_page_changed(self, index: int) -> None:
+        if index == 2:
+            self.learning_visualizer.load_checkpoint_statistics()
+
+    def _schedule_results_load(self) -> None:
+        if self.results_view.is_loaded or self._results_load_scheduled:
+            return
+        self._results_load_scheduled = True
+        self.results_view.summary_label.setText("Loading saved evidence...")
+        QTimer.singleShot(0, self._load_results_evidence)
+
+    def _load_results_evidence(self) -> None:
+        try:
+            if not self.results_view.is_loaded:
+                self.results_view.reload()
+        finally:
+            self._results_load_scheduled = False
 
     def _apply_gui_settings(self, settings: GuiSettings) -> None:
         self.app_settings = settings
@@ -1889,26 +1969,39 @@ class MainWindow(QMainWindow):
             agent,
             self.project_options.tracks,
         )
+        novice_guide = build_novice_agent_guide(agent.agent_type)
         self.agent_education_profile = profile
         self.agent_algorithm_button.setEnabled(True)
         self.agent_education_title_label.setText(profile.title)
-        self.agent_education_badge_label.setText(profile.badge)
-        self.agent_education_headline_label.setText(profile.headline)
+        self.agent_education_badge_label.setText(novice_guide.badge)
+        self.agent_education_headline_label.setText(novice_guide.headline)
         self.agent_education_metadata_box.setPlainText(
             _format_key_value_lines(profile.metadata)
         )
-        self._set_text_box(self.agent_education_overview_box, profile.overview)
+        self._set_text_box(
+            self.agent_education_overview_box,
+            novice_guide.driving_story,
+        )
         self._set_text_box(
             self.agent_education_learning_box,
-            profile.algorithm_summary,
+            novice_guide.learning_story,
         )
         self._set_text_box(
             self.agent_education_takeaways_box,
-            profile.key_takeaways,
+            novice_guide.key_takeaways,
         )
-        self._set_text_box(self.agent_education_signals_box, profile.input_signals)
-        self._set_text_box(self.agent_education_strengths_box, profile.strengths)
-        self._set_text_box(self.agent_education_failure_box, profile.failure_signs)
+        self._set_text_box(
+            self.agent_education_signals_box,
+            novice_guide.input_signals,
+        )
+        self._set_text_box(
+            self.agent_education_strengths_box,
+            novice_guide.strengths,
+        )
+        self._set_text_box(
+            self.agent_education_failure_box,
+            novice_guide.failure_signs,
+        )
         self._set_text_box(self.agent_education_tracks_box, profile.track_context)
 
         for label, value in profile.quick_facts:
@@ -1917,11 +2010,17 @@ class MainWindow(QMainWindow):
                 fact_label.setText(value)
 
         for index, label in enumerate(self.agent_pipeline_labels):
-            if index < len(profile.decision_steps):
-                label.setText(profile.decision_steps[index])
+            if index < len(novice_guide.decision_steps):
+                label.setText(novice_guide.decision_steps[index])
             else:
                 label.setText("--")
-        self.learning_visualizer.set_agent(agent.agent_type, agent.name)
+        self.learning_visualizer.set_agent(
+            agent.agent_type,
+            agent.name,
+            inspect_checkpoint=False,
+        )
+        if self.agent_lab_tabs is not None and self.agent_lab_tabs.currentIndex() == 2:
+            self.learning_visualizer.load_checkpoint_statistics()
         self._sync_racing_line_visualizer(agent)
 
     def _set_text_box(self, box: QTextEdit, lines: tuple[str, ...]) -> None:
@@ -3141,6 +3240,7 @@ class AgentAlgorithmDialog(QDialog):
         layout.addWidget(subtitle)
 
         tabs = QTabWidget()
+        tabs.setObjectName("algorithmGuideTabs")
         tabs.addTab(self._build_overview_tab(profile), "Overview")
         tabs.addTab(self._build_pseudocode_tab(profile), "Algorithm")
         if profile.formula_notes:

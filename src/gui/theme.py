@@ -272,6 +272,35 @@ def build_stylesheet(palette: ThemePalette = LIGHT_THEME) -> str:
         background-color: {palette.canvas};
         color: {palette.text};
     }}
+    QWidget#startupView, QFrame#startupPanel {{
+        background-color: {header};
+        border: 1px solid {header_divider};
+    }}
+    QLabel#startupTitle {{
+        color: {header_text};
+        font-size: 21px;
+        font-weight: 700;
+    }}
+    QLabel#startupContext {{
+        color: {header_muted};
+        font-size: 9px;
+        font-weight: 600;
+    }}
+    QLabel#startupStatus {{
+        color: {header_muted};
+        font-size: 10px;
+    }}
+    QProgressBar#startupProgress {{
+        min-height: 7px;
+        max-height: 7px;
+        border: none;
+        border-radius: 3px;
+        background-color: {header_divider};
+    }}
+    QProgressBar#startupProgress::chunk {{
+        border-radius: 3px;
+        background-color: {palette.accent};
+    }}
     QWidget#pageCanvas, QWidget#scrollCanvas {{
         background-color: {palette.canvas};
     }}
@@ -433,14 +462,16 @@ def build_stylesheet(palette: ThemePalette = LIGHT_THEME) -> str:
         border: 0;
     }}
     QTabWidget#contentTabs::pane,
-    QTabWidget#agentLabTabs::pane {{
+    QTabWidget#agentLabTabs::pane,
+    QTabWidget#algorithmGuideTabs::pane {{
         background-color: {palette.surface};
         border: 1px solid {palette.border};
         border-radius: 6px;
         top: -1px;
     }}
     QTabWidget#contentTabs QTabBar::tab,
-    QTabWidget#agentLabTabs QTabBar::tab {{
+    QTabWidget#agentLabTabs QTabBar::tab,
+    QTabWidget#algorithmGuideTabs QTabBar::tab {{
         padding: 8px 14px;
         color: {palette.muted};
         background-color: transparent;
@@ -448,9 +479,17 @@ def build_stylesheet(palette: ThemePalette = LIGHT_THEME) -> str:
         border-bottom: 2px solid transparent;
         font-weight: 600;
     }}
+    QTabWidget#contentTabs QTabBar::tab:hover,
+    QTabWidget#agentLabTabs QTabBar::tab:hover,
+    QTabWidget#algorithmGuideTabs QTabBar::tab:hover {{
+        color: {palette.text};
+        background-color: {hover};
+    }}
     QTabWidget#contentTabs QTabBar::tab:selected,
-    QTabWidget#agentLabTabs QTabBar::tab:selected {{
+    QTabWidget#agentLabTabs QTabBar::tab:selected,
+    QTabWidget#algorithmGuideTabs QTabBar::tab:selected {{
         color: {palette.accent};
+        background-color: {palette.surface};
         border-bottom-color: {palette.accent};
     }}
     QPushButton {{

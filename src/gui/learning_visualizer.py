@@ -62,6 +62,8 @@ class LearningVisualizerPanel(QWidget):
         self._speed = 1.0
         self._reduce_motion = False
         self._statistics_cache: dict[Path, CheckpointStatistics] = {}
+        self._agent_type: str | None = None
+        self._agent_name = ""
 
         self.title_label = QLabel(self.profile.title)
         self.title_label.setObjectName("pageTitle")
@@ -176,17 +178,39 @@ class LearningVisualizerPanel(QWidget):
         explanation_layout.addWidget(self.equation_label)
         layout.addWidget(explanation)
 
-    def set_agent(self, agent_type: str | None, agent_name: str = "") -> None:
+    def set_agent(
+        self,
+        agent_type: str | None,
+        agent_name: str = "",
+        *,
+        inspect_checkpoint: bool = True,
+    ) -> None:
         self.pause()
+        self._agent_type = agent_type
+        self._agent_name = agent_name
         self.profile = build_learning_visualization_profile(agent_type)
         self.title_label.setText(self.profile.title)
         self.status_label.setText(self.profile.status)
         self.diagram.set_profile(self.profile)
         self.diagram.set_checkpoint_statistics(None)
-        self.checkpoint_label.setText(self._checkpoint_message(agent_type, agent_name))
+        if inspect_checkpoint:
+            self.load_checkpoint_statistics()
+        elif self.profile.kind == "td3":
+            self.checkpoint_label.setText(
+                "Saved neural-network measurements load when this visualiser opens."
+            )
+        else:
+            self.checkpoint_label.setText(
+                self._checkpoint_message(agent_type, agent_name)
+            )
         self.step_index = 0
         self.phase = 0.0
         self._show_current_step()
+
+    def load_checkpoint_statistics(self) -> None:
+        self.checkpoint_label.setText(
+            self._checkpoint_message(self._agent_type, self._agent_name)
+        )
 
     def _checkpoint_message(self, agent_type: str | None, agent_name: str) -> str:
         checkpoint = default_checkpoint_for_agent(agent_type)

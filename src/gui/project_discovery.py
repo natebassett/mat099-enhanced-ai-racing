@@ -104,23 +104,89 @@ def load_project_options(
 
 
 def discover_agents() -> list[AgentOption]:
-    from agents.dyna_q_agent import DynaQFinalisedAgent, DynaQLearningAgent
-    from agents.map_aware_agent import MapAwareAgent
-    from agents.random_agent import RandomAgent
-    from agents.rule_based_agent import RuleBasedAgent
-    from agents.td3_agent import Td3ScratchAgent
-    from agents.n_step_td3_agent import NstepTd3Agent
-    from agents.sensor_n_step_td3_agent import SensorNstepTd3Agent
-
+    # Keep startup discovery lightweight. RaceWorker imports only the selected
+    # class when a race starts, so loading every neural dependency here is wasteful.
     return [
-        _agent_option(DynaQLearningAgent),
-        _agent_option(DynaQFinalisedAgent),
-        _agent_option(Td3ScratchAgent),
-        _agent_option(NstepTd3Agent),
-        _agent_option(SensorNstepTd3Agent),
-        _agent_option(MapAwareAgent),
-        _agent_option(RuleBasedAgent),
-        _agent_option(RandomAgent),
+        AgentOption(
+            "Dyna-Q Learning Agent",
+            "dyna_q_learning",
+            "0.1",
+            "agents.dyna_q_agent.DynaQLearningAgent",
+            True,
+            False,
+            150000,
+            1,
+        ),
+        AgentOption(
+            "Dyna-Q Finalised Agent",
+            "dyna_q_finalised",
+            "0.1",
+            "agents.dyna_q_agent.DynaQFinalisedAgent",
+            True,
+            False,
+            150000,
+            1,
+        ),
+        AgentOption(
+            "TD3 Scratch Racer",
+            "td3_scratch",
+            "0.1",
+            "agents.td3_agent.Td3ScratchAgent",
+            True,
+            False,
+            150000,
+            1,
+        ),
+        AgentOption(
+            "torcsRL N-Step TD3 Racer",
+            "n_step_td3",
+            "0.2",
+            "agents.n_step_td3_agent.NstepTd3Agent",
+            True,
+            True,
+            15000,
+            1,
+        ),
+        AgentOption(
+            "Sensor-Only N-Step TD3 Racer",
+            "sensor_n_step_td3",
+            "0.1",
+            "agents.sensor_n_step_td3_agent.SensorNstepTd3Agent",
+            True,
+            False,
+            15000,
+            1,
+        ),
+        AgentOption(
+            "Map-Aware Racing-Line Agent",
+            "map_aware",
+            "4.2",
+            "agents.map_aware_agent.MapAwareAgent",
+            True,
+            True,
+            150000,
+            1,
+        ),
+        AgentOption(
+            "Rule-Based Anti-Spin Agent",
+            "rule_based",
+            "1.9",
+            "agents.rule_based_agent.RuleBasedAgent",
+            True,
+            False,
+            150000,
+            1,
+        ),
+        AgentOption(
+            "Random Agent",
+            "random",
+            "1.0",
+            "agents.random_agent.RandomAgent",
+            False,
+            False,
+            None,
+            None,
+        ),
     ]
 
 
@@ -198,22 +264,6 @@ def compatible_tracks_for_agent(
     if agent.requires_racing_line:
         return [track for track in tracks if track.has_racing_line]
     return tracks
-
-
-def _agent_option(agent_class: type) -> AgentOption:
-    agent_type = str(getattr(agent_class, "agent_type", agent_class.__name__))
-    return AgentOption(
-        name=str(getattr(agent_class, "name", agent_class.__name__)),
-        agent_type=agent_type,
-        version=str(getattr(agent_class, "version", "unknown")),
-        class_path=f"{agent_class.__module__}.{agent_class.__name__}",
-        uses_full_control=bool(getattr(agent_class, "uses_full_control", False)),
-        requires_racing_line=bool(
-            getattr(agent_class, "requires_racing_line", agent_type == "map_aware")
-        ),
-        max_steps=_optional_int(getattr(agent_class, "max_steps", None)),
-        target_laps=_optional_int(getattr(agent_class, "target_laps", None)),
-    )
 
 
 def _existing_racing_line_path(racing_lines_root: Path, track_id: str) -> Path | None:

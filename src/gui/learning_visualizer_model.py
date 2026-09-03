@@ -143,60 +143,60 @@ def inspect_td3_checkpoint(path: str | Path) -> CheckpointStatistics:
 
 def _td3_profile(agent_type: str) -> LearningVisualizationProfile:
     if agent_type == "sensor_n_step_td3":
-        title = "Sensor-only N-step TD3 update"
-        inputs = ("Motion", "Road sensors", "Wheel spin", "History", "Track position")
+        title = "How Agent 8 adjusts its neural network"
+        inputs = ("Car movement", "Road view", "Wheel grip", "Recent memory", "Road position")
     elif agent_type == "n_step_td3":
-        title = "Racing-line-informed N-step TD3 update"
-        inputs = ("Motion", "Road sensors", "Wheel spin", "History", "Line geometry")
+        title = "How Agent 7 adjusts its neural network"
+        inputs = ("Car movement", "Road view", "Wheel grip", "Recent memory", "Route preview")
     else:
-        title = "Scratch TD3 update"
-        inputs = ("Motion", "Road sensors", "Wheel spin", "Previous action", "Lap phase")
+        title = "How Agent 6 adjusts its neural network"
+        inputs = ("Car movement", "Road view", "Wheel grip", "Last action", "Lap progress")
     return LearningVisualizationProfile(
         kind="td3",
         title=title,
-        status="Conceptual update with actual saved actor measurements",
+        status="A simplified training view with measurements from the saved neural driver",
         input_labels=inputs,
         output_labels=("Steering", "Throttle / brake"),
         steps=(
             LearningStep(
-                "Sample experience",
-                "A replay batch supplies states, actions, rewards, and later states.",
+                "Remember recent driving",
+                "Training picks a small set of earlier moments, including what happened after each action.",
                 "replay",
                 "(s, a, r, s') from replay",
             ),
             LearningStep(
-                "Actor predicts controls",
-                "The actor converts each state into continuous steering and pedal intent.",
+                "The neural driver suggests controls",
+                "The actor is the part that turns sensor information into steering and pedal choices.",
                 "actor_forward",
                 "a = mu(s)",
             ),
             LearningStep(
-                "Twin critics estimate value",
-                "Two critics independently score how useful the sampled controls are.",
+                "Twin critics act as two coaches",
+                "Two separate critics score how useful those choices are likely to be over time.",
                 "critics",
                 "Q1(s, a), Q2(s, a)",
             ),
             LearningStep(
-                "Build the TD target",
-                "Observed reward is combined with the smaller smoothed target value.",
+                "Build a cautious learning target",
+                "The real reward is combined with the lower of the two future estimates to avoid overconfidence.",
                 "target",
                 "y = R(n) + gamma^n min(Q1', Q2')",
             ),
             LearningStep(
-                "Measure prediction error",
-                "The critic loss measures the gap between predicted value and the TD target.",
+                "Check the coaches' predictions",
+                "The loss measures how far each critic's prediction was from the learning target.",
                 "loss",
                 "Lcritic = (Q1-y)^2 + (Q2-y)^2",
             ),
             LearningStep(
-                "Backpropagate gradients",
-                "Gradients move backward through active networks and identify useful parameter changes.",
+                "Send correction signals backward",
+                "Backpropagation works backward through the network to find which internal weights need adjustment.",
                 "backward",
                 "gradient = dL / dweight",
             ),
             LearningStep(
-                "Apply a small update",
-                "Critic weights change every update; the actor changes less often and targets follow slowly.",
+                "Adjust the weights a little",
+                "The critics change first. The actor changes less often, helping the neural driver learn more steadily.",
                 "update",
                 "weight <- weight - learning_rate * gradient",
             ),
@@ -207,50 +207,50 @@ def _td3_profile(agent_type: str) -> LearningVisualizationProfile:
 def _dyna_q_profile(agent_type: str) -> LearningVisualizationProfile:
     finalised = agent_type == "dyna_q_finalised"
     status = (
-        "Saved Q-table policy: learning disabled"
+        "Using its saved score table; learning is switched off"
         if finalised
-        else "Conceptual live Q-table and planning update"
+        else "How one driving choice changes the score table"
     )
     return LearningVisualizationProfile(
         kind="dyna_q",
-        title="Dyna-Q value update",
+        title="How Dyna-Q learns from one driving choice",
         status=status,
         input_labels=("Lap section", "Speed", "Road position", "Heading", "Sensor danger"),
         output_labels=("Discrete action",),
         steps=(
             LearningStep(
-                "Encode the state",
-                "Continuous telemetry is grouped into a compact table key.",
+                "Describe the situation",
+                "The live readings are grouped into a simpler label that fits in a table.",
                 "state",
                 "telemetry -> state bins",
             ),
             LearningStep(
-                "Choose an action",
-                "Learning mode sometimes explores; finalised mode chooses the highest value.",
+                "Choose from the score table",
+                "While learning, it sometimes tries something different. The finalised driver uses the best score.",
                 "choice",
                 "a = epsilon-greedy(Q(s, a))",
             ),
             LearningStep(
-                "Observe reward",
-                "The next TORCS frame reports progress, stability, and failures.",
+                "See whether it helped",
+                "The next simulator update gives a reward for progress, stability, or failure.",
                 "reward",
                 "transition = (s, a, r, s')",
             ),
             LearningStep(
-                "Calculate TD error",
-                "The new target is compared with the stored state-action value.",
+                "Compare the old guess with the result",
+                "The learning correction measures how different the result was from the stored score.",
                 "td_error",
                 "delta = r + gamma max Q(s', a') - Q(s, a)",
             ),
             LearningStep(
-                "Update one table cell",
-                "Only the chosen state-action value moves toward the new target.",
+                "Adjust one score",
+                "Only the score for this situation and action moves toward the new evidence.",
                 "q_update",
                 "Q(s, a) <- Q(s, a) + alpha * delta",
             ),
             LearningStep(
-                "Replay learned transitions",
-                "Dyna-Q samples its model and repeats the same update without another race frame.",
+                "Practise from memory",
+                "Dyna-Q repeats remembered situations, so one real experience can teach it more than once.",
                 "planning",
                 "model(s, a) -> (r, s')",
             ),
@@ -260,21 +260,21 @@ def _dyna_q_profile(agent_type: str) -> LearningVisualizationProfile:
 
 def _non_learning_profile(agent_type: str | None) -> LearningVisualizationProfile:
     if agent_type == "map_aware":
-        title = "Map-aware decision path"
-        middle = "Racing-line planner"
-        status = "Engineered controller: no neural weights are trained"
+        title = "How the map-aware driver decides"
+        middle = "the planned route and safety rules"
+        status = "Uses a prepared route and rules; nothing is trained"
     elif agent_type == "rule_based":
-        title = "Rule-based decision path"
-        middle = "Rules and safety limits"
-        status = "Engineered controller: no neural weights are trained"
+        title = "How the rule-based driver decides"
+        middle = "its rulebook and safety limits"
+        status = "Uses hand-written rules; nothing is trained"
     elif agent_type == "random":
-        title = "Random baseline path"
-        middle = "Bounded random sample"
-        status = "Baseline driver: no learning state is retained"
+        title = "How the random comparison driver decides"
+        middle = "a limited random choice"
+        status = "Makes random choices and does not learn"
     else:
-        title = "Agent decision path"
-        middle = "Agent logic"
-        status = "No learning visualisation is defined for this agent"
+        title = "How this driver decides"
+        middle = "its driving logic"
+        status = "No learning view is available for this driver"
     return LearningVisualizationProfile(
         kind="static",
         title=title,
@@ -282,12 +282,12 @@ def _non_learning_profile(agent_type: str | None) -> LearningVisualizationProfil
         input_labels=("TORCS telemetry",),
         output_labels=("Driving controls",),
         steps=(
-            LearningStep("Observe", "Read the current simulator state.", "observe", "telemetry"),
-            LearningStep("Decide", f"Apply {middle.lower()} to the observation.", "decide", middle),
-            LearningStep("Act", "Send steering and pedal controls to TORCS.", "act", "controls"),
+            LearningStep("Look", "Read what the car and road are doing now.", "observe", "telemetry"),
+            LearningStep("Decide", f"Use {middle} to choose what to do.", "decide", middle),
+            LearningStep("Drive", "Send steering and pedal controls to the car.", "act", "controls"),
             LearningStep(
-                "No weight update",
-                "This agent does not train a neural network or update a Q-table.",
+                "No learning step",
+                "This driver does not change neural-network weights or a score table.",
                 "no_update",
                 "parameters remain unchanged",
             ),

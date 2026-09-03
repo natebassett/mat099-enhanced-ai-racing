@@ -17,7 +17,7 @@ if str(SRC_DIR) not in sys.path:
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication, QScrollArea, QSplitter, QTabWidget  # noqa: E402
 
-from gui.main_window import MainWindow  # noqa: E402
+from gui.main_window import AgentAlgorithmDialog, MainWindow  # noqa: E402
 
 
 class AgentLabLayoutTests(unittest.TestCase):
@@ -46,11 +46,20 @@ class AgentLabLayoutTests(unittest.TestCase):
         self.assertEqual(
             [tabs.tabText(index) for index in range(tabs.count())],
             [
-                "How It Drives",
-                "How It Learns",
-                "Learning Visualiser",
-                "Use & Limits",
+                "Driving",
+                "Learning",
+                "Inside the Brain",
+                "Strengths & Limits",
             ],
+        )
+
+        self.assertEqual(
+            self.window.agent_algorithm_button.text(),
+            "See equations and code",
+        )
+        self.assertIn(
+            "Imagine",
+            self.window.agent_education_headline_label.text(),
         )
 
     def test_agent_lab_pages_scroll_vertically_without_horizontal_overflow(self) -> None:
@@ -78,6 +87,14 @@ class AgentLabLayoutTests(unittest.TestCase):
         self.assertIn("n_step_td3", agent_types)
         self.assertIn("sensor_n_step_td3", agent_types)
         self.assertNotIn("agent8_recorded_elite_lap", agent_types)
+
+    def test_algorithm_guide_tabs_use_the_themed_subwindow_navigation(self) -> None:
+        dialog = AgentAlgorithmDialog(self.window.agent_education_profile, self.window)
+        tabs = dialog.findChild(QTabWidget, "algorithmGuideTabs")
+
+        self.assertIsNotNone(tabs)
+        self.assertGreaterEqual(tabs.count(), 3)
+        dialog.close()
 
 
 if __name__ == "__main__":

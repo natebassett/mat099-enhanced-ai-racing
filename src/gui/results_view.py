@@ -8,6 +8,7 @@ import pyqtgraph as pg
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -68,14 +69,22 @@ PACE_TARGET_SECONDS = 90.0
 class ResultsView(QWidget):
     """Read-only analytics workspace backed by saved project evidence."""
 
-    def __init__(self, project_root: Path, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        project_root: Path,
+        parent: QWidget | None = None,
+        *,
+        palette: ThemePalette | None = None,
+        chart_palette: ChartPalette | None = None,
+        load_immediately: bool = True,
+    ) -> None:
         super().__init__(parent)
         self.project_root = project_root
-        self.theme_palette = LIGHT_THEME
-        self.chart_palette = chart_palette_for_preferences(
-            "standard",
-            dark=False,
+        self.theme_palette = palette or LIGHT_THEME
+        self.chart_palette = chart_palette or chart_palette_for_preferences(
+            "standard", dark=self.theme_palette.is_dark
         )
+        self._loaded = False
         self.dataset = ResultsDataset((), (), (), (), ())
         self._evaluation_rows: list[EvaluationBatch] = []
         self._training_rows: list[TrainingRun] = []
@@ -143,13 +152,29 @@ class ResultsView(QWidget):
 
         self._build_ui()
         self._connect_signals()
-        self.reload()
+        if load_immediately:
+            self.reload()
+        else:
+            self.show_loading_state()
+
+    @property
+    def is_loaded(self) -> bool:
+        return self._loaded
+
+    def show_loading_state(self) -> None:
+        self.summary_label.setText(
+            "Saved evidence will load when you open the Results page."
+        )
+        self.warning_label.hide()
 
     def set_visual_theme(
         self,
         palette: ThemePalette,
         chart_palette: ChartPalette,
     ) -> None:
+        changed = (
+            palette != self.theme_palette or chart_palette != self.chart_palette
+        )
         self.theme_palette = palette
         self.chart_palette = chart_palette
         for plot in (
@@ -165,12 +190,16 @@ class ResultsView(QWidget):
                 axis = plot.getAxis(axis_name)
                 axis.setTextPen(palette.muted)
                 axis.setPen(palette.border_strong)
-        self.reload()
+        if self._loaded and changed:
+            self._redraw_loaded_data()
 
     def reload(self) -> None:
         evaluation_id = self.evaluation_batch_combo.currentData()
         training_id = self.training_run_combo.currentData()
+        self.summary_label.setText("Loading saved evidence...")
+        QApplication.processEvents()
         self.dataset = load_results_dataset(self.project_root)
+        self._loaded = True
         self._populate_filters()
         self._refresh_overview()
         self._refresh_evaluation_options(preferred_id=evaluation_id)
@@ -183,6 +212,14 @@ class ResultsView(QWidget):
         )
         self.warning_label.setVisible(bool(self.dataset.warnings))
         self.warning_label.setText("  |  ".join(self.dataset.warnings[:3]))
+
+    def _redraw_loaded_data(self) -> None:
+        evaluation_id = self.evaluation_batch_combo.currentData()
+        training_id = self.training_run_combo.currentData()
+        self._refresh_overview()
+        self._refresh_evaluation_options(preferred_id=evaluation_id)
+        self._refresh_training_options(preferred_id=training_id)
+        self._refresh_race_results()
 
     def take_technical_evidence_page(self) -> QWidget | None:
         page = self.technical_evidence_page

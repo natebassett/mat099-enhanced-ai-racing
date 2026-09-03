@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import sys
 import unittest
 from pathlib import Path
@@ -35,6 +36,32 @@ class ProjectDiscoveryTests(unittest.TestCase):
         self.assertIn("sensor_n_step_td3", agent_types)
         self.assertNotIn("agent8_recorded_elite_lap", agent_types)
         self.assertTrue(any(agent.uses_full_control for agent in agents))
+
+    def test_lightweight_catalogue_matches_real_agent_classes(self):
+        for agent in discover_agents():
+            module_name, class_name = agent.class_path.rsplit(".", 1)
+            agent_class = getattr(importlib.import_module(module_name), class_name)
+
+            self.assertEqual(agent.name, agent_class.name)
+            self.assertEqual(agent.agent_type, agent_class.agent_type)
+            self.assertEqual(agent.version, agent_class.version)
+            self.assertEqual(
+                agent.uses_full_control,
+                getattr(agent_class, "uses_full_control", False),
+            )
+            self.assertEqual(
+                agent.requires_racing_line,
+                getattr(
+                    agent_class,
+                    "requires_racing_line",
+                    agent.agent_type == "map_aware",
+                ),
+            )
+            self.assertEqual(agent.max_steps, getattr(agent_class, "max_steps", None))
+            self.assertEqual(
+                agent.target_laps,
+                getattr(agent_class, "target_laps", None),
+            )
 
     def test_discovers_torcs_tracks_from_xml(self):
         tracks = discover_tracks(PROJECT_ROOT)

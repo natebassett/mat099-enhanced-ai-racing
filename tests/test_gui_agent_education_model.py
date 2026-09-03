@@ -120,8 +120,11 @@ class GuiAgentEducationModelTests(unittest.TestCase):
 
         self.assertEqual(profile.badge, "Racing-line-informed N-step TD3 policy")
         self.assertIn("never as a copied teacher action", profile.headline)
-        self.assertEqual(dict(profile.quick_facts)["Policy"], "Neural actor")
-        self.assertEqual(dict(profile.quick_facts)["Racing line"], "Geometry input")
+        self.assertEqual(
+            dict(profile.quick_facts)["Policy"],
+            "A trained neural network",
+        )
+        self.assertEqual(dict(profile.quick_facts)["Racing line"], "Route preview only")
         self.assertTrue(any("141-value" in note for note in profile.algorithm_summary))
         self.assertTrue(any("Three-Step Critic Target" == note.title for note in profile.formula_notes))
         self.assertTrue(any(r"\gamma^3" in note.formula for note in profile.formula_notes))
@@ -139,7 +142,10 @@ class GuiAgentEducationModelTests(unittest.TestCase):
 
         self.assertEqual(profile.badge, "Sensor-only N-step TD3 policy")
         self.assertIn("without a racing-line file or an external teacher", profile.headline)
-        self.assertEqual(dict(profile.quick_facts)["Learns from"], "Reward + own laps")
+        self.assertEqual(
+            dict(profile.quick_facts)["Learns from"],
+            "Rewards + its own good laps",
+        )
         self.assertEqual(dict(profile.quick_facts)["Racing line"], "Not used")
         self.assertTrue(any("self-generated" in note for note in profile.overview))
         self.assertTrue(any("Sensor Stability Reward" == note.title for note in profile.formula_notes))
