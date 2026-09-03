@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
+from project_paths import PROJECT_ROOT
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 G_TRACK_3_LENGTH_METRES = 2843.0934
 
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "agent6_td3_scratch_racer.zip"

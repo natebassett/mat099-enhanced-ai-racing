@@ -2,8 +2,8 @@ import csv
 import math
 from pathlib import Path
 
+from project_paths import PROJECT_ROOT
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TELEMETRY_PATH = (
     PROJECT_ROOT / "data" / "generated" / "rule_based_telemetry.csv"
 )

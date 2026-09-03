@@ -4,6 +4,7 @@ import math
 from enum import Enum
 from pathlib import Path
 
+from project_paths import PROJECT_ROOT
 from racing_line import (
     RacingLine,
     DrivingMode,
@@ -14,7 +15,6 @@ from racing_line import (
 )
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RACING_LINE_PATH = PROJECT_ROOT / "data" / "racing_lines" / "g-track-3.json"
 DEFAULT_TELEMETRY_PATH = (
     PROJECT_ROOT / "data" / "generated" / "map_aware_telemetry.csv"

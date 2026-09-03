@@ -20,6 +20,18 @@ WELSH = {
     "Review": "Adolygu",
     "Compare": "Cymharu",
     "Agent Lab": "Labordy Asiantau",
+    "Pick a driver to see what it notices, how it decides, and whether it learns.": (
+        "Dewiswch yrrwr i weld beth mae'n sylwi arno, sut mae'n penderfynu, ac a yw'n dysgu."
+    ),
+    "Driver style": "Dull gyrru",
+    "How it improves": "Sut mae'n gwella",
+    "Makes decisions with": "Yn gwneud penderfyniadau gyda",
+    "Track guide": "Canllaw trac",
+    "Step 1": "Cam 1",
+    "Step 2": "Cam 2",
+    "Step 3": "Cam 3",
+    "Step 4": "Cam 4",
+    "Step 5": "Cam 5",
     "Settings": "Gosodiadau",
     "Choose how the application opens and how much live information it shows.": (
         "Dewiswch sut mae'r rhaglen yn agor a faint o wybodaeth fyw mae'n ei dangos."
@@ -76,6 +88,19 @@ WELSH = {
     "Agent Guide": "Canllaw Asiant",
     "Open Technical Guide": "Agor y Canllaw Technegol",
     "See equations and code": "Gweld hafaliadau a chod",
+    "Open the optional technical guide with equations, pseudocode, and source excerpts": (
+        "Agorwch y canllaw technegol dewisol gyda hafaliadau, ffug-god a darnau o'r cod ffynhonnell"
+    ),
+    "Algorithm Guide": "Canllaw Algorithm",
+    "Algorithm": "Algorithm",
+    "Formulas": "Fformiwlâu",
+    "Code": "Cod",
+    "Interpretation": "Dehongliad",
+    "Close": "Cau",
+    "How The Algorithm Thinks": "Sut Mae'r Algorithm yn Meddwl",
+    "What Users Should Notice": "Beth Dylai Defnyddwyr Sylwi Arno",
+    "Readable Algorithm": "Algorithm Hawdd ei Ddarllen",
+    "Maths / Logic In Human Terms": "Mathemateg / Rhesymeg mewn Iaith Syml",
     "Meet This Driver": "Dewch i Adnabod y Gyrrwr",
     "How It Drives": "Sut Mae'n Gyrru",
     "How It Learns": "Sut Mae'n Dysgu",
@@ -92,6 +117,18 @@ WELSH = {
     "What Can Go Wrong": "Beth All Fynd o'i Le",
     "Where It Works": "Ble Mae'n Gweithio",
     "Technical Details": "Manylion Technegol",
+    "Racing-Line Visualizer": "Delweddwr Llinell Rasio",
+    "Accelerate": "Cyflymu",
+    "Full throttle": "Cyflymu llawn",
+    "Turn": "Troi",
+    "Settle": "Sefydlogi",
+    "Line Summary": "Crynodeb y Llinell",
+    "Current Target": "Targed Presennol",
+    "No racing line loaded": "Dim llinell rasio wedi'i llwytho",
+    "No agent discovered": "Ni ddarganfuwyd asiant",
+    "No project agent metadata is available.": (
+        "Nid oes manylion asiant prosiect ar gael."
+    ),
     "Overview": "Trosolwg",
     "Learning Journey": "Taith Ddysgu",
     "Agent Comparison": "Cymhariaeth Asiantau",
@@ -211,6 +248,15 @@ def translate_widget_tree(root: QWidget, language: str) -> None:
             _translate_property(widget, "text", widget.text, widget.setText, language)
         elif isinstance(widget, QLabel):
             _translate_property(widget, "text", widget.text, widget.setText, language)
+
+        if widget.toolTip():
+            _translate_property(
+                widget,
+                "tool_tip",
+                widget.toolTip,
+                widget.setToolTip,
+                language,
+            )
 
         if isinstance(widget, QTabWidget):
             sources = getattr(widget, "_i18n_tab_sources", None)

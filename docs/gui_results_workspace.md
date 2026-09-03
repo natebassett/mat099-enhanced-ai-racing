@@ -11,7 +11,7 @@ rewrite evaluation and training logs.
 - Leads with laps completed, typical lap time, fastest lap, and trial count.
 - Selects the fastest reliable representative from evaluations with at least ten
   trials and at least 80% completion.
-- Compares Agents 6, 7, and 8 using direct completion counts and familiar
+- Compares Agents 7 and 8 using direct completion counts and familiar
   percentage bars.
 - Explains the difference between demonstrated pace and repeated reliability in
   plain language.

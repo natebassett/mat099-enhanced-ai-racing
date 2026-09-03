@@ -4,8 +4,10 @@ from dataclasses import dataclass
 from typing import Any
 
 try:
+    from .novice_education import build_novice_agent_guide
     from .project_discovery import AgentOption, TrackOption, compatible_tracks_for_agent
 except ImportError:
+    from novice_education import build_novice_agent_guide
     from project_discovery import AgentOption, TrackOption, compatible_tracks_for_agent
 
 
@@ -48,13 +50,16 @@ class AgentEducationProfile:
 def build_agent_education_profile(
     agent: AgentOption,
     tracks: list[TrackOption],
+    language: str = "en",
 ) -> AgentEducationProfile:
     template = _template_for(agent.agent_type)
+    if language == "cy":
+        template = _welsh_template(agent.agent_type, template)
     return AgentEducationProfile(
         title=agent.name,
         badge=template["badge"],
         headline=template["headline"],
-        quick_facts=_quick_facts(agent.agent_type),
+        quick_facts=_quick_facts(agent.agent_type, language),
         overview=tuple(template["overview"]),
         decision_steps=tuple(template["decision_steps"]),
         algorithm_summary=tuple(template["algorithm_summary"]),
@@ -66,8 +71,8 @@ def build_agent_education_profile(
         input_signals=tuple(template["input_signals"]),
         strengths=tuple(template["strengths"]),
         failure_signs=tuple(template["failure_signs"]),
-        track_context=_track_context(agent, tracks),
-        metadata=_metadata(agent),
+        track_context=_track_context(agent, tracks, language),
+        metadata=_metadata(agent, language),
     )
 
 
@@ -1091,7 +1096,208 @@ def _template_for(agent_type: str) -> dict[str, Any]:
     }
 
 
-def _quick_facts(agent_type: str) -> tuple[tuple[str, str], ...]:
+_WELSH_FORMULA_GUIDES = {
+    "Normalised Track Position": (
+        "Safle Trac wedi'i Normaleiddio",
+        "Mae 0 yn ganol y ffordd, -1 yn ymyl chwith a +1 yn ymyl dde. Mae'r hafaliad yn trosi'r raddfa hon yn bellter ochr mewn metrau.",
+    ),
+    "Racing Point Projection": (
+        "Taflunio Pwynt Rasio",
+        "Mae'r pwynt yn dechrau ar ganol y trac ac yn symud ar draws lled y ffordd i greu'r llwybr rasio bwriedig.",
+    ),
+    "Lap-Distance Interpolation": (
+        "Rhyngosod Pellter Lap",
+        "Mae rhyngosod yn llenwi'r bwlch rhwng dau bwynt llwybr fel bod y targed yn newid yn llyfn, gan gynnwys dros y llinell gychwyn.",
+    ),
+    "Speed-Dependent Lookahead": (
+        "Edrych Ymlaen yn ôl Cyflymder",
+        "Wrth i'r car fynd yn gyflymach, mae'n edrych ymhellach ymlaen. Mae'r terfynau'n atal golwg sy'n rhy fyr neu'n rhy bell.",
+    ),
+    "Smooth Merge Onto The Line": (
+        "Ymuno'n Llyfn â'r Llinell",
+        "Mae'r gromlin hon yn symud y car tuag at y llwybr fesul tipyn ar ôl lansio, yn hytrach na neidio i'r ochr.",
+    ),
+    "Curvature-Limited Speed": (
+        "Cyflymder wedi'i Gyfyngu gan Grymedd",
+        "Mae cromlin fwy yn golygu cornel fwy tynn. Felly mae'r cyflymder diogel yn gostwng wrth i'r tro fynd yn fwy tynn.",
+    ),
+    "Line Error": (
+        "Gwall y Llinell",
+        "Mae'r gwahaniaeth rhwng safle'r car a'r targed yn dweud i'r rheolydd pa ochr sydd angen cywiriad.",
+    ),
+    "Sensor Score": (
+        "Sgôr Synhwyrydd",
+        "Mae'r sgôr yn cyfuno faint o ffordd agored sydd i'w gweld ac ongl y synhwyrydd er mwyn ffafrio cyfeiriad defnyddiol.",
+    ),
+    "Visible-Corner Severity": (
+        "Pa Mor Lem yw'r Gornel Weladwy",
+        "Mae'r gymhareb rhwng y ffordd syth ymlaen a'r ochr fwy agored yn amcangyfrif pa mor ofalus y dylai'r car fod.",
+    ),
+    "Closing Factor": (
+        "Ffactor Cau",
+        "Mae darlleniad blaen sy'n crebachu yn dangos bod y car yn cyrraedd rhwystr neu gornel, felly dylai baratoi'n gynt.",
+    ),
+    "Stability Mode": (
+        "Mesur Sefydlogrwydd",
+        "Mae symudiad i'r ochr, llithro olwynion ac ongl y car yn ffurfio mesur syml o ba mor ansefydlog yw'r car.",
+    ),
+    "Q-Learning Update": (
+        "Diweddariad Q-Learning",
+        "Mae'r hen sgôr yn symud tuag at y wobr newydd ynghyd â'r canlyniad gorau a ddisgwylir o'r sefyllfa nesaf.",
+    ),
+    "Dyna-Q Model Replay": (
+        "Ailchwarae Model Dyna-Q",
+        "Ar ôl dysgu o gam go iawn, mae'r asiant yn ail-ymarfer profiadau o'i gof er mwyn defnyddio data'n fwy effeithlon.",
+    ),
+    "Epsilon-Greedy Choice": (
+        "Dewis Epsilon-Greedy",
+        "Fel arfer dewisir y weithred â'r sgôr uchaf, ond weithiau caiff dewis arall ei brofi er mwyn archwilio.",
+    ),
+    "Progress Reward": (
+        "Gwobr Cynnydd",
+        "Mae'r wobr yn ffafrio symud ymlaen, cyflymder defnyddiol a sefydlogrwydd, ac yn cosbi methiant.",
+    ),
+    "Deterministic Actor": (
+        "Actor Penderfynol",
+        "Mae'r actor yn troi cyflwr y car yn rheolyddion parhaus. Wrth werthuso, mae'r un mewnbwn yn cynhyrchu'r un dewis.",
+    ),
+    "Twin Critic Target": (
+        "Targed Dau Feirniad",
+        "Mae TD3 yn defnyddio'r amcangyfrif lleiaf o ddau feirniad er mwyn lleihau hyder gormodol mewn gweithred fregus.",
+    ),
+    "Scratch Progress Reward": (
+        "Gwobr Cynnydd o'r Dechrau",
+        "Mae cynnydd ymlaen a chwblhau lap yn dda; mae gyrru oddi ar y trac neu fethu yn wael. Nid yw'r hafaliad yn darparu gweithred i'w chopïo.",
+    ),
+    "Uniform Steering Sample": (
+        "Sampl Llywio Unffurf",
+        "Mae pob gwerth llywio o fewn y terfynau yn cael yr un siawns. Nid oes penderfyniad deallus yma.",
+    ),
+    "Uniform Throttle Sample": (
+        "Sampl Cyflymu Unffurf",
+        "Dewisir cyflymu ar hap o ystod sefydlog, heb ddefnyddio'r ffordd neu gyflwr y car.",
+    ),
+    "Repeatable Randomness": (
+        "Hapusrwydd Ailadroddadwy",
+        "Mae hedyn sefydlog yn ail-greu'r un dilyniant hap, sy'n gwneud cymariaethau prawf yn decach.",
+    ),
+    "History Observation": (
+        "Arsylwad â Hanes",
+        "Mae tri ffrâm telemetreg a thri gweithred flaenorol yn rhoi cipolwg byr o symudiad diweddar i'r actor.",
+    ),
+    "Three-Step Critic Target": (
+        "Targed Beirniad Tri Cham",
+        "Mae'r targed yn defnyddio tair gwobr go iawn cyn gofyn i'r rhwydwaith amcangyfrif beth sy'n digwydd wedyn.",
+    ),
+    "Target Policy Smoothing": (
+        "Llyfnhau'r Polisi Targed",
+        "Mae sŵn bach wedi'i glipio yn ystod hyfforddi'r beirniad yn ffafrio gweithredoedd sy'n parhau'n dda ar ôl newid bach.",
+    ),
+    "Sensor Stability Reward": (
+        "Gwobr Sefydlogrwydd Synwyryddion",
+        "Mae cyflymder ymlaen yn werthfawr pan fo'r car wedi'i alinio â'r ffordd. Mae cosbau bach am ymyl y trac a llywio sydyn yn helpu sefydlogrwydd heb bennu llwybr.",
+    ),
+    "Racing-Line Velocity Reward": (
+        "Gwobr Cyflymder y Llinell Rasio",
+        "Mae'r wobr yn ffafrio symud ymlaen yn agos at y llwybr parod. Mae'n sgorio canlyniad gweithred niwral; nid yw'n rhoi gweithred athro.",
+    ),
+    "Delayed Actor Objective": (
+        "Amcan Actor wedi'i Oedi",
+        "Mae'r actor yn newid yn llai aml na'r beirniaid ac yn dysgu dewis rheolyddion y mae'r beirniad cyntaf yn rhagweld fydd yn ddefnyddiol.",
+    ),
+}
+
+
+_WELSH_CODE_GUIDES = {
+    "Racing-line lookup": "Mae'r cod yn dod o hyd i'r ddau bwynt llwybr o amgylch y car ac yn rhyngosod rhyngddynt.",
+    "Previewing the route ahead": "Mae'r rheolydd yn samplu sawl pwynt o'i flaen er mwyn paratoi llywio a chyflymder cyn y gornel.",
+    "Turning the plan into controls": "Mae'r cod yn trosi'r targed llwybr a chyflymder yn llywio, cyflymu a brecio.",
+    "Choosing the most useful road sensor": "Mae'r cod yn graddio'r synwyryddion ac yn dewis y cyfeiriad sy'n cynnig y ffordd fwyaf defnyddiol.",
+    "Classifying the road ahead": "Mae'r rheolau'n dosbarthu'r ffordd weladwy er mwyn dewis ymateb addas.",
+    "Real update plus planning replay": "Mae un profiad go iawn yn diweddaru'r tabl, ac yna defnyddir profiadau o'r cof ar gyfer ymarfer ychwanegol.",
+    "Learning vs finalised mode": "Mae'r modd dysgu yn archwilio ac yn newid y tabl; mae'r modd terfynol yn defnyddio'r dewis gorau sydd wedi'i gadw.",
+    "Raw telemetry observation": "Mae'r cod yn graddio telemetreg TORCS i mewnbynnau sefydlog ar gyfer y rhwydwaith.",
+    "Direct continuous controls": "Mae allbynnau'r actor yn dod yn llywio a bwriad pedal parhaus, gyda dewis gêr awtomatig.",
+    "Curriculum reward": "Mae'r cod yn cyfrifo gwobr o gynnydd a diogelwch yn ystod hyfforddiant hanesyddol Agent 6.",
+    "Random baseline action": "Mae'r llinell sylfaen yn samplu rheolyddion ar hap er mwyn darparu cymhariaeth isaf syml.",
+    "Telemetry and history state": "Mae'r contract yn cyfuno telemetreg bresennol, hanes byr a gweithredoedd blaenorol mewn un mewnbwn.",
+    "Twin-critic learning target": "Mae'r cod yn ychwanegu sŵn bach at y targed ac yn defnyddio'r gwerth lleiaf o'r ddau feirniad.",
+    "Delayed neural policy update": "Mae'r actor yn newid ar gamau oedi er mwyn dilyn gweithredoedd â gwerth hirdymor uwch.",
+}
+
+_WELSH_CODE_TITLES = {
+    "Racing-line lookup": "Chwilio'r llinell rasio",
+    "Previewing the route ahead": "Rhagweld y llwybr o'ch blaen",
+    "Turning the plan into controls": "Troi'r cynllun yn rheolyddion",
+    "Choosing the most useful road sensor": "Dewis y synhwyrydd ffordd mwyaf defnyddiol",
+    "Classifying the road ahead": "Dosbarthu'r ffordd o'ch blaen",
+    "Real update plus planning replay": "Diweddariad go iawn ac ailchwarae cynllunio",
+    "Learning vs finalised mode": "Modd dysgu a modd terfynol",
+    "Raw telemetry observation": "Arsylwad telemetreg crai",
+    "Direct continuous controls": "Rheolyddion parhaus uniongyrchol",
+    "Curriculum reward": "Gwobr y cwricwlwm",
+    "Random baseline action": "Gweithred llinell sylfaen ar hap",
+    "Telemetry and history state": "Cyflwr telemetreg a hanes",
+    "Twin-critic learning target": "Targed dysgu'r ddau feirniad",
+    "Delayed neural policy update": "Diweddariad polisi niwral wedi'i oedi",
+}
+
+
+def _welsh_template(agent_type: str, template: dict[str, Any]) -> dict[str, Any]:
+    guide = build_novice_agent_guide(agent_type, language="cy")
+    localised = dict(template)
+    localised.update(
+        {
+            "badge": guide.badge,
+            "headline": guide.headline,
+            "overview": guide.driving_story,
+            "decision_steps": guide.decision_steps,
+            "algorithm_summary": (*guide.learning_story, *guide.key_takeaways),
+            "pseudocode": guide.decision_steps,
+            "formula_notes": tuple(
+                _welsh_formula_note(note) for note in template["formula_notes"]
+            ),
+            "code_snippets": tuple(
+                _welsh_code_snippet(snippet) for snippet in template["code_snippets"]
+            ),
+            "math_notes": (*guide.learning_story, *guide.key_takeaways),
+            "key_takeaways": guide.key_takeaways,
+            "input_signals": guide.input_signals,
+            "strengths": guide.strengths,
+            "failure_signs": guide.failure_signs,
+        }
+    )
+    return localised
+
+
+def _welsh_formula_note(note: FormulaNote) -> FormulaNote:
+    title, explanation = _WELSH_FORMULA_GUIDES.get(
+        note.title,
+        (
+            note.title,
+            "Mae'r hafaliad hwn yn crynhoi un rhan o resymeg yr asiant. Mae'r symbolau a'r gwerthoedd yn aros yr un fath ym mhob iaith.",
+        ),
+    )
+    return FormulaNote(title=title, formula=note.formula, explanation=explanation)
+
+
+def _welsh_code_snippet(snippet: CodeSnippet) -> CodeSnippet:
+    explanation = _WELSH_CODE_GUIDES.get(
+        snippet.title,
+        "Mae'r darn hwn yn dangos sut mae'r syniad yn cael ei droi'n gamau Python yn y prosiect.",
+    )
+    return CodeSnippet(
+        title=_WELSH_CODE_TITLES.get(snippet.title, snippet.title),
+        source=snippet.source,
+        explanation=explanation,
+        code=snippet.code,
+    )
+
+
+def _quick_facts(
+    agent_type: str,
+    language: str = "en",
+) -> tuple[tuple[str, str], ...]:
     facts = {
         "map_aware": (
             ("Approach", "Planned route + live sensors"),
@@ -1148,7 +1354,7 @@ def _quick_facts(agent_type: str) -> tuple[tuple[str, str], ...]:
             ("Racing line", "Not used"),
         ),
     }
-    return facts.get(
+    selected = facts.get(
         agent_type,
         (
             ("Approach", "Project agent"),
@@ -1157,6 +1363,38 @@ def _quick_facts(agent_type: str) -> tuple[tuple[str, str], ...]:
             ("Racing line", "See metadata"),
         ),
     )
+    if language != "cy":
+        return selected
+
+    translations = {
+        "Planned route + live sensors": "Llwybr wedi'i gynllunio + synwyryddion byw",
+        "Does not train": "Nid yw'n hyfforddi",
+        "Rules and a route plan": "Rheolau a chynllun llwybr",
+        "Required": "Angenrheidiol",
+        "Live sensor rules": "Rheolau synwyryddion byw",
+        "A hand-written rulebook": "Llyfr rheolau wedi'i ysgrifennu â llaw",
+        "Not used": "Heb ei ddefnyddio",
+        "Learns action scores": "Yn dysgu sgoriau gweithredoedd",
+        "Rewards + memory practice": "Gwobrau + ymarfer o'r cof",
+        "An action score table": "Tabl sgoriau gweithredoedd",
+        "Uses learned action scores": "Yn defnyddio sgoriau wedi'u dysgu",
+        "Saved earlier training": "Hyfforddiant cynharach wedi'i gadw",
+        "The best saved table choice": "Y dewis gorau yn y tabl wedi'i gadw",
+        "Neural continuous control": "Rheolaeth niwral barhaus",
+        "Rewards + replay memory": "Gwobrau + cof ailchwarae",
+        "A trained neural network": "Rhwydwaith niwral wedi'i hyfforddi",
+        "Neural control + route preview": "Rheolaeth niwral + rhagolwg llwybr",
+        "Route preview only": "Rhagolwg llwybr yn unig",
+        "Neural control from sensors": "Rheolaeth niwral o synwyryddion",
+        "Rewards + its own good laps": "Gwobrau + ei lapiau da ei hun",
+        "Random comparison": "Cymhariaeth ar hap",
+        "Random control values": "Gwerthoedd rheoli ar hap",
+        "Project agent": "Asiant y prosiect",
+        "Agent specific": "Yn benodol i'r asiant",
+        "See guide": "Gweler y canllaw",
+        "See metadata": "Gweler y manylion technegol",
+    }
+    return tuple((key, translations.get(value, value)) for key, value in selected)
 
 
 def _n_step_td3_template(*, sensor_only: bool) -> dict[str, Any]:
@@ -1438,7 +1676,34 @@ def _n_step_td3_template(*, sensor_only: bool) -> dict[str, Any]:
     }
 
 
-def _metadata(agent: AgentOption) -> tuple[tuple[str, str], ...]:
+def _metadata(
+    agent: AgentOption,
+    language: str = "en",
+) -> tuple[tuple[str, str], ...]:
+    if language == "cy":
+        return (
+            ("Math yr asiant", agent.agent_type),
+            ("Fersiwn", agent.version),
+            (
+                "Dull rheoli",
+                (
+                    "Rheolaeth lawn: llywio, cyflymu, brecio a gêr"
+                    if agent.uses_full_control
+                    else "Allbwn gweithred Gym"
+                ),
+            ),
+            (
+                "Dibyniaeth ar drac",
+                (
+                    "Mae angen ffeil llinell rasio"
+                    if agent.requires_racing_line
+                    else "Nid oes angen ffeil llinell rasio"
+                ),
+            ),
+            ("Lapiau targed", _format_optional_int(agent.target_laps)),
+            ("Uchafswm camau", _format_optional_int(agent.max_steps)),
+        )
+
     return (
         ("Agent type", agent.agent_type),
         ("Version", agent.version),
@@ -1466,21 +1731,40 @@ def _metadata(agent: AgentOption) -> tuple[tuple[str, str], ...]:
 def _track_context(
     agent: AgentOption,
     tracks: list[TrackOption],
+    language: str = "en",
 ) -> tuple[str, ...]:
     compatible_tracks = compatible_tracks_for_agent(agent, tracks)
     if not tracks:
-        return ("No TORCS tracks were discovered.",)
+        return (
+            "Ni ddarganfuwyd unrhyw draciau TORCS."
+            if language == "cy"
+            else "No TORCS tracks were discovered.",
+        )
 
     if agent.requires_racing_line:
         if not compatible_tracks:
+            if language == "cy":
+                return (
+                    "Mae angen ffeiliau llinell rasio ar yr asiant hwn, ond ni ddarganfuwyd yr un.",
+                    "Cynhyrchwch linell rasio cyn ei ddefnyddio ar fap newydd.",
+                )
             return (
                 "This agent needs racing-line files, but none were discovered.",
                 "Generate a racing line before using it on a new map.",
             )
+        if language == "cy":
+            return (
+                f"Traciau â llinell rasio: {_format_track_list(compatible_tracks, language)}.",
+                (
+                    f"Mae gan {len(compatible_tracks)} o'r {len(tracks)} trac a "
+                    "ddarganfuwyd ddata llinell rasio gyfatebol ar hyn o bryd."
+                ),
+                "Mae angen JSON llinell rasio ei hun ar drac newydd cyn bod yr asiant hwn yn ddewis teg.",
+            )
         return (
             (
                 "Racing-line tracks: "
-                f"{_format_track_list(compatible_tracks)}."
+                f"{_format_track_list(compatible_tracks, language)}."
             ),
             (
                 f"{len(compatible_tracks)} of {len(tracks)} discovered tracks "
@@ -1489,8 +1773,18 @@ def _track_context(
             "New tracks need their own racing-line JSON before this agent is a fair fit.",
         )
 
+    if language == "cy":
+        return (
+            f"Traciau cydnaws: {_format_track_list(compatible_tracks, language)}.",
+            (
+                f"Gellir dewis yr asiant hwn ar gyfer {len(compatible_tracks)} "
+                f"o'r {len(tracks)} trac a ddarganfuwyd."
+            ),
+            "Gall perfformiad amrywio yn ôl siâp y trac, hyd yn oed heb ddibynnu ar fap.",
+        )
+
     return (
-        f"Compatible tracks: {_format_track_list(compatible_tracks)}.",
+        f"Compatible tracks: {_format_track_list(compatible_tracks, language)}.",
         (
             f"This agent can be selected for {len(compatible_tracks)} of "
             f"{len(tracks)} discovered tracks."
@@ -1499,14 +1793,19 @@ def _track_context(
     )
 
 
-def _format_track_list(tracks: list[TrackOption]) -> str:
+def _format_track_list(
+    tracks: list[TrackOption],
+    language: str = "en",
+) -> str:
     if not tracks:
-        return "none"
+        return "dim" if language == "cy" else "none"
 
     labels = [track.label for track in tracks[:6]]
     remaining = len(tracks) - len(labels)
     if remaining > 0:
-        labels.append(f"{remaining} more")
+        labels.append(
+            f"{remaining} arall" if language == "cy" else f"{remaining} more"
+        )
     return ", ".join(labels)
 
 

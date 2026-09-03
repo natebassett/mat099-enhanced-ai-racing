@@ -1,8 +1,8 @@
 # Agent 7: N-Step TD3 Racer
 
-Agent 7 is an independent continuous-control racing agent. It exists beside
-Agent 6 and has separate source files, checkpoint contracts, models, logs, and
-evaluation outputs.
+Agent 7 is an independent continuous-control racing agent. It has separate
+source files, checkpoint contracts, models, logs, and evaluation outputs from
+Agent 8 and the project's engineered agents.
 
 ## Design
 
@@ -79,7 +79,7 @@ models/training_runs/agent7_n_step_td3_v5/
 data/evaluation/agent7_n_step_td3_v5/
 ```
 
-It does not load or overwrite any Agent 6 model or earlier Agent 7 checkpoint.
+It does not load or overwrite Agent 8 models or earlier Agent 7 checkpoints.
 The app and evaluator can still load v2 actors for comparison, but v2
 actor/critic checkpoints cannot resume v3 training because their critics were
 fitted to a different reward contract.

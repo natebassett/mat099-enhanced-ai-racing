@@ -9,7 +9,7 @@ an educational animation and measured experiment data.
 
 ## Supported views
 
-- Agents 6, 7, and 8 show the TD3 replay, actor, twin-critic, target, loss,
+- Agents 7 and 8 show the TD3 replay, actor, twin-critic, target, loss,
   gradient, and delayed-update sequence.
 - Dyna-Q agents show state encoding, epsilon-greedy choice, TD error, Q-table
   update, and model replay.
@@ -56,4 +56,3 @@ and target policy smoothing.
 The latter two sources informed the use of progressive disclosure,
 representative rather than exhaustive nodes, direct labels, and step-by-step
 animation. They do not define or alter the racing algorithms.
-

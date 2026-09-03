@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import pyqtgraph as pg
+from project_paths import PROJECT_ROOT
 from PySide6.QtCore import QEvent, Qt, QThread, QTimer
 from PySide6.QtGui import QFont, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
@@ -182,7 +183,7 @@ class MainWindow(QMainWindow):
         self.resize(1440, 860)
         self.setMinimumSize(1120, 700)
 
-        self.project_root = Path(__file__).resolve().parents[2]
+        self.project_root = PROJECT_ROOT
         self._report_startup(30, "Finding drivers, tracks, and saved races...")
         self.project_options: ProjectOptions = load_project_options(self.project_root)
         self._report_startup(46, "Preparing the telemetry workspace...")
@@ -1447,7 +1448,7 @@ class MainWindow(QMainWindow):
         self.track_combo.currentIndexChanged.connect(self._update_selection_details)
         self.car_combo.currentIndexChanged.connect(self._update_selection_details)
         self.agent_education_combo.currentIndexChanged.connect(
-            self._update_agent_education
+            lambda _index: self._update_agent_education()
         )
         self.agent_algorithm_button.clicked.connect(self._open_agent_algorithm_dialog)
         self.run_history_table.cellClicked.connect(self._handle_run_history_clicked)
@@ -1555,6 +1556,8 @@ class MainWindow(QMainWindow):
         )
         translate_widget_tree(self, language)
         self.settings_view.set_language(language)
+        if self.agent_education_combo.count() > 0:
+            self._update_agent_education(language)
 
     def _apply_plot_theme(self, palette) -> None:
         self.visual_palette = palette
@@ -1936,17 +1939,20 @@ class MainWindow(QMainWindow):
         self.track_combo.blockSignals(False)
         self.start_button.setEnabled(self.track_combo.count() > 0)
 
-    def _update_agent_education(self) -> None:
+    def _update_agent_education(self, language: str | None = None) -> None:
+        language = language or self.app_settings.language
         if self.agent_algorithm_dialog is not None:
             self.agent_algorithm_dialog.close()
 
         agent = self.selected_education_agent()
         if agent is None:
             self.agent_education_profile = None
-            self.agent_education_title_label.setText("No agent discovered")
-            self.agent_education_badge_label.setText("Idle")
+            self.agent_education_title_label.setText(
+                tr("No agent discovered", language)
+            )
+            self.agent_education_badge_label.setText(tr("Idle", language))
             self.agent_education_headline_label.setText(
-                "No project agent metadata is available."
+                tr("No project agent metadata is available.", language)
             )
             self.agent_algorithm_button.setEnabled(False)
             self._set_text_box(self.agent_education_metadata_box, ())
@@ -1968,8 +1974,12 @@ class MainWindow(QMainWindow):
         profile = build_agent_education_profile(
             agent,
             self.project_options.tracks,
+            language=language,
         )
-        novice_guide = build_novice_agent_guide(agent.agent_type)
+        novice_guide = build_novice_agent_guide(
+            agent.agent_type,
+            language=language,
+        )
         self.agent_education_profile = profile
         self.agent_algorithm_button.setEnabled(True)
         self.agent_education_title_label.setText(profile.title)
@@ -2034,7 +2044,11 @@ class MainWindow(QMainWindow):
             self.agent_algorithm_dialog.activateWindow()
             return
 
-        dialog = AgentAlgorithmDialog(self.agent_education_profile, self)
+        dialog = AgentAlgorithmDialog(
+            self.agent_education_profile,
+            self,
+            language=self.app_settings.language,
+        )
         self.agent_algorithm_dialog = dialog
         dialog.finished.connect(
             lambda _result, guide_dialog=dialog: self._handle_agent_algorithm_closed(
@@ -3223,9 +3237,11 @@ class AgentAlgorithmDialog(QDialog):
         self,
         profile: AgentEducationProfile,
         parent: QWidget | None = None,
+        *,
+        language: str = "en",
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"Algorithm Guide - {profile.title}")
+        self.setWindowTitle(f"{tr('Algorithm Guide', language)} - {profile.title}")
         self.resize(960, 700)
 
         layout = QVBoxLayout(self)
@@ -3256,6 +3272,7 @@ class AgentAlgorithmDialog(QDialog):
         close_button.clicked.connect(self.close)
         controls.addWidget(close_button)
         layout.addLayout(controls)
+        translate_widget_tree(self, language)
 
     def _build_overview_tab(self, profile: AgentEducationProfile) -> QWidget:
         content = QWidget()

@@ -57,8 +57,8 @@ SQLite foreign-key cascades; a database error rolls the entire operation back.
 
 Agent 8's pre-race notice reports the project's observed `19/20` repeated-run
 completion result. It is an evidence label for that evaluated checkpoint, not a
-claim that all TD3 policies fail exactly one race in twenty. Agent 6 and Agent 7
-use more general notices because their saved evidence has different contracts.
+claim that all TD3 policies fail exactly one race in twenty. Agent 7 has its own
+policy and evaluation contract, so its reliability is reported separately.
 
 ## Research Evidence
 

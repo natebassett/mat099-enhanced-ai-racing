@@ -5,11 +5,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from project_paths import PROJECT_ROOT
 
 
 LOOKAHEAD_DISTANCES_M = np.arange(0.0, 300.0, 25.0, dtype=np.float32)
 CURVATURE_SCALE = 0.1
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RACING_LINE_DIR = PROJECT_ROOT / "data" / "racing_lines"
 
 

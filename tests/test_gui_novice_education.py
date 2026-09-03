@@ -53,6 +53,27 @@ class NoviceEducationTests(unittest.TestCase):
         self.assertIn("does not train", " ".join(map_aware.learning_story).lower())
         self.assertIn("scorebook", " ".join(dyna_q.learning_story).lower())
 
+    def test_every_agent_has_a_complete_welsh_novice_guide(self) -> None:
+        agent_types = (
+            "map_aware",
+            "rule_based",
+            "dyna_q_learning",
+            "dyna_q_finalised",
+            "n_step_td3",
+            "sensor_n_step_td3",
+            "random",
+        )
+
+        for agent_type in agent_types:
+            with self.subTest(agent_type=agent_type):
+                english = build_novice_agent_guide(agent_type)
+                welsh = build_novice_agent_guide(agent_type, language="cy")
+                self.assertEqual(len(welsh.decision_steps), 5)
+                self.assertNotEqual(welsh.headline, english.headline)
+                self.assertTrue(all(welsh.driving_story))
+                self.assertTrue(all(welsh.learning_story))
+                self.assertTrue(all(welsh.input_signals))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+from project_paths import PROJECT_ROOT
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
-GYM_TORCS_DIR = ROOT_DIR / "torcs-wrapper" / "gym_torcs"
+ROOT_DIR = PROJECT_ROOT
+GYM_TORCS_DIR = PROJECT_ROOT / "torcs-wrapper" / "gym_torcs"
 
 sys.path.append(str(GYM_TORCS_DIR))
 

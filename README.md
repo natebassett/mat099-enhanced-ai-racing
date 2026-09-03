@@ -57,10 +57,10 @@ The current project focuses on:
   A Dyna-Q learning agent that learns from repeated interaction with TORCS and
   saves a policy for later evaluation.
 
-- **Deep reinforcement learning as an extension area**  
-  The project structure is intended to support future DRL work, where neural
-  networks could be used to learn driving behaviour from state, reward, and
-  telemetry data.
+- **Deep reinforcement learning**
+  Agent 7 and Agent 8 use N-step TD3 with neural actor-critic policies. Agent
+  7 receives racing-line geometry as context; Agent 8 learns from car and road
+  sensors without a racing line or teacher actions.
 
 The project compares these approaches using measurable race outputs such as
 progress, lap completion, speed, off-track events, crashes, rewards, and
@@ -125,6 +125,8 @@ environment, acts, receives feedback, and can be evaluated or improved.
 | Map-Aware Racing-Line Agent | Uses track and racing-line information to guide the car around the circuit. |
 | Dyna-Q Learning Agent | Learns from experience using reinforcement learning and saves a policy. |
 | Dyna-Q Finalised Agent | Loads a trained policy and drives without further learning or exploration. |
+| torcsRL N-Step TD3 Racer (Agent 7) | Learns continuous control with a racing-line preview used as context, not as copied actions. |
+| Sensor-Only N-Step TD3 Racer (Agent 8) | A reward-only neural policy that learns from vehicle telemetry and 19 road sensors. |
 
 These agents allow the project to show a progression from simple behaviour to
 more structured and learning-based decision-making.
@@ -158,7 +160,7 @@ observable behaviour.
 | Action | A control decision sent back to TORCS, such as steering or braking. |
 | Telemetry | Recorded data that shows what happened during the race. |
 | Reward | A score used by a learning agent to judge whether behaviour was useful. |
-| Policy | Saved decision-making knowledge used by the Dyna-Q agent. |
+| Policy | Saved decision-making knowledge, such as a Dyna-Q table or a neural TD3 checkpoint. |
 | Training | Repeated runs where a learning agent updates its policy. |
 | Evaluation | Testing an agent or saved policy and measuring the result. |
 | Racing line | A planned route around the track used to guide driving decisions. |
@@ -181,13 +183,11 @@ observable behaviour.
 | `torcs/` | Local Windows TORCS simulator files used by the project. |
 | `torcs-wrapper/gym_torcs/` | Python wrapper used to communicate with TORCS. |
 
-## Project Handbook
+## Documentation
 
-The main dissertation wiki-style reference is stored in `docs/`:
-
-- `docs/MAT099_Project_Handbook.docx` is the polished Word handbook for review.
-- `docs/project-handbook.md` is the editable Markdown source summary.
-- `docs/assets/` contains the architecture diagram and placeholder locations for future screenshots.
+The documentation is deliberately split by purpose rather than duplicated in a
+single handbook. Start with [`docs/README.md`](docs/README.md) for the reading
+path, then use the Agent 7/8, GUI evidence, and packaging notes as needed.
 
 ## Running The Project
 
@@ -207,7 +207,14 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-Launch the desktop application:
+Launch the packaged Windows application:
+
+```powershell
+.\dist\Enhanced AI Racing\EnhancedAIRacing.exe
+```
+
+For source development, launch the desktop application from the active project
+environment:
 
 ```powershell
 python src\gui\app.py

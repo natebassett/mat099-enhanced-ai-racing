@@ -151,6 +151,34 @@ class GuiAgentEducationModelTests(unittest.TestCase):
         self.assertTrue(any("Sensor Stability Reward" == note.title for note in profile.formula_notes))
         self.assertTrue(any("No racing-line target" in note for note in profile.input_signals))
 
+    def test_welsh_profile_localises_explanations_but_preserves_technical_data(self):
+        agent = _agent(
+            "Sensor-Only N-Step TD3 Racer",
+            "sensor_n_step_td3",
+            requires_line=False,
+        )
+        english = build_agent_education_profile(agent, _tracks())
+        welsh = build_agent_education_profile(agent, _tracks(), language="cy")
+
+        self.assertNotEqual(welsh.headline, english.headline)
+        self.assertIn("Mae", welsh.headline)
+        self.assertIn("Traciau cydnaws", welsh.track_context[0])
+        self.assertIn("Math yr asiant", dict(welsh.metadata))
+        self.assertEqual(
+            dict(welsh.quick_facts)["Policy"],
+            "Rhwydwaith niwral wedi'i hyfforddi",
+        )
+        self.assertEqual(
+            welsh.formula_notes[0].formula,
+            english.formula_notes[0].formula,
+        )
+        self.assertNotEqual(
+            welsh.formula_notes[0].explanation,
+            english.formula_notes[0].explanation,
+        )
+        self.assertEqual(welsh.code_snippets[0].code, english.code_snippets[0].code)
+        self.assertEqual(welsh.code_snippets[0].source, english.code_snippets[0].source)
+
 
 def _agent(name: str, agent_type: str, *, requires_line: bool) -> AgentOption:
     return AgentOption(

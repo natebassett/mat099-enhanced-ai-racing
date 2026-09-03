@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from project_paths import PROJECT_ROOT
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = PROJECT_ROOT / "src"
 DEFAULT_RUN_LIMIT = 100
 
@@ -122,16 +122,6 @@ def discover_agents() -> list[AgentOption]:
             "dyna_q_finalised",
             "0.1",
             "agents.dyna_q_agent.DynaQFinalisedAgent",
-            True,
-            False,
-            150000,
-            1,
-        ),
-        AgentOption(
-            "TD3 Scratch Racer",
-            "td3_scratch",
-            "0.1",
-            "agents.td3_agent.Td3ScratchAgent",
             True,
             False,
             150000,

@@ -6,12 +6,14 @@ from pathlib import Path
 from PySide6.QtWidgets import QApplication
 
 if __package__ in {None, ""}:
-    sys.path.append(str(Path(__file__).resolve().parent))
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
+    from project_paths import PROJECT_ROOT
     from i18n import tr
     from settings_model import SettingsStore
     from startup_view import StartupView
     from theme import apply_application_theme, palette_for_preferences
 else:
+    from project_paths import PROJECT_ROOT
     from .i18n import tr
     from .settings_model import SettingsStore
     from .startup_view import StartupView
@@ -22,9 +24,8 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Enhanced AI Racing")
     app.setOrganizationName("MAT099")
-    project_root = Path(__file__).resolve().parents[2]
     settings = SettingsStore(
-        project_root / "data" / "generated" / "gui_settings.json"
+        PROJECT_ROOT / "data" / "generated" / "gui_settings.json"
     ).load()
     apply_application_theme(
         app,

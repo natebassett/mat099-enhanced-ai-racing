@@ -26,6 +26,8 @@ class GuiTranslationTests(unittest.TestCase):
 
     def test_known_text_translates_and_technical_text_is_preserved(self) -> None:
         self.assertEqual(tr("Settings", "cy"), "Gosodiadau")
+        self.assertEqual(tr("Formulas", "cy"), "Fformiwlâu")
+        self.assertEqual(tr("Step 3", "cy"), "Cam 3")
         self.assertEqual(tr("TD3 Q1 loss", "cy"), "TD3 Q1 loss")
 
     def test_widget_tree_can_switch_back_to_english(self) -> None:

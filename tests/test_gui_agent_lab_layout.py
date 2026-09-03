@@ -96,6 +96,28 @@ class AgentLabLayoutTests(unittest.TestCase):
         self.assertGreaterEqual(tabs.count(), 3)
         dialog.close()
 
+    def test_welsh_setting_refreshes_agent_lab_and_algorithm_guide(self) -> None:
+        self.window.app_settings = self.window.app_settings.__class__(language="cy")
+        self.window._apply_language("cy")
+
+        self.assertEqual(self.window.agent_lab_tabs.tabText(0), "Gyrru")
+        self.assertIn("Mae", self.window.agent_education_headline_label.text())
+        self.assertIn("Traciau", self.window.agent_education_tracks_box.toPlainText())
+
+        dialog = AgentAlgorithmDialog(
+            self.window.agent_education_profile,
+            self.window,
+            language="cy",
+        )
+        tabs = dialog.findChild(QTabWidget, "algorithmGuideTabs")
+        self.assertEqual(tabs.tabText(0), "Trosolwg")
+        self.assertIn("Canllaw Algorithm", dialog.windowTitle())
+        dialog.close()
+
+        self.window._apply_language("en")
+        self.assertEqual(self.window.agent_lab_tabs.tabText(0), "Driving")
+        self.assertNotIn("Mae", self.window.agent_education_headline_label.text())
+
 
 if __name__ == "__main__":
     unittest.main()

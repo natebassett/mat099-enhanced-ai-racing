@@ -64,7 +64,7 @@ Evaluate the protected deterministic champion:
 python scripts\evaluate_sensor_n_step_td3_agent.py --repeats 10
 ```
 
-The console application exposes the trained policy as option `8`. Agent 7 and
+The console application exposes the trained policy as option `7`. Agent 7 and
 Agent 8 checkpoints have distinct model, observation, and reward contracts, so
 they cannot be loaded into one another accidentally.
 
