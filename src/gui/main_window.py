@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
 import pyqtgraph as pg
+from project_paths import PROJECT_ROOT
 from PySide6.QtCore import QEvent, Qt, QThread, QTimer
 from PySide6.QtGui import QFont, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFrame,
@@ -20,8 +24,10 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QSlider,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -31,6 +37,10 @@ from PySide6.QtWidgets import (
 )
 
 try:
+    from .application_maintenance import (
+        clear_application_cache,
+        inspect_application_cache,
+    )
     from .agent_education_model import (
         AgentEducationProfile,
         build_agent_education_profile,
@@ -55,7 +65,14 @@ try:
         discover_run_history,
         load_project_options,
     )
+    from .navigation import PrimaryNavigation
+    from .learning_visualizer import LearningVisualizerPanel
+    from .i18n import tr, translate_widget_tree
+    from .novice_education import build_novice_agent_guide
     from .race_worker import RaceWorker
+    from .results_view import ResultsView
+    from .settings_model import GuiSettings, SettingsStore
+    from .settings_view import SettingsView
     from .racing_line_model import (
         RacingLineProfile,
         RacingLineVisualProfile,
@@ -76,7 +93,16 @@ try:
         summarize_run_explanation,
     )
     from .track_view import RoadSensorWidget, TrackPositionWidget
+    from .theme import (
+        apply_application_theme,
+        chart_palette_for_preferences,
+        palette_for_preferences,
+    )
 except ImportError:
+    from application_maintenance import (
+        clear_application_cache,
+        inspect_application_cache,
+    )
     from agent_education_model import (
         AgentEducationProfile,
         build_agent_education_profile,
@@ -101,7 +127,14 @@ except ImportError:
         discover_run_history,
         load_project_options,
     )
+    from navigation import PrimaryNavigation
+    from learning_visualizer import LearningVisualizerPanel
+    from i18n import tr, translate_widget_tree
+    from novice_education import build_novice_agent_guide
     from race_worker import RaceWorker
+    from results_view import ResultsView
+    from settings_model import GuiSettings, SettingsStore
+    from settings_view import SettingsView
     from racing_line_model import (
         RacingLineProfile,
         RacingLineVisualProfile,
@@ -122,6 +155,11 @@ except ImportError:
         summarize_run_explanation,
     )
     from track_view import RoadSensorWidget, TrackPositionWidget
+    from theme import (
+        apply_application_theme,
+        chart_palette_for_preferences,
+        palette_for_preferences,
+    )
 
 
 @dataclass(frozen=True)
@@ -135,12 +173,33 @@ class MetricSpec:
 class MainWindow(QMainWindow):
     """Desktop GUI shell with real project option discovery."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        progress_callback: Callable[[int, str], None] | None = None,
+    ) -> None:
         super().__init__()
+        self._startup_progress_callback = progress_callback
         self.setWindowTitle("Enhanced AI Racing Telemetry Dashboard")
-        self.resize(1280, 760)
+        self.resize(1440, 860)
+        self.setMinimumSize(1120, 700)
 
-        self.project_options: ProjectOptions = load_project_options()
+        self.project_root = PROJECT_ROOT
+        self._report_startup(30, "Finding drivers, tracks, and saved races...")
+        self.project_options: ProjectOptions = load_project_options(self.project_root)
+        self._report_startup(46, "Preparing the telemetry workspace...")
+        self.settings_store = SettingsStore(
+            self.project_root / "data" / "generated" / "gui_settings.json"
+        )
+        self.app_settings: GuiSettings = self.settings_store.load()
+        self.visual_palette = palette_for_preferences(
+            self.app_settings.appearance_mode,
+            self.app_settings.colour_mode,
+            QApplication.instance(),
+        )
+        self.chart_palette = chart_palette_for_preferences(
+            self.app_settings.colour_mode,
+            dark=self.visual_palette.is_dark,
+        )
 
         self.agent_combo = QComboBox()
         self.track_combo = QComboBox()
@@ -167,7 +226,9 @@ class MainWindow(QMainWindow):
         self.dyna_q_value_labels: dict[str, QLabel] = {}
         self.run_history_table = QTableWidget(0, 8)
         self.run_history_source_label = QLabel()
-        self.tabs: QTabWidget | None = None
+        self.tabs: PrimaryNavigation | None = None
+        self.results_tab_index = 0
+        self.settings_tab_index = 0
         self.review_tab_index = 0
         self.compare_tab_index = 0
         self.agents_tab_index = 0
@@ -205,13 +266,33 @@ class MainWindow(QMainWindow):
         self.agent_education_title_label = QLabel("Agent Guide")
         self.agent_education_badge_label = QLabel("Idle")
         self.agent_education_headline_label = QLabel("Select an agent.")
-        self.agent_algorithm_button = QPushButton("Algorithm Guide")
+        self.agent_algorithm_button = QPushButton("See equations and code")
+        self.agent_education_fact_labels: dict[str, QLabel] = {}
         self.agent_education_metadata_box = QTextEdit()
         self.agent_education_overview_box = QTextEdit()
+        self.agent_education_learning_box = QTextEdit()
+        self.agent_education_takeaways_box = QTextEdit()
         self.agent_education_signals_box = QTextEdit()
         self.agent_education_strengths_box = QTextEdit()
         self.agent_education_failure_box = QTextEdit()
         self.agent_education_tracks_box = QTextEdit()
+        self.learning_visualizer = LearningVisualizerPanel()
+        self.agent_lab_tabs: QTabWidget | None = None
+        self.results_view = ResultsView(
+            self.project_root,
+            palette=self.visual_palette,
+            chart_palette=self.chart_palette,
+            load_immediately=self.app_settings.start_page == "Results",
+        )
+        self._report_startup(64, "Building the learning and results pages...")
+        self.settings_view = SettingsView(
+            agents=self.project_options.agents,
+            tracks=self.project_options.tracks,
+            settings=self.app_settings,
+            store=self.settings_store,
+            project_root=self.project_root,
+            research_evidence_page=self.results_view.take_technical_evidence_page(),
+        )
         self.agent_pipeline_labels: list[QLabel] = []
         self.racing_line_track_combo = QComboBox()
         self.racing_line_play_button = QPushButton("Play")
@@ -248,7 +329,7 @@ class MainWindow(QMainWindow):
         self.racing_line_distance = 0.0
         self.telemetry_history = TelemetryHistory()
         self.metric_value_labels: dict[str, QLabel] = {}
-        self.chart_window_seconds = 90.0
+        self.chart_window_seconds = float(self.app_settings.chart_window_seconds)
         self.speed_plot: pg.PlotWidget | None = None
         self.steer_plot: pg.PlotWidget | None = None
         self.pedal_plot: pg.PlotWidget | None = None
@@ -275,24 +356,68 @@ class MainWindow(QMainWindow):
         self._last_explanation_step: int | None = None
         self._last_explanation_lap_time: float | None = None
         self._last_explanation_event_key: str | None = None
+        self._agent_lab_loaded = False
+        self._results_load_scheduled = False
 
         self._configure_controls()
         self._build_ui()
+        self._report_startup(82, "Connecting controls and live telemetry...")
         self._refresh_compare_options()
-        self._update_agent_education()
         self._connect_signals()
         self._update_selection_details()
         self._update_dyna_q_panel_visibility()
+        self._apply_plot_theme(self.visual_palette)
+        self._apply_language(self.app_settings.language)
+        self._refresh_settings_storage_summary()
+        self._ensure_current_page_loaded()
+        self._report_startup(96, "Finishing the dashboard...")
+
+    def _report_startup(self, value: int, message: str) -> None:
+        if self._startup_progress_callback is not None:
+            self._startup_progress_callback(value, message)
 
     def _configure_controls(self) -> None:
+        for combo in (
+            self.agent_combo,
+            self.track_combo,
+            self.car_combo,
+            self.agent_education_combo,
+            self.racing_line_track_combo,
+            self.compare_track_combo,
+            self.compare_run_a_combo,
+            self.compare_run_b_combo,
+        ):
+            combo.setSizeAdjustPolicy(
+                QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+            )
+            combo.setMinimumContentsLength(16)
+
         self._populate_combo(self.agent_combo, self.project_options.agents)
+        if self.app_settings.default_agent_type:
+            self._select_combo_item(
+                self.agent_combo,
+                "agent_type",
+                self.app_settings.default_agent_type,
+            )
         self._populate_combo(self.agent_education_combo, self.project_options.agents)
         self._populate_racing_line_tracks()
-        self._refresh_track_options(preferred_track_id="g-track-3")
+        self._refresh_track_options(
+            preferred_track_id=self.app_settings.default_track_id
+        )
         self._populate_combo(self.car_combo, self.project_options.cars)
         self._select_combo_item(self.car_combo, "car_id", "car1-ow1")
 
         self.stop_button.setEnabled(False)
+        self.start_button.setProperty("primary", True)
+        self.stop_button.setProperty("danger", True)
+        self.start_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
+        )
+        self.stop_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaStop)
+        )
+        self.start_button.setToolTip("Start the selected TORCS race")
+        self.stop_button.setToolTip("Stop the active race safely")
         self.status_label.setObjectName("statusLabel")
 
         self.explanation_status_label.setObjectName("explanationStatus")
@@ -373,6 +498,8 @@ class MainWindow(QMainWindow):
         for box in (
             self.agent_education_metadata_box,
             self.agent_education_overview_box,
+            self.agent_education_learning_box,
+            self.agent_education_takeaways_box,
             self.agent_education_signals_box,
             self.agent_education_strengths_box,
             self.agent_education_failure_box,
@@ -391,25 +518,75 @@ class MainWindow(QMainWindow):
         self.racing_line_timer.setInterval(60)
 
     def _build_ui(self) -> None:
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_dashboard_tab(), "Dashboard")
-        self.tabs.addTab(self._build_run_history_tab(), "Run History")
-        self.review_tab_index = self.tabs.addTab(self._build_review_tab(), "Review")
-        self.compare_tab_index = self.tabs.addTab(self._build_compare_tab(), "Compare")
-        self.agents_tab_index = self.tabs.addTab(self._build_agents_tab(), "Agents")
+        self.tabs = PrimaryNavigation()
+        self.tabs.addTab(
+            self._build_dashboard_tab(),
+            "Live Telemetry",
+            "Open the live race dashboard",
+        )
+        self.tabs.addTab(
+            self._build_run_history_tab(),
+            "Runs",
+            "Browse saved race runs",
+        )
+        self.results_tab_index = self.tabs.addTab(
+            self.results_view,
+            "Results",
+            "Inspect evaluation evidence and learning progress",
+        )
+        self.review_tab_index = self.tabs.addTab(
+            self._build_review_tab(),
+            "Review",
+            "Review a saved race run",
+        )
+        self.compare_tab_index = self.tabs.addTab(
+            self._build_compare_tab(),
+            "Compare",
+            "Compare two saved race runs",
+        )
+        self.agents_tab_index = self.tabs.addTab(
+            self._build_agents_tab(),
+            "Agent Lab",
+            "Explore the available driving agents",
+        )
+        self.settings_tab_index = self.tabs.addTab(
+            self.settings_view,
+            "Settings",
+            "Choose application preferences and review research evidence",
+        )
 
         self.setCentralWidget(self.tabs)
+        self.learning_visualizer.set_reduce_motion(self.app_settings.reduce_motion)
+        self._select_start_page(self.app_settings.start_page)
         self.statusBar().showMessage(self._discovery_summary())
 
     def _build_dashboard_tab(self) -> QWidget:
         page = QWidget()
+        page.setObjectName("pageCanvas")
         layout = QHBoxLayout(page)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(12)
 
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._build_control_panel())
-        splitter.addWidget(self._build_telemetry_panel())
-        splitter.addWidget(self._build_explanation_panel())
-        splitter.setSizes([270, 690, 320])
+        splitter.setObjectName("dashboardSplitter")
+        splitter.setChildrenCollapsible(False)
+
+        control_panel = self._build_control_panel()
+        telemetry_panel = self._build_telemetry_panel()
+        explanation_panel = self._build_explanation_panel()
+        control_panel.setMinimumWidth(240)
+        control_panel.setMaximumWidth(300)
+        telemetry_panel.setMinimumWidth(500)
+        explanation_panel.setMinimumWidth(285)
+        explanation_panel.setMaximumWidth(430)
+
+        splitter.addWidget(control_panel)
+        splitter.addWidget(telemetry_panel)
+        splitter.addWidget(explanation_panel)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([260, 720, 360])
 
         layout.addWidget(splitter)
         return page
@@ -417,6 +594,8 @@ class MainWindow(QMainWindow):
     def _build_control_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 8, 0)
+        layout.setSpacing(8)
 
         title = QLabel("Race Control")
         title.setFont(_section_font())
@@ -441,7 +620,10 @@ class MainWindow(QMainWindow):
 
     def _build_telemetry_panel(self) -> QWidget:
         panel = QWidget()
+        panel.setObjectName("liveTelemetryPanel")
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 0, 8, 0)
+        layout.setSpacing(8)
 
         title = QLabel("Live Driver Dashboard")
         title.setFont(_section_font())
@@ -458,6 +640,9 @@ class MainWindow(QMainWindow):
             MetricSpec("damage", "Damage", "--"),
         ]
         metric_grid = QGridLayout()
+        metric_grid.setContentsMargins(0, 0, 0, 0)
+        metric_grid.setHorizontalSpacing(6)
+        metric_grid.setVerticalSpacing(6)
         for index, metric in enumerate(metrics):
             metric_grid.addWidget(
                 self._metric_card(metric),
@@ -467,31 +652,39 @@ class MainWindow(QMainWindow):
         layout.addLayout(metric_grid)
 
         road_row = QHBoxLayout()
+        road_row.setContentsMargins(0, 0, 0, 0)
+        road_row.setSpacing(8)
         road_row.addWidget(self._visual_group("Road Position", self.track_position_widget))
         road_row.addWidget(self._visual_group("Road Ahead", self.road_sensor_widget))
         layout.addLayout(road_row)
 
-        chart_row = QHBoxLayout()
-        self.speed_plot = self._build_plot("Speed", "km/h")
+        chart_tabs = QTabWidget()
+        chart_tabs.setObjectName("contentTabs")
+        chart_tabs.setMinimumHeight(190)
+
+        self.speed_plot = self._build_plot("", "km/h")
         self.speed_plot.setYRange(0.0, 220.0)
         self.speed_curve = self.speed_plot.plot(
             [],
             [],
             pen=pg.mkPen("#2f80ed", width=2),
         )
-        chart_row.addWidget(self.speed_plot)
+        chart_tabs.addTab(self.speed_plot, "Speed")
 
-        self.steer_plot = self._build_plot("Steering", "steer")
+        self.steer_plot = self._build_plot("", "steer")
         self.steer_plot.setYRange(-1.0, 1.0)
         self.steer_curve = self.steer_plot.plot(
             [],
             [],
             pen=pg.mkPen("#8e5cf7", width=2),
         )
-        chart_row.addWidget(self.steer_plot)
-        layout.addLayout(chart_row)
+        chart_tabs.addTab(self.steer_plot, "Steering")
 
-        self.pedal_plot = self._build_plot("Throttle / Brake", "%")
+        pedal_page = QWidget()
+        pedal_layout = QVBoxLayout(pedal_page)
+        pedal_layout.setContentsMargins(0, 4, 0, 0)
+        pedal_layout.setSpacing(2)
+        self.pedal_plot = self._build_plot("", "%")
         self.pedal_plot.setYRange(0.0, 100.0)
         self.throttle_curve = self.pedal_plot.plot(
             [],
@@ -503,7 +696,7 @@ class MainWindow(QMainWindow):
             [],
             pen=pg.mkPen("#c0392b", width=2),
         )
-        layout.addWidget(
+        pedal_layout.addWidget(
             self._chart_legend(
                 [
                     ("Throttle", "#27ae60"),
@@ -511,13 +704,24 @@ class MainWindow(QMainWindow):
                 ]
             )
         )
-        layout.addWidget(self.pedal_plot)
+        pedal_layout.addWidget(self.pedal_plot, 1)
+        chart_tabs.addTab(pedal_page, "Throttle / Brake")
+        layout.addWidget(chart_tabs, 1)
 
         return panel
 
     def _build_explanation_panel(self) -> QWidget:
+        scroll_area = QScrollArea()
+        scroll_area.setObjectName("dashboardInsightScroll")
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
         panel = QWidget()
+        panel.setObjectName("scrollCanvas")
+        panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 0, 8, 0)
+        layout.setSpacing(8)
 
         title = QLabel("What The Car Is Doing")
         title.setFont(_section_font())
@@ -541,7 +745,8 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.explanation_box)
         layout.addWidget(log_group, 1)
 
-        return panel
+        scroll_area.setWidget(panel)
+        return scroll_area
 
     def _build_dyna_q_learning_panel(self) -> QWidget:
         group = QGroupBox("Dyna-Q Learning Brain")
@@ -552,22 +757,20 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.dyna_q_status_detail_label)
 
         loop_group = QGroupBox("Learning Loop")
-        loop_layout = QHBoxLayout(loop_group)
+        loop_layout = QGridLayout(loop_group)
         loop_layout.setSpacing(6)
         for index, step in enumerate(
             ("Observe", "Act", "Reward", "Update Q-table", "Replay memory")
         ):
-            if index:
-                arrow = QLabel(">")
-                arrow.setAlignment(Qt.AlignCenter)
-                loop_layout.addWidget(arrow)
-            step_label = QLabel(step)
+            step_label = QLabel(f"{index + 1}. {step}")
             step_label.setAlignment(Qt.AlignCenter)
             step_label.setWordWrap(True)
-            step_label.setMinimumHeight(34)
+            step_label.setMinimumHeight(38)
             step_label.setStyleSheet(_dyna_q_loop_style(active=False))
             self.dyna_q_loop_labels.append(step_label)
-            loop_layout.addWidget(step_label, 1)
+            loop_layout.addWidget(step_label, index // 3, index % 3)
+        for column in range(3):
+            loop_layout.setColumnStretch(column, 1)
         layout.addWidget(loop_group)
 
         why_group = QGroupBox("Why This Action?")
@@ -612,6 +815,8 @@ class MainWindow(QMainWindow):
     def _build_run_history_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
 
         title = QLabel("Run History")
         title.setFont(_section_font())
@@ -647,6 +852,7 @@ class MainWindow(QMainWindow):
     def _build_review_tab(self) -> QWidget:
         page = QWidget()
         layout = QHBoxLayout(page)
+        layout.setContentsMargins(18, 18, 18, 18)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_review_replay_panel())
@@ -775,6 +981,7 @@ class MainWindow(QMainWindow):
     def _build_compare_tab(self) -> QWidget:
         page = QWidget()
         layout = QHBoxLayout(page)
+        layout.setContentsMargins(18, 18, 18, 18)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self._build_compare_replay_panel())
@@ -901,12 +1108,21 @@ class MainWindow(QMainWindow):
 
     def _build_agents_tab(self) -> QWidget:
         page = QWidget()
+        page.setObjectName("pageCanvas")
         layout = QHBoxLayout(page)
+        layout.setContentsMargins(16, 14, 16, 14)
 
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._build_agent_education_left_panel())
-        splitter.addWidget(self._build_agent_education_detail_panel())
-        splitter.setSizes([330, 850])
+        splitter.setObjectName("agentLabSplitter")
+        splitter.setChildrenCollapsible(False)
+        summary_panel = self._build_agent_education_left_panel()
+        detail_panel = self._build_agent_education_detail_panel()
+        summary_panel.setMinimumWidth(280)
+        summary_panel.setMaximumWidth(360)
+        detail_panel.setMinimumWidth(620)
+        splitter.addWidget(summary_panel)
+        splitter.addWidget(detail_panel)
+        splitter.setSizes([320, 1040])
         layout.addWidget(splitter)
 
         return page
@@ -914,62 +1130,161 @@ class MainWindow(QMainWindow):
     def _build_agent_education_left_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 10, 0)
+        layout.setSpacing(10)
 
-        title = QLabel("Agents")
+        title = QLabel("Agent Lab")
+        title.setObjectName("pageTitle")
         title.setFont(_section_font())
+        subtitle = QLabel(
+            "Pick a driver to see what it notices, how it decides, and whether it learns."
+        )
+        subtitle.setObjectName("pageSubtitle")
+        subtitle.setWordWrap(True)
         layout.addWidget(title)
+        layout.addWidget(subtitle)
         layout.addWidget(self._combo_group("Driver", self.agent_education_combo))
 
-        profile_group = QGroupBox("Profile")
+        profile_group = QGroupBox("Meet This Driver")
         profile_layout = QVBoxLayout(profile_group)
         profile_layout.addWidget(self.agent_education_title_label)
         profile_layout.addWidget(self.agent_education_badge_label)
         profile_layout.addWidget(self.agent_education_headline_label)
-        profile_layout.addWidget(self.agent_algorithm_button)
         layout.addWidget(profile_group)
 
-        layout.addWidget(
-            self._text_group("Project Metadata", self.agent_education_metadata_box)
+        layout.addWidget(self._build_agent_quick_facts())
+        self.agent_algorithm_button.setProperty("primary", True)
+        self.agent_algorithm_button.setToolTip(
+            "Open the optional technical guide with equations, pseudocode, and source excerpts"
         )
+        layout.addWidget(self.agent_algorithm_button)
         layout.addStretch(1)
         return panel
 
-    def _build_agent_education_detail_panel(self) -> QWidget:
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
+    def _build_agent_quick_facts(self) -> QWidget:
+        panel = QFrame()
+        panel.setProperty("surface", True)
+        layout = QGridLayout(panel)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(10)
 
+        for index, (fact_key, visible_label) in enumerate(
+            (
+                ("Approach", "Driver style"),
+                ("Learns from", "How it improves"),
+                ("Policy", "Makes decisions with"),
+                ("Racing line", "Track guide"),
+            )
+        ):
+            label = QLabel(visible_label)
+            label.setObjectName("metricLabel")
+            value = QLabel("--")
+            value.setObjectName("factValue")
+            value.setWordWrap(True)
+            value.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+            self.agent_education_fact_labels[fact_key] = value
+            row = index // 2
+            column = (index % 2) * 2
+            layout.addWidget(label, row * 2, column, 1, 2)
+            layout.addWidget(value, row * 2 + 1, column, 1, 2)
+        return panel
+
+    def _build_agent_education_detail_panel(self) -> QTabWidget:
+        tabs = QTabWidget()
+        self.agent_lab_tabs = tabs
+        tabs.setObjectName("agentLabTabs")
+        tabs.addTab(self._build_agent_driving_page(), "Driving")
+        tabs.addTab(self._build_agent_learning_page(), "Learning")
+        tabs.addTab(
+            self._agent_lab_scroll_page(
+                self.learning_visualizer,
+                "learningVisualizerScroll",
+            ),
+            "Inside the Brain",
+        )
+        tabs.addTab(self._build_agent_limits_page(), "Strengths & Limits")
+        tabs.currentChanged.connect(self._handle_agent_lab_page_changed)
+        return tabs
+
+    def _build_agent_driving_page(self) -> QScrollArea:
         content = QWidget()
+        content.setObjectName("scrollCanvas")
         layout = QVBoxLayout(content)
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(10)
         layout.addWidget(
-            self._text_group("What This Driver Is Doing", self.agent_education_overview_box)
+            self._text_group("The Simple Version", self.agent_education_overview_box)
         )
 
-        decision_group = QGroupBox("Decision Flow")
+        decision_group = QGroupBox("One Decision, Step by Step")
         decision_layout = QVBoxLayout(decision_group)
         decision_layout.addWidget(self._build_agent_pipeline())
         layout.addWidget(decision_group)
-
         layout.addWidget(self._build_racing_line_visualizer_panel())
+        layout.addStretch(1)
+        return self._agent_lab_scroll_page(content, "agentDrivingScroll")
+
+    def _build_agent_learning_page(self) -> QScrollArea:
+        content = QWidget()
+        content.setObjectName("scrollCanvas")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(10)
+        layout.addWidget(
+            self._text_group("How Learning Works", self.agent_education_learning_box)
+        )
+
+        detail_row = QHBoxLayout()
+        detail_row.setSpacing(10)
+        detail_row.addWidget(
+            self._text_group("What It Can See", self.agent_education_signals_box)
+        )
+        detail_row.addWidget(
+            self._text_group("In Plain English", self.agent_education_takeaways_box)
+        )
+        layout.addLayout(detail_row)
+        layout.addStretch(1)
+        return self._agent_lab_scroll_page(content, "agentLearningScroll")
+
+    def _build_agent_limits_page(self) -> QScrollArea:
+        content = QWidget()
+        content.setObjectName("scrollCanvas")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(10)
 
         first_row = QHBoxLayout()
+        first_row.setSpacing(10)
         first_row.addWidget(
-            self._text_group("What It Watches", self.agent_education_signals_box)
+            self._text_group("What It Does Well", self.agent_education_strengths_box)
         )
         first_row.addWidget(
-            self._text_group("Where It Helps", self.agent_education_strengths_box)
+            self._text_group("What Can Go Wrong", self.agent_education_failure_box)
         )
         layout.addLayout(first_row)
 
         second_row = QHBoxLayout()
+        second_row.setSpacing(10)
         second_row.addWidget(
-            self._text_group("Failure Signs", self.agent_education_failure_box)
+            self._text_group("Where It Works", self.agent_education_tracks_box)
         )
         second_row.addWidget(
-            self._text_group("Track Fit", self.agent_education_tracks_box)
+            self._text_group("Technical Details", self.agent_education_metadata_box)
         )
         layout.addLayout(second_row)
         layout.addStretch(1)
+        return self._agent_lab_scroll_page(content, "agentLimitsScroll")
 
+    def _agent_lab_scroll_page(
+        self,
+        content: QWidget,
+        object_name: str,
+    ) -> QScrollArea:
+        scroll_area = QScrollArea()
+        scroll_area.setObjectName(object_name)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll_area.setWidget(content)
         return scroll_area
 
@@ -981,7 +1296,7 @@ class MainWindow(QMainWindow):
 
         for index in range(5):
             card = QFrame()
-            card.setFrameShape(QFrame.StyledPanel)
+            card.setProperty("pipelineStep", True)
             card.setMinimumHeight(88)
 
             card_layout = QVBoxLayout(card)
@@ -994,7 +1309,10 @@ class MainWindow(QMainWindow):
 
             card_layout.addWidget(step_label)
             card_layout.addWidget(body_label)
-            layout.addWidget(card, index // 3, index % 3)
+            if index < 3:
+                layout.addWidget(card, 0, index * 2, 1, 2)
+            else:
+                layout.addWidget(card, 1, (index - 3) * 3, 1, 3)
 
         return widget
 
@@ -1059,6 +1377,7 @@ class MainWindow(QMainWindow):
         for label, color in items:
             swatch = QLabel()
             swatch.setFixedSize(10, 10)
+            swatch.setProperty("chartSeries", label)
             swatch.setStyleSheet(
                 f"background-color: {color}; border: 1px solid #202020;"
             )
@@ -1070,8 +1389,8 @@ class MainWindow(QMainWindow):
 
     def _metric_card(self, metric: MetricSpec) -> QFrame:
         card = QFrame()
-        card.setFrameShape(QFrame.StyledPanel)
-        card.setMinimumHeight(82)
+        card.setProperty("metricCard", True)
+        card.setMinimumHeight(72)
 
         layout = QVBoxLayout(card)
         label = QLabel(metric.label)
@@ -1088,7 +1407,7 @@ class MainWindow(QMainWindow):
 
     def _review_metric_card(self, metric: MetricSpec) -> QFrame:
         card = QFrame()
-        card.setFrameShape(QFrame.StyledPanel)
+        card.setProperty("metricCard", True)
         card.setMinimumHeight(72)
 
         layout = QVBoxLayout(card)
@@ -1106,11 +1425,16 @@ class MainWindow(QMainWindow):
 
     def _build_plot(self, title: str, left_axis_label: str) -> pg.PlotWidget:
         plot = pg.PlotWidget()
-        plot.setTitle(title)
-        plot.setBackground("w")
+        if title:
+            plot.setTitle(title)
+        plot.setBackground(self.visual_palette.plot_background())
         plot.setLabel("left", left_axis_label)
         plot.setLabel("bottom", "lap time", units="s")
         plot.showGrid(x=True, y=True, alpha=0.25)
+        for axis_name in ("left", "bottom"):
+            axis = plot.getAxis(axis_name)
+            axis.setTextPen(self.visual_palette.muted)
+            axis.setPen(self.visual_palette.border_strong)
         plot.hideButtons()
         plot.setMenuEnabled(False)
         plot.setMouseEnabled(x=False, y=False)
@@ -1124,7 +1448,7 @@ class MainWindow(QMainWindow):
         self.track_combo.currentIndexChanged.connect(self._update_selection_details)
         self.car_combo.currentIndexChanged.connect(self._update_selection_details)
         self.agent_education_combo.currentIndexChanged.connect(
-            self._update_agent_education
+            lambda _index: self._update_agent_education()
         )
         self.agent_algorithm_button.clicked.connect(self._open_agent_algorithm_dialog)
         self.run_history_table.cellClicked.connect(self._handle_run_history_clicked)
@@ -1151,6 +1475,304 @@ class MainWindow(QMainWindow):
         self.racing_line_reset_button.clicked.connect(self._reset_racing_line_animation)
         self.racing_line_map_button.clicked.connect(self._open_racing_line_map_dialog)
         self.racing_line_timer.timeout.connect(self._advance_racing_line_animation)
+        self.settings_view.settings_saved.connect(self._apply_gui_settings)
+        self.settings_view.clear_cache_requested.connect(
+            self._handle_clear_application_cache
+        )
+        self.settings_view.reset_run_history_requested.connect(
+            self._handle_reset_run_history
+        )
+        if self.tabs is not None:
+            self.tabs.currentChanged.connect(self._handle_primary_page_changed)
+        self.settings_view.tabs.currentChanged.connect(
+            self._handle_settings_page_changed
+        )
+
+    def _handle_primary_page_changed(self, index: int) -> None:
+        if index == self.agents_tab_index:
+            self._ensure_agent_lab_loaded()
+        elif index == self.results_tab_index:
+            self._schedule_results_load()
+        elif (
+            index == self.settings_tab_index
+            and self.settings_view.tabs.currentIndex() == 1
+        ):
+            self._schedule_results_load()
+
+    def _handle_settings_page_changed(self, index: int) -> None:
+        if index == 1:
+            self._schedule_results_load()
+
+    def _ensure_current_page_loaded(self) -> None:
+        if self.tabs is not None:
+            self._handle_primary_page_changed(self.tabs.currentIndex())
+
+    def _ensure_agent_lab_loaded(self) -> None:
+        if self._agent_lab_loaded:
+            return
+        self._agent_lab_loaded = True
+        self._update_agent_education()
+
+    def _handle_agent_lab_page_changed(self, index: int) -> None:
+        if index == 2:
+            self.learning_visualizer.load_checkpoint_statistics()
+
+    def _schedule_results_load(self) -> None:
+        if self.results_view.is_loaded or self._results_load_scheduled:
+            return
+        self._results_load_scheduled = True
+        self.results_view.summary_label.setText("Loading saved evidence...")
+        QTimer.singleShot(0, self._load_results_evidence)
+
+    def _load_results_evidence(self) -> None:
+        try:
+            if not self.results_view.is_loaded:
+                self.results_view.reload()
+        finally:
+            self._results_load_scheduled = False
+
+    def _apply_gui_settings(self, settings: GuiSettings) -> None:
+        self.app_settings = settings
+        self.chart_window_seconds = float(settings.chart_window_seconds)
+        self.learning_visualizer.set_reduce_motion(settings.reduce_motion)
+        application = QApplication.instance()
+        if application is not None:
+            palette = palette_for_preferences(
+                settings.appearance_mode,
+                settings.colour_mode,
+                application,
+            )
+            apply_application_theme(application, palette)
+            self._apply_plot_theme(palette)
+        self._apply_language(settings.language)
+        self.statusBar().showMessage(
+            tr("Settings saved", settings.language),
+            4_000,
+        )
+
+    def _apply_language(self, language: str) -> None:
+        self.setWindowTitle(
+            tr("Enhanced AI Racing Telemetry Dashboard", language)
+        )
+        translate_widget_tree(self, language)
+        self.settings_view.set_language(language)
+        if self.agent_education_combo.count() > 0:
+            self._update_agent_education(language)
+
+    def _apply_plot_theme(self, palette) -> None:
+        self.visual_palette = palette
+        self.chart_palette = chart_palette_for_preferences(
+            self.app_settings.colour_mode,
+            dark=palette.is_dark,
+        )
+        for plot in (
+            self.speed_plot,
+            self.steer_plot,
+            self.pedal_plot,
+            self.review_speed_plot,
+            self.review_steer_plot,
+            self.review_pedal_plot,
+            self.compare_speed_plot,
+        ):
+            if plot is None:
+                continue
+            plot.setBackground(palette.plot_background())
+            for axis_name in ("left", "bottom"):
+                axis = plot.getAxis(axis_name)
+                axis.setTextPen(palette.muted)
+                axis.setPen(palette.border_strong)
+
+        curve_pens = (
+            (self.speed_curve, self.chart_palette.speed, Qt.SolidLine),
+            (self.steer_curve, self.chart_palette.steering, Qt.SolidLine),
+            (self.throttle_curve, self.chart_palette.throttle, Qt.SolidLine),
+            (self.brake_curve, self.chart_palette.brake, Qt.DashLine),
+            (self.review_speed_curve, self.chart_palette.speed, Qt.SolidLine),
+            (self.review_steer_curve, self.chart_palette.steering, Qt.SolidLine),
+            (
+                self.review_throttle_curve,
+                self.chart_palette.throttle,
+                Qt.SolidLine,
+            ),
+            (self.review_brake_curve, self.chart_palette.brake, Qt.DashLine),
+            (
+                self.compare_speed_curve_a,
+                self.chart_palette.comparison_a,
+                Qt.SolidLine,
+            ),
+            (
+                self.compare_speed_curve_b,
+                self.chart_palette.comparison_b,
+                Qt.DashLine,
+            ),
+        )
+        for curve, colour, style in curve_pens:
+            if curve is not None:
+                curve.setPen(pg.mkPen(colour, width=2, style=style))
+
+        for marker in (
+            self.review_speed_marker,
+            self.review_steer_marker,
+            self.review_pedal_marker,
+            self.compare_speed_marker,
+        ):
+            if marker is not None:
+                marker.setPen(pg.mkPen(self.chart_palette.neutral, width=1))
+
+        legend_colours = {
+            "Speed": self.chart_palette.speed,
+            "Steering": self.chart_palette.steering,
+            "Throttle": self.chart_palette.throttle,
+            "Brake": self.chart_palette.brake,
+            "Run A": self.chart_palette.comparison_a,
+            "Run B": self.chart_palette.comparison_b,
+            "Accelerate": self.chart_palette.throttle,
+            "Full throttle": self.chart_palette.throttle,
+            "Turn": self.chart_palette.steering,
+            "Settle": self.chart_palette.speed,
+        }
+        for swatch in self.findChildren(QLabel):
+            series = str(swatch.property("chartSeries") or "")
+            if series in legend_colours:
+                swatch.setStyleSheet(
+                    f"background-color: {legend_colours[series]}; "
+                    f"border: 1px solid {palette.border_strong};"
+                )
+
+        self.learning_visualizer.set_visual_theme(
+            palette,
+            self.chart_palette,
+        )
+        self.results_view.set_visual_theme(palette, self.chart_palette)
+
+    def _refresh_settings_storage_summary(self) -> None:
+        cache = inspect_application_cache(self.project_root)
+        self.settings_view.refresh_storage_summary(
+            run_count=self._saved_run_count(),
+            cache_bytes=cache.bytes_used,
+            cache_directories=cache.directories,
+        )
+
+    def _saved_run_count(self) -> int:
+        database_path = self.project_root / "data" / "generated" / "race_results.db"
+        if not database_path.is_file():
+            return len(self.project_options.runs)
+        try:
+            from storage import RaceRepository
+
+            return RaceRepository(database_path).count_runs()
+        except (OSError, RuntimeError):
+            return len(self.project_options.runs)
+
+    def _handle_clear_application_cache(self) -> None:
+        if self.race_thread is not None:
+            return
+        try:
+            removed = clear_application_cache(self.project_root)
+            self.learning_visualizer.clear_statistics_cache()
+        except OSError as error:
+            QMessageBox.warning(
+                self,
+                tr("Cache Could Not Be Cleared", self.app_settings.language),
+                (
+                    f"Ni newidiwyd y storfa dros dro.\n\n{error}"
+                    if self.app_settings.language == "cy"
+                    else f"The temporary cache was left unchanged.\n\n{error}"
+                ),
+            )
+            return
+        self._refresh_settings_storage_summary()
+        QMessageBox.information(
+            self,
+            tr("Temporary Cache Cleared", self.app_settings.language),
+            _cache_cleared_text(
+                removed.bytes_used,
+                removed.directories,
+                self.app_settings.language,
+            ),
+        )
+
+    def _handle_reset_run_history(self) -> None:
+        if self.race_thread is not None:
+            return
+        run_count = self._saved_run_count()
+        if run_count <= 1:
+            QMessageBox.information(
+                self,
+                tr("Run History Already Clear", self.app_settings.language),
+                tr("There are no older race runs to remove.", self.app_settings.language),
+            )
+            return
+
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle(tr("Reset Run History?", self.app_settings.language))
+        dialog.setText(tr("Delete older GUI race runs?", self.app_settings.language))
+        dialog.setInformativeText(_run_reset_warning_text(
+            run_count,
+            self.app_settings.default_track_id,
+            self.app_settings.language,
+        ))
+        delete_button = dialog.addButton(
+            tr("Delete older runs", self.app_settings.language),
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
+        dialog.addButton(
+            tr("Cancel", self.app_settings.language),
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        dialog.exec()
+        if dialog.clickedButton() is not delete_button:
+            return
+
+        try:
+            from storage import RaceRepository
+
+            result = RaceRepository().prune_runs_to_representatives(
+                preferred_track=self.app_settings.default_track_id
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                tr("Run History Could Not Be Reset", self.app_settings.language),
+                (
+                    f"Ni ddilëwyd unrhyw ras yn fwriadol.\n\n{error}"
+                    if self.app_settings.language == "cy"
+                    else f"No runs were intentionally removed.\n\n{error}"
+                ),
+            )
+            return
+
+        self._clear_review_after_history_reset()
+        self._reload_run_history()
+        self.results_view.reload()
+        self._refresh_settings_storage_summary()
+        QMessageBox.information(
+            self,
+            tr("Run History Reset", self.app_settings.language),
+            _run_reset_result_text(
+                result.deleted_count,
+                result.retained_count,
+                self.app_settings.language,
+            ),
+        )
+
+    def _clear_review_after_history_reset(self) -> None:
+        self.review_timer.stop()
+        self.review_run = None
+        self.review_snapshots = []
+        self.review_title_label.setText("No run selected")
+        self.review_summary_box.setText("Select a saved run from Run History.")
+        self._clear_review_snapshot()
+        self._clear_compare_view("Select two saved runs to compare.")
+
+    def _select_start_page(self, page_name: str) -> None:
+        if self.tabs is None:
+            return
+        for index in range(self.tabs.count()):
+            if self.tabs.tabText(index) == page_name:
+                self.tabs.setCurrentIndex(index)
+                return
 
     def _handle_start_clicked(self) -> None:
         if self.race_thread is not None:
@@ -1161,6 +1783,8 @@ class MainWindow(QMainWindow):
         car = self.selected_car()
         if agent is None or track is None or car is None:
             self.status_label.setText("No compatible race setup selected.")
+            return
+        if not self._confirm_td3_start(agent):
             return
 
         self._set_race_controls_enabled(False)
@@ -1191,6 +1815,40 @@ class MainWindow(QMainWindow):
         self.race_thread.finished.connect(self.race_thread.deleteLater)
         self.race_thread.finished.connect(self._clear_race_thread)
         self.race_thread.start()
+
+    def _confirm_td3_start(self, agent: AgentOption) -> bool:
+        if (
+            not self.app_settings.show_td3_advisory
+            or agent.agent_type
+            not in {"td3_scratch", "n_step_td3", "sensor_n_step_td3"}
+        ):
+            return True
+
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Information)
+        language = self.app_settings.language
+        dialog.setWindowTitle(tr("Before You Start", language))
+        dialog.setText(tr("Learned drivers can vary between races.", language))
+        dialog.setInformativeText(_td3_advisory_text(agent.agent_type, language))
+        never_again = QCheckBox(tr("Do not show this note again", language))
+        dialog.setCheckBox(never_again)
+        start_button = dialog.addButton(
+            tr("Start race", language),
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        dialog.addButton(tr("Not now", language), QMessageBox.ButtonRole.RejectRole)
+        dialog.exec()
+
+        if never_again.isChecked():
+            updated = replace(self.app_settings, show_td3_advisory=False)
+            try:
+                self.settings_store.save(updated)
+            except OSError:
+                pass
+            else:
+                self.app_settings = updated
+                self.settings_view.set_settings(updated)
+        return dialog.clickedButton() is start_button
 
     def _handle_stop_clicked(self) -> None:
         if self.race_worker is None:
@@ -1281,53 +1939,98 @@ class MainWindow(QMainWindow):
         self.track_combo.blockSignals(False)
         self.start_button.setEnabled(self.track_combo.count() > 0)
 
-    def _update_agent_education(self) -> None:
+    def _update_agent_education(self, language: str | None = None) -> None:
+        language = language or self.app_settings.language
         if self.agent_algorithm_dialog is not None:
             self.agent_algorithm_dialog.close()
 
         agent = self.selected_education_agent()
         if agent is None:
             self.agent_education_profile = None
-            self.agent_education_title_label.setText("No agent discovered")
-            self.agent_education_badge_label.setText("Idle")
+            self.agent_education_title_label.setText(
+                tr("No agent discovered", language)
+            )
+            self.agent_education_badge_label.setText(tr("Idle", language))
             self.agent_education_headline_label.setText(
-                "No project agent metadata is available."
+                tr("No project agent metadata is available.", language)
             )
             self.agent_algorithm_button.setEnabled(False)
             self._set_text_box(self.agent_education_metadata_box, ())
             self._set_text_box(self.agent_education_overview_box, ())
+            self._set_text_box(self.agent_education_learning_box, ())
+            self._set_text_box(self.agent_education_takeaways_box, ())
             self._set_text_box(self.agent_education_signals_box, ())
             self._set_text_box(self.agent_education_strengths_box, ())
             self._set_text_box(self.agent_education_failure_box, ())
             self._set_text_box(self.agent_education_tracks_box, ())
+            for label in self.agent_education_fact_labels.values():
+                label.setText("--")
             for label in self.agent_pipeline_labels:
                 label.setText("--")
+            self.learning_visualizer.set_agent(None)
             self._sync_racing_line_visualizer(None)
             return
 
         profile = build_agent_education_profile(
             agent,
             self.project_options.tracks,
+            language=language,
+        )
+        novice_guide = build_novice_agent_guide(
+            agent.agent_type,
+            language=language,
         )
         self.agent_education_profile = profile
         self.agent_algorithm_button.setEnabled(True)
         self.agent_education_title_label.setText(profile.title)
-        self.agent_education_badge_label.setText(profile.badge)
-        self.agent_education_headline_label.setText(profile.headline)
+        self.agent_education_badge_label.setText(novice_guide.badge)
+        self.agent_education_headline_label.setText(novice_guide.headline)
         self.agent_education_metadata_box.setPlainText(
             _format_key_value_lines(profile.metadata)
         )
-        self._set_text_box(self.agent_education_overview_box, profile.overview)
-        self._set_text_box(self.agent_education_signals_box, profile.input_signals)
-        self._set_text_box(self.agent_education_strengths_box, profile.strengths)
-        self._set_text_box(self.agent_education_failure_box, profile.failure_signs)
+        self._set_text_box(
+            self.agent_education_overview_box,
+            novice_guide.driving_story,
+        )
+        self._set_text_box(
+            self.agent_education_learning_box,
+            novice_guide.learning_story,
+        )
+        self._set_text_box(
+            self.agent_education_takeaways_box,
+            novice_guide.key_takeaways,
+        )
+        self._set_text_box(
+            self.agent_education_signals_box,
+            novice_guide.input_signals,
+        )
+        self._set_text_box(
+            self.agent_education_strengths_box,
+            novice_guide.strengths,
+        )
+        self._set_text_box(
+            self.agent_education_failure_box,
+            novice_guide.failure_signs,
+        )
         self._set_text_box(self.agent_education_tracks_box, profile.track_context)
 
+        for label, value in profile.quick_facts:
+            fact_label = self.agent_education_fact_labels.get(label)
+            if fact_label is not None:
+                fact_label.setText(value)
+
         for index, label in enumerate(self.agent_pipeline_labels):
-            if index < len(profile.decision_steps):
-                label.setText(profile.decision_steps[index])
+            if index < len(novice_guide.decision_steps):
+                label.setText(novice_guide.decision_steps[index])
             else:
                 label.setText("--")
+        self.learning_visualizer.set_agent(
+            agent.agent_type,
+            agent.name,
+            inspect_checkpoint=False,
+        )
+        if self.agent_lab_tabs is not None and self.agent_lab_tabs.currentIndex() == 2:
+            self.learning_visualizer.load_checkpoint_statistics()
         self._sync_racing_line_visualizer(agent)
 
     def _set_text_box(self, box: QTextEdit, lines: tuple[str, ...]) -> None:
@@ -1341,7 +2044,11 @@ class MainWindow(QMainWindow):
             self.agent_algorithm_dialog.activateWindow()
             return
 
-        dialog = AgentAlgorithmDialog(self.agent_education_profile, self)
+        dialog = AgentAlgorithmDialog(
+            self.agent_education_profile,
+            self,
+            language=self.app_settings.language,
+        )
         self.agent_algorithm_dialog = dialog
         dialog.finished.connect(
             lambda _result, guide_dialog=dialog: self._handle_agent_algorithm_closed(
@@ -2495,6 +3202,7 @@ class MainWindow(QMainWindow):
         self.car_combo.setEnabled(enabled)
         self.start_button.setEnabled(enabled and self.track_combo.count() > 0)
         self.stop_button.setEnabled(not enabled)
+        self.settings_view.set_maintenance_enabled(enabled)
 
     def _reset_race_controls(self) -> None:
         self._set_race_controls_enabled(True)
@@ -2529,9 +3237,11 @@ class AgentAlgorithmDialog(QDialog):
         self,
         profile: AgentEducationProfile,
         parent: QWidget | None = None,
+        *,
+        language: str = "en",
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"Algorithm Guide - {profile.title}")
+        self.setWindowTitle(f"{tr('Algorithm Guide', language)} - {profile.title}")
         self.resize(960, 700)
 
         layout = QVBoxLayout(self)
@@ -2546,6 +3256,7 @@ class AgentAlgorithmDialog(QDialog):
         layout.addWidget(subtitle)
 
         tabs = QTabWidget()
+        tabs.setObjectName("algorithmGuideTabs")
         tabs.addTab(self._build_overview_tab(profile), "Overview")
         tabs.addTab(self._build_pseudocode_tab(profile), "Algorithm")
         if profile.formula_notes:
@@ -2561,6 +3272,7 @@ class AgentAlgorithmDialog(QDialog):
         close_button.clicked.connect(self.close)
         controls.addWidget(close_button)
         layout.addLayout(controls)
+        translate_widget_tree(self, language)
 
     def _build_overview_tab(self, profile: AgentEducationProfile) -> QWidget:
         content = QWidget()
@@ -3090,16 +3802,17 @@ def _dyna_q_status_key(status: str) -> str:
 
 def _dyna_q_status_style(status_key: str) -> str:
     palette = {
-        "waiting": ("#3b3b3b", "#d0d0d0"),
-        "explore": ("#8a5a00", "#ffffff"),
-        "greedy": ("#1f7a4d", "#ffffff"),
-        "update": ("#265d97", "#ffffff"),
-        "replay": ("#5a3f91", "#ffffff"),
+        "waiting": ("#E8ECEF", "#46535B", "#CCD4D9"),
+        "explore": ("#FFF2D5", "#805300", "#E7C16F"),
+        "greedy": ("#E0F2E8", "#17653B", "#91CBA9"),
+        "update": ("#DDECF8", "#1F5F8B", "#98BEDA"),
+        "replay": ("#ECE6F6", "#5B3C88", "#BBA9D4"),
     }
-    background, foreground = palette.get(status_key, palette["waiting"])
+    background, foreground, border = palette.get(status_key, palette["waiting"])
     return (
         f"background-color: {background}; "
         f"color: {foreground}; "
+        f"border: 1px solid {border}; "
         "border-radius: 4px; "
         "font-weight: 700; "
         "padding: 4px 8px;"
@@ -3109,17 +3822,17 @@ def _dyna_q_status_style(status_key: str) -> str:
 def _dyna_q_loop_style(*, active: bool) -> str:
     if active:
         return (
-            "background-color: #265d97; "
-            "color: #ffffff; "
-            "border: 1px solid #6fa8dc; "
+            "background-color: #D8F0EC; "
+            "color: #075E56; "
+            "border: 1px solid #6BB8AE; "
             "border-radius: 4px; "
             "font-weight: 700; "
             "padding: 4px;"
         )
     return (
-        "background-color: #303030; "
-        "color: #d0d0d0; "
-        "border: 1px solid #454545; "
+        "background-color: #F3F6F7; "
+        "color: #53616A; "
+        "border: 1px solid #D5DDE1; "
         "border-radius: 4px; "
         "padding: 4px;"
     )
@@ -3147,6 +3860,91 @@ def _format_speed(value: float | None) -> str:
 
 def _format_path(value: object) -> str:
     return "not generated" if value is None else str(value)
+
+
+def _format_bytes(value: int) -> str:
+    size = float(max(0, value))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024.0 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return "0 B"
+
+
+def _td3_advisory_text(agent_type: str, language: str = "en") -> str:
+    if language == "cy":
+        if agent_type == "sensor_n_step_td3":
+            return (
+                "Yn ystod gwerthusiad ailadroddus y prosiect, cwblhaodd Asiant 8 "
+                "19 o 20 ras. Ni orffennodd un ras. Mae amrywiadau bach yn arferol "
+                "i bolisi niwral dysgedig, felly nid oes sicrwydd y bydd y ras hon "
+                "yn cael ei chwblhau."
+            )
+        if agent_type == "n_step_td3":
+            return (
+                "Polisi niwral dysgedig yw Asiant 7. Gall gwblhau'r gylched, ond "
+                "gall rasys ailadroddus amrywio ac nid oes sicrwydd o gwblhau."
+            )
+        return (
+            "Polisi niwral arbrofol o'r dechrau yw Asiant 6. Mae'n bosibl na fydd "
+            "yn cwblhau'r gylched yn ystod arddangosiad."
+        )
+    if agent_type == "sensor_n_step_td3":
+        return (
+            "In the project's repeated evaluation, Agent 8 completed 19 of 20 "
+            "runs. One run did not finish. Small variations are normal for a "
+            "learned neural policy, so this race is not guaranteed to complete."
+        )
+    if agent_type == "n_step_td3":
+        return (
+            "Agent 7 is a learned neural policy. It can complete the circuit, "
+            "but repeated runs may differ and completion is not guaranteed."
+        )
+    return (
+        "Agent 6 is an experimental from-scratch neural policy. It may fail to "
+        "complete the circuit during a demonstration."
+    )
+
+
+def _cache_cleared_text(bytes_used: int, directories: int, language: str) -> str:
+    if language == "cy":
+        return (
+            f"Dilëwyd {_format_bytes(bytes_used)} o {directories} ffolder dros dro.\n\n"
+            "Ni newidiwyd modelau, rasys na thystiolaeth ymchwil."
+        )
+    folder = "folder" if directories == 1 else "folders"
+    return (
+        f"Removed {_format_bytes(bytes_used)} from {directories} temporary {folder}.\n\n"
+        "Models, race runs, and research evidence were not changed."
+    )
+
+
+def _run_reset_warning_text(run_count: int, track_id: str, language: str) -> str:
+    if language == "cy":
+        return (
+            f"Mae gan y rhaglen {run_count:,} ras wedi'u cadw ar hyn o bryd. Cedwir "
+            "un ailchwarae defnyddiol ar gyfer pob asiant, gan roi blaenoriaeth i "
+            f"lapiau cyflawn ar {track_id}.\n\nNi chyffyrddir â phwyntiau gwirio "
+            "hyfforddi, gwerthusiadau, logiau na llinellau rasio. Ni ellir dadwneud hyn."
+        )
+    return (
+        f"The application currently has {run_count:,} saved runs. One useful "
+        "replay per agent will be preserved, preferring completed laps on "
+        f"{track_id}.\n\nTraining checkpoints, evaluations, logs, and racing "
+        "lines will not be touched. This cannot be undone."
+    )
+
+
+def _run_reset_result_text(deleted: int, retained: int, language: str) -> str:
+    if language == "cy":
+        return (
+            f"Dilëwyd {deleted:,} ras hŷn a chadwyd {retained:,} "
+            "ailchwarae cynrychioliadol."
+        )
+    return (
+        f"Deleted {deleted:,} older runs and kept {retained:,} "
+        "representative replays."
+    )
 
 
 def _track_label(track: TrackOption) -> str:

@@ -64,7 +64,7 @@ Evaluate the protected deterministic champion:
 python scripts\evaluate_sensor_n_step_td3_agent.py --repeats 10
 ```
 
-The console application exposes the trained policy as option `8`. Agent 7 and
+The console application exposes the trained policy as option `7`. Agent 7 and
 Agent 8 checkpoints have distinct model, observation, and reward contracts, so
 they cannot be loaded into one another accidentally.
 
@@ -286,13 +286,12 @@ python scripts\evaluate_sensor_n_step_td3_self_imitation_agent.py --policy-path 
 The new profile is deliberately not added to Agent 8's default application
 checkpoint list until an external evaluation demonstrates improved reliability.
 
-## Recorded elite-lap demonstration
+## Recorded elite-lap evidence
 
-Console option `9` and the GUI agent named
-`Agent 8 Recorded 83.620s Demonstration` replay the exact 4,040 raw actions
-captured from Agent 8's clean 83.620-second training lap. Steering and the
-signed throttle/brake command are replayed in order, while the existing live
-RPM-based automatic gearbox remains active.
+The exact 4,040 raw actions captured from Agent 8's clean 83.620-second
+training lap are retained as historical experiment evidence. They are not
+registered as a selectable driver because replaying controls open loop is not
+a neural-policy evaluation and can diverge after small simulator differences.
 
 The portable recording is stored in
 `data/recorded_laps/agent8_elite_83_620s_actions.npz`, with provenance and lap
@@ -300,9 +299,7 @@ metrics in `data/recorded_laps/agent8_elite_83_620s.json`. It does not depend on
 an ignored training-run or model directory, so the demonstration works from a
 fresh repository checkout.
 
-This option is deliberately registered as
-`agent8_recorded_elite_lap`, not as the neural Agent 8 policy. Its saved race
-configuration sets `evaluation_eligible` and `neural_policy_active` to false.
-It is an open-loop visualisation of a trajectory discovered by reward-only TD3,
-so small differences in initial simulator state can make it diverge and its
-result must not be reported as a DRL policy evaluation.
+The recording is a trajectory discovered by Agent 8 and may support later
+analysis or visualisation. It must not be reported as a repeatable DRL policy
+result; dissertation performance comparisons should use saved Agent 8 model
+checkpoints and their corresponding evaluation logs.

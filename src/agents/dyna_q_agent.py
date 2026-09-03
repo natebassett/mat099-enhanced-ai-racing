@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from project_paths import PROJECT_ROOT
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 POLICY_DIR = PROJECT_ROOT / "data" / "policies"
 DEFAULT_LATEST_POLICY_PATH = POLICY_DIR / "dyna_q_g_track_3_latest.json"
 DEFAULT_FINAL_POLICY_PATH = POLICY_DIR / "dyna_q_g_track_3_final.json"

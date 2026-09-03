@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QObject, Signal, Slot
+from project_paths import PROJECT_ROOT
 
 try:
     from .project_discovery import AgentOption, CarOption, TrackOption
@@ -18,7 +19,6 @@ except ImportError:
     from torcs_config import TorcsRaceSetup, TorcsRuntimeConfig
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = PROJECT_ROOT / "src"
 
 if str(SRC_DIR) not in sys.path:

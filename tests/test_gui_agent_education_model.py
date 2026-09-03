@@ -112,6 +112,73 @@ class GuiAgentEducationModelTests(unittest.TestCase):
         self.assertTrue(any("build_td3_observation" in snippet.source for snippet in profile.code_snippets))
         self.assertIn("No racing-line file required", dict(profile.metadata)["Track dependency"])
 
+    def test_agent7_profile_explains_n_step_td3_without_action_imitation(self):
+        profile = build_agent_education_profile(
+            _agent("torcsRL N-Step TD3 Racer", "n_step_td3", requires_line=True),
+            _tracks(),
+        )
+
+        self.assertEqual(profile.badge, "Racing-line-informed N-step TD3 policy")
+        self.assertIn("never as a copied teacher action", profile.headline)
+        self.assertEqual(
+            dict(profile.quick_facts)["Policy"],
+            "A trained neural network",
+        )
+        self.assertEqual(dict(profile.quick_facts)["Racing line"], "Route preview only")
+        self.assertTrue(any("141-value" in note for note in profile.algorithm_summary))
+        self.assertTrue(any("Three-Step Critic Target" == note.title for note in profile.formula_notes))
+        self.assertTrue(any(r"\gamma^3" in note.formula for note in profile.formula_notes))
+        self.assertTrue(any("NstepTd3Learner" in snippet.source for snippet in profile.code_snippets))
+
+    def test_agent8_profile_explains_sensor_only_learning_and_own_laps(self):
+        profile = build_agent_education_profile(
+            _agent(
+                "Sensor-Only N-Step TD3 Racer",
+                "sensor_n_step_td3",
+                requires_line=False,
+            ),
+            _tracks(),
+        )
+
+        self.assertEqual(profile.badge, "Sensor-only N-step TD3 policy")
+        self.assertIn("without a racing-line file or an external teacher", profile.headline)
+        self.assertEqual(
+            dict(profile.quick_facts)["Learns from"],
+            "Rewards + its own good laps",
+        )
+        self.assertEqual(dict(profile.quick_facts)["Racing line"], "Not used")
+        self.assertTrue(any("self-generated" in note for note in profile.overview))
+        self.assertTrue(any("Sensor Stability Reward" == note.title for note in profile.formula_notes))
+        self.assertTrue(any("No racing-line target" in note for note in profile.input_signals))
+
+    def test_welsh_profile_localises_explanations_but_preserves_technical_data(self):
+        agent = _agent(
+            "Sensor-Only N-Step TD3 Racer",
+            "sensor_n_step_td3",
+            requires_line=False,
+        )
+        english = build_agent_education_profile(agent, _tracks())
+        welsh = build_agent_education_profile(agent, _tracks(), language="cy")
+
+        self.assertNotEqual(welsh.headline, english.headline)
+        self.assertIn("Mae", welsh.headline)
+        self.assertIn("Traciau cydnaws", welsh.track_context[0])
+        self.assertIn("Math yr asiant", dict(welsh.metadata))
+        self.assertEqual(
+            dict(welsh.quick_facts)["Policy"],
+            "Rhwydwaith niwral wedi'i hyfforddi",
+        )
+        self.assertEqual(
+            welsh.formula_notes[0].formula,
+            english.formula_notes[0].formula,
+        )
+        self.assertNotEqual(
+            welsh.formula_notes[0].explanation,
+            english.formula_notes[0].explanation,
+        )
+        self.assertEqual(welsh.code_snippets[0].code, english.code_snippets[0].code)
+        self.assertEqual(welsh.code_snippets[0].source, english.code_snippets[0].source)
+
 
 def _agent(name: str, agent_type: str, *, requires_line: bool) -> AgentOption:
     return AgentOption(

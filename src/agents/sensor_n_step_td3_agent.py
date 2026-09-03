@@ -3,9 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from agents.n_step_td3_agent import NstepTd3Agent
+from project_paths import PROJECT_ROOT
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = PROJECT_ROOT / "models" / "agent8_sensor_n_step_td3"
 RELIABILITY_MODEL_DIR = (
     PROJECT_ROOT / "models" / "agent8_sensor_n_step_td3_v1_clean_reliability"

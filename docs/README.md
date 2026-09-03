@@ -1,25 +1,40 @@
 # Documentation
 
-This folder contains the project handbook and supporting documentation assets for
-the MAT099 Enhanced AI Racing dissertation project.
+This folder holds focused supporting notes for the MAT099 Enhanced AI Racing
+project. The root [README](../README.md) is the main entry point for running the
+application and understanding the overall project.
 
-## Files
+## Reading Path
+
+1. Read the root README for the project aim, agent comparison, and quick start.
+2. Read the Agent 7 and Agent 8 notes for the two deep reinforcement learning
+   experiments and their distinct evidence boundaries.
+3. Read the GUI notes when discussing explainability, results reporting, or
+   accessibility in the dissertation.
+4. Read the Windows packaging note when building or distributing the desktop app.
+
+## Focused Notes
 
 | File | Purpose |
 | --- | --- |
-| `MAT099_Project_Handbook.docx` | Polished Word handbook for dissertation review and wiki-style reading. |
-| `project-handbook.md` | Lightweight Markdown source summary for version control. |
-| `assets/architecture-overview.png` | Architecture diagram used by the handbook. |
+| `agent7_n_step_td3.md` | Agent 7's racing-line-informed N-step TD3 design, experiments, and commands. |
+| `agent8_sensor_n_step_td3.md` | Agent 8's sensor-only reward-driven TD3 design, reliability work, and evidence. |
+| `gui_learning_visualizer.md` | Evidence boundary and research basis for the learning animation. |
+| `gui_results_workspace.md` | Reporting rules for the novice-friendly Results page and detailed research evidence. |
+| `gui_settings_and_sources.md` | Settings behavior, accessibility choices, and research-source boundaries. |
+| `windows-packaging.md` | Reproducible build and release checks for the Windows application. |
 
-## Screenshot Placeholders
+## Supporting Assets
 
-The following placeholder assets are included so the documentation structure is
-ready for final screenshots:
-
-| Placeholder | Intended replacement |
+| Asset | Purpose |
 | --- | --- |
-| `assets/gui-main-window-placeholder.svg` | Main GUI screen showing agent selection and live controls. |
-| `assets/telemetry-review-placeholder.svg` | Telemetry review or comparison screen after a saved run. |
-| `assets/racing-line-placeholder.svg` | Racing-line visualisation or generated track view. |
+| `assets/architecture-overview.png` | Reusable system overview. |
+| `assets/gui-main-window.png` | Final live-telemetry dashboard screenshot. |
+| `assets/racing-line.png` | Final racing-line inspection screenshot. |
+| `assets/telemetry-review.png` | Final saved Agent 8 replay screenshot. |
 
-Replace these placeholders once final dissertation screenshots are available.
+## Evidence Rule
+
+The Markdown notes explain design decisions and historical experiments. Final
+performance claims should cite the saved evaluation data, telemetry, and Results
+workspace rather than a single training run or a placeholder image.

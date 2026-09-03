@@ -9,6 +9,10 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Windows application build output
+build/
+dist/
+
 # Logs / models
 ppo_driver/logs/
 ppo_driver/models/

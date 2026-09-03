@@ -4,8 +4,10 @@ from dataclasses import dataclass
 from typing import Any
 
 try:
+    from .novice_education import build_novice_agent_guide
     from .project_discovery import AgentOption, TrackOption, compatible_tracks_for_agent
 except ImportError:
+    from novice_education import build_novice_agent_guide
     from project_discovery import AgentOption, TrackOption, compatible_tracks_for_agent
 
 
@@ -29,6 +31,7 @@ class AgentEducationProfile:
     title: str
     badge: str
     headline: str
+    quick_facts: tuple[tuple[str, str], ...]
     overview: tuple[str, ...]
     decision_steps: tuple[str, ...]
     algorithm_summary: tuple[str, ...]
@@ -47,12 +50,16 @@ class AgentEducationProfile:
 def build_agent_education_profile(
     agent: AgentOption,
     tracks: list[TrackOption],
+    language: str = "en",
 ) -> AgentEducationProfile:
     template = _template_for(agent.agent_type)
+    if language == "cy":
+        template = _welsh_template(agent.agent_type, template)
     return AgentEducationProfile(
         title=agent.name,
         badge=template["badge"],
         headline=template["headline"],
+        quick_facts=_quick_facts(agent.agent_type, language),
         overview=tuple(template["overview"]),
         decision_steps=tuple(template["decision_steps"]),
         algorithm_summary=tuple(template["algorithm_summary"]),
@@ -64,8 +71,8 @@ def build_agent_education_profile(
         input_signals=tuple(template["input_signals"]),
         strengths=tuple(template["strengths"]),
         failure_signs=tuple(template["failure_signs"]),
-        track_context=_track_context(agent, tracks),
-        metadata=_metadata(agent),
+        track_context=_track_context(agent, tracks, language),
+        metadata=_metadata(agent, language),
     )
 
 
@@ -913,6 +920,12 @@ def _template_for(agent_type: str) -> dict[str, Any]:
             ),
         }
 
+    if agent_type == "n_step_td3":
+        return _n_step_td3_template(sensor_only=False)
+
+    if agent_type == "sensor_n_step_td3":
+        return _n_step_td3_template(sensor_only=True)
+
     if agent_type == "random":
         return {
             "badge": "Baseline random driver",
@@ -1083,7 +1096,614 @@ def _template_for(agent_type: str) -> dict[str, Any]:
     }
 
 
-def _metadata(agent: AgentOption) -> tuple[tuple[str, str], ...]:
+_WELSH_FORMULA_GUIDES = {
+    "Normalised Track Position": (
+        "Safle Trac wedi'i Normaleiddio",
+        "Mae 0 yn ganol y ffordd, -1 yn ymyl chwith a +1 yn ymyl dde. Mae'r hafaliad yn trosi'r raddfa hon yn bellter ochr mewn metrau.",
+    ),
+    "Racing Point Projection": (
+        "Taflunio Pwynt Rasio",
+        "Mae'r pwynt yn dechrau ar ganol y trac ac yn symud ar draws lled y ffordd i greu'r llwybr rasio bwriedig.",
+    ),
+    "Lap-Distance Interpolation": (
+        "Rhyngosod Pellter Lap",
+        "Mae rhyngosod yn llenwi'r bwlch rhwng dau bwynt llwybr fel bod y targed yn newid yn llyfn, gan gynnwys dros y llinell gychwyn.",
+    ),
+    "Speed-Dependent Lookahead": (
+        "Edrych Ymlaen yn ôl Cyflymder",
+        "Wrth i'r car fynd yn gyflymach, mae'n edrych ymhellach ymlaen. Mae'r terfynau'n atal golwg sy'n rhy fyr neu'n rhy bell.",
+    ),
+    "Smooth Merge Onto The Line": (
+        "Ymuno'n Llyfn â'r Llinell",
+        "Mae'r gromlin hon yn symud y car tuag at y llwybr fesul tipyn ar ôl lansio, yn hytrach na neidio i'r ochr.",
+    ),
+    "Curvature-Limited Speed": (
+        "Cyflymder wedi'i Gyfyngu gan Grymedd",
+        "Mae cromlin fwy yn golygu cornel fwy tynn. Felly mae'r cyflymder diogel yn gostwng wrth i'r tro fynd yn fwy tynn.",
+    ),
+    "Line Error": (
+        "Gwall y Llinell",
+        "Mae'r gwahaniaeth rhwng safle'r car a'r targed yn dweud i'r rheolydd pa ochr sydd angen cywiriad.",
+    ),
+    "Sensor Score": (
+        "Sgôr Synhwyrydd",
+        "Mae'r sgôr yn cyfuno faint o ffordd agored sydd i'w gweld ac ongl y synhwyrydd er mwyn ffafrio cyfeiriad defnyddiol.",
+    ),
+    "Visible-Corner Severity": (
+        "Pa Mor Lem yw'r Gornel Weladwy",
+        "Mae'r gymhareb rhwng y ffordd syth ymlaen a'r ochr fwy agored yn amcangyfrif pa mor ofalus y dylai'r car fod.",
+    ),
+    "Closing Factor": (
+        "Ffactor Cau",
+        "Mae darlleniad blaen sy'n crebachu yn dangos bod y car yn cyrraedd rhwystr neu gornel, felly dylai baratoi'n gynt.",
+    ),
+    "Stability Mode": (
+        "Mesur Sefydlogrwydd",
+        "Mae symudiad i'r ochr, llithro olwynion ac ongl y car yn ffurfio mesur syml o ba mor ansefydlog yw'r car.",
+    ),
+    "Q-Learning Update": (
+        "Diweddariad Q-Learning",
+        "Mae'r hen sgôr yn symud tuag at y wobr newydd ynghyd â'r canlyniad gorau a ddisgwylir o'r sefyllfa nesaf.",
+    ),
+    "Dyna-Q Model Replay": (
+        "Ailchwarae Model Dyna-Q",
+        "Ar ôl dysgu o gam go iawn, mae'r asiant yn ail-ymarfer profiadau o'i gof er mwyn defnyddio data'n fwy effeithlon.",
+    ),
+    "Epsilon-Greedy Choice": (
+        "Dewis Epsilon-Greedy",
+        "Fel arfer dewisir y weithred â'r sgôr uchaf, ond weithiau caiff dewis arall ei brofi er mwyn archwilio.",
+    ),
+    "Progress Reward": (
+        "Gwobr Cynnydd",
+        "Mae'r wobr yn ffafrio symud ymlaen, cyflymder defnyddiol a sefydlogrwydd, ac yn cosbi methiant.",
+    ),
+    "Deterministic Actor": (
+        "Actor Penderfynol",
+        "Mae'r actor yn troi cyflwr y car yn rheolyddion parhaus. Wrth werthuso, mae'r un mewnbwn yn cynhyrchu'r un dewis.",
+    ),
+    "Twin Critic Target": (
+        "Targed Dau Feirniad",
+        "Mae TD3 yn defnyddio'r amcangyfrif lleiaf o ddau feirniad er mwyn lleihau hyder gormodol mewn gweithred fregus.",
+    ),
+    "Scratch Progress Reward": (
+        "Gwobr Cynnydd o'r Dechrau",
+        "Mae cynnydd ymlaen a chwblhau lap yn dda; mae gyrru oddi ar y trac neu fethu yn wael. Nid yw'r hafaliad yn darparu gweithred i'w chopïo.",
+    ),
+    "Uniform Steering Sample": (
+        "Sampl Llywio Unffurf",
+        "Mae pob gwerth llywio o fewn y terfynau yn cael yr un siawns. Nid oes penderfyniad deallus yma.",
+    ),
+    "Uniform Throttle Sample": (
+        "Sampl Cyflymu Unffurf",
+        "Dewisir cyflymu ar hap o ystod sefydlog, heb ddefnyddio'r ffordd neu gyflwr y car.",
+    ),
+    "Repeatable Randomness": (
+        "Hapusrwydd Ailadroddadwy",
+        "Mae hedyn sefydlog yn ail-greu'r un dilyniant hap, sy'n gwneud cymariaethau prawf yn decach.",
+    ),
+    "History Observation": (
+        "Arsylwad â Hanes",
+        "Mae tri ffrâm telemetreg a thri gweithred flaenorol yn rhoi cipolwg byr o symudiad diweddar i'r actor.",
+    ),
+    "Three-Step Critic Target": (
+        "Targed Beirniad Tri Cham",
+        "Mae'r targed yn defnyddio tair gwobr go iawn cyn gofyn i'r rhwydwaith amcangyfrif beth sy'n digwydd wedyn.",
+    ),
+    "Target Policy Smoothing": (
+        "Llyfnhau'r Polisi Targed",
+        "Mae sŵn bach wedi'i glipio yn ystod hyfforddi'r beirniad yn ffafrio gweithredoedd sy'n parhau'n dda ar ôl newid bach.",
+    ),
+    "Sensor Stability Reward": (
+        "Gwobr Sefydlogrwydd Synwyryddion",
+        "Mae cyflymder ymlaen yn werthfawr pan fo'r car wedi'i alinio â'r ffordd. Mae cosbau bach am ymyl y trac a llywio sydyn yn helpu sefydlogrwydd heb bennu llwybr.",
+    ),
+    "Racing-Line Velocity Reward": (
+        "Gwobr Cyflymder y Llinell Rasio",
+        "Mae'r wobr yn ffafrio symud ymlaen yn agos at y llwybr parod. Mae'n sgorio canlyniad gweithred niwral; nid yw'n rhoi gweithred athro.",
+    ),
+    "Delayed Actor Objective": (
+        "Amcan Actor wedi'i Oedi",
+        "Mae'r actor yn newid yn llai aml na'r beirniaid ac yn dysgu dewis rheolyddion y mae'r beirniad cyntaf yn rhagweld fydd yn ddefnyddiol.",
+    ),
+}
+
+
+_WELSH_CODE_GUIDES = {
+    "Racing-line lookup": "Mae'r cod yn dod o hyd i'r ddau bwynt llwybr o amgylch y car ac yn rhyngosod rhyngddynt.",
+    "Previewing the route ahead": "Mae'r rheolydd yn samplu sawl pwynt o'i flaen er mwyn paratoi llywio a chyflymder cyn y gornel.",
+    "Turning the plan into controls": "Mae'r cod yn trosi'r targed llwybr a chyflymder yn llywio, cyflymu a brecio.",
+    "Choosing the most useful road sensor": "Mae'r cod yn graddio'r synwyryddion ac yn dewis y cyfeiriad sy'n cynnig y ffordd fwyaf defnyddiol.",
+    "Classifying the road ahead": "Mae'r rheolau'n dosbarthu'r ffordd weladwy er mwyn dewis ymateb addas.",
+    "Real update plus planning replay": "Mae un profiad go iawn yn diweddaru'r tabl, ac yna defnyddir profiadau o'r cof ar gyfer ymarfer ychwanegol.",
+    "Learning vs finalised mode": "Mae'r modd dysgu yn archwilio ac yn newid y tabl; mae'r modd terfynol yn defnyddio'r dewis gorau sydd wedi'i gadw.",
+    "Raw telemetry observation": "Mae'r cod yn graddio telemetreg TORCS i mewnbynnau sefydlog ar gyfer y rhwydwaith.",
+    "Direct continuous controls": "Mae allbynnau'r actor yn dod yn llywio a bwriad pedal parhaus, gyda dewis gêr awtomatig.",
+    "Curriculum reward": "Mae'r cod yn cyfrifo gwobr o gynnydd a diogelwch yn ystod hyfforddiant hanesyddol Agent 6.",
+    "Random baseline action": "Mae'r llinell sylfaen yn samplu rheolyddion ar hap er mwyn darparu cymhariaeth isaf syml.",
+    "Telemetry and history state": "Mae'r contract yn cyfuno telemetreg bresennol, hanes byr a gweithredoedd blaenorol mewn un mewnbwn.",
+    "Twin-critic learning target": "Mae'r cod yn ychwanegu sŵn bach at y targed ac yn defnyddio'r gwerth lleiaf o'r ddau feirniad.",
+    "Delayed neural policy update": "Mae'r actor yn newid ar gamau oedi er mwyn dilyn gweithredoedd â gwerth hirdymor uwch.",
+}
+
+_WELSH_CODE_TITLES = {
+    "Racing-line lookup": "Chwilio'r llinell rasio",
+    "Previewing the route ahead": "Rhagweld y llwybr o'ch blaen",
+    "Turning the plan into controls": "Troi'r cynllun yn rheolyddion",
+    "Choosing the most useful road sensor": "Dewis y synhwyrydd ffordd mwyaf defnyddiol",
+    "Classifying the road ahead": "Dosbarthu'r ffordd o'ch blaen",
+    "Real update plus planning replay": "Diweddariad go iawn ac ailchwarae cynllunio",
+    "Learning vs finalised mode": "Modd dysgu a modd terfynol",
+    "Raw telemetry observation": "Arsylwad telemetreg crai",
+    "Direct continuous controls": "Rheolyddion parhaus uniongyrchol",
+    "Curriculum reward": "Gwobr y cwricwlwm",
+    "Random baseline action": "Gweithred llinell sylfaen ar hap",
+    "Telemetry and history state": "Cyflwr telemetreg a hanes",
+    "Twin-critic learning target": "Targed dysgu'r ddau feirniad",
+    "Delayed neural policy update": "Diweddariad polisi niwral wedi'i oedi",
+}
+
+
+def _welsh_template(agent_type: str, template: dict[str, Any]) -> dict[str, Any]:
+    guide = build_novice_agent_guide(agent_type, language="cy")
+    localised = dict(template)
+    localised.update(
+        {
+            "badge": guide.badge,
+            "headline": guide.headline,
+            "overview": guide.driving_story,
+            "decision_steps": guide.decision_steps,
+            "algorithm_summary": (*guide.learning_story, *guide.key_takeaways),
+            "pseudocode": guide.decision_steps,
+            "formula_notes": tuple(
+                _welsh_formula_note(note) for note in template["formula_notes"]
+            ),
+            "code_snippets": tuple(
+                _welsh_code_snippet(snippet) for snippet in template["code_snippets"]
+            ),
+            "math_notes": (*guide.learning_story, *guide.key_takeaways),
+            "key_takeaways": guide.key_takeaways,
+            "input_signals": guide.input_signals,
+            "strengths": guide.strengths,
+            "failure_signs": guide.failure_signs,
+        }
+    )
+    return localised
+
+
+def _welsh_formula_note(note: FormulaNote) -> FormulaNote:
+    title, explanation = _WELSH_FORMULA_GUIDES.get(
+        note.title,
+        (
+            note.title,
+            "Mae'r hafaliad hwn yn crynhoi un rhan o resymeg yr asiant. Mae'r symbolau a'r gwerthoedd yn aros yr un fath ym mhob iaith.",
+        ),
+    )
+    return FormulaNote(title=title, formula=note.formula, explanation=explanation)
+
+
+def _welsh_code_snippet(snippet: CodeSnippet) -> CodeSnippet:
+    explanation = _WELSH_CODE_GUIDES.get(
+        snippet.title,
+        "Mae'r darn hwn yn dangos sut mae'r syniad yn cael ei droi'n gamau Python yn y prosiect.",
+    )
+    return CodeSnippet(
+        title=_WELSH_CODE_TITLES.get(snippet.title, snippet.title),
+        source=snippet.source,
+        explanation=explanation,
+        code=snippet.code,
+    )
+
+
+def _quick_facts(
+    agent_type: str,
+    language: str = "en",
+) -> tuple[tuple[str, str], ...]:
+    facts = {
+        "map_aware": (
+            ("Approach", "Planned route + live sensors"),
+            ("Learns from", "Does not train"),
+            ("Policy", "Rules and a route plan"),
+            ("Racing line", "Required"),
+        ),
+        "rule_based": (
+            ("Approach", "Live sensor rules"),
+            ("Learns from", "Does not train"),
+            ("Policy", "A hand-written rulebook"),
+            ("Racing line", "Not used"),
+        ),
+        "dyna_q_learning": (
+            ("Approach", "Learns action scores"),
+            ("Learns from", "Rewards + memory practice"),
+            ("Policy", "An action score table"),
+            ("Racing line", "Not used"),
+        ),
+        "dyna_q_finalised": (
+            ("Approach", "Uses learned action scores"),
+            ("Learns from", "Saved earlier training"),
+            ("Policy", "The best saved table choice"),
+            ("Racing line", "Not used"),
+        ),
+        "dyna_q": (
+            ("Approach", "Learns action scores"),
+            ("Learns from", "Rewards + memory practice"),
+            ("Policy", "An action score table"),
+            ("Racing line", "Not used"),
+        ),
+        "td3_scratch": (
+            ("Approach", "Neural continuous control"),
+            ("Learns from", "Rewards + replay memory"),
+            ("Policy", "A trained neural network"),
+            ("Racing line", "Not used"),
+        ),
+        "n_step_td3": (
+            ("Approach", "Neural control + route preview"),
+            ("Learns from", "Rewards + replay memory"),
+            ("Policy", "A trained neural network"),
+            ("Racing line", "Route preview only"),
+        ),
+        "sensor_n_step_td3": (
+            ("Approach", "Neural control from sensors"),
+            ("Learns from", "Rewards + its own good laps"),
+            ("Policy", "A trained neural network"),
+            ("Racing line", "Not used"),
+        ),
+        "random": (
+            ("Approach", "Random comparison"),
+            ("Learns from", "Does not train"),
+            ("Policy", "Random control values"),
+            ("Racing line", "Not used"),
+        ),
+    }
+    selected = facts.get(
+        agent_type,
+        (
+            ("Approach", "Project agent"),
+            ("Learns from", "Agent specific"),
+            ("Policy", "See guide"),
+            ("Racing line", "See metadata"),
+        ),
+    )
+    if language != "cy":
+        return selected
+
+    translations = {
+        "Planned route + live sensors": "Llwybr wedi'i gynllunio + synwyryddion byw",
+        "Does not train": "Nid yw'n hyfforddi",
+        "Rules and a route plan": "Rheolau a chynllun llwybr",
+        "Required": "Angenrheidiol",
+        "Live sensor rules": "Rheolau synwyryddion byw",
+        "A hand-written rulebook": "Llyfr rheolau wedi'i ysgrifennu â llaw",
+        "Not used": "Heb ei ddefnyddio",
+        "Learns action scores": "Yn dysgu sgoriau gweithredoedd",
+        "Rewards + memory practice": "Gwobrau + ymarfer o'r cof",
+        "An action score table": "Tabl sgoriau gweithredoedd",
+        "Uses learned action scores": "Yn defnyddio sgoriau wedi'u dysgu",
+        "Saved earlier training": "Hyfforddiant cynharach wedi'i gadw",
+        "The best saved table choice": "Y dewis gorau yn y tabl wedi'i gadw",
+        "Neural continuous control": "Rheolaeth niwral barhaus",
+        "Rewards + replay memory": "Gwobrau + cof ailchwarae",
+        "A trained neural network": "Rhwydwaith niwral wedi'i hyfforddi",
+        "Neural control + route preview": "Rheolaeth niwral + rhagolwg llwybr",
+        "Route preview only": "Rhagolwg llwybr yn unig",
+        "Neural control from sensors": "Rheolaeth niwral o synwyryddion",
+        "Rewards + its own good laps": "Gwobrau + ei lapiau da ei hun",
+        "Random comparison": "Cymhariaeth ar hap",
+        "Random control values": "Gwerthoedd rheoli ar hap",
+        "Project agent": "Asiant y prosiect",
+        "Agent specific": "Yn benodol i'r asiant",
+        "See guide": "Gweler y canllaw",
+        "See metadata": "Gweler y manylion technegol",
+    }
+    return tuple((key, translations.get(value, value)) for key, value in selected)
+
+
+def _n_step_td3_template(*, sensor_only: bool) -> dict[str, Any]:
+    if sensor_only:
+        badge = "Sensor-only N-step TD3 policy"
+        headline = (
+            "Agent 8 learns continuous steering and acceleration from TORCS sensors "
+            "without a racing-line file or an external teacher."
+        )
+        overview = (
+            "It receives vehicle motion, road-range sensors, wheel spin, and recent driving history.",
+            (
+                "The observation deliberately contains no target route. Racing-line feature "
+                "slots are zeroed so the network contract stays compatible with Agent 7."
+            ),
+            (
+                "Most training is reward-driven TD3. Later stability experiments can retain "
+                "a small sample of Agent 8's own successful laps; this is self-generated "
+                "experience, not an external demonstration."
+            ),
+            (
+                "At deployment, exploration noise is disabled and the neural actor produces "
+                "the controls directly. Automatic shifting keeps the learning task focused "
+                "on steering, throttle, and braking."
+            ),
+        )
+        decision_steps = (
+            "Read vehicle motion, track position, wheel spin, and all 19 road sensors.",
+            "Normalise 45 sensor features and append recent observations and actions.",
+            "Pass the 141-value history state through the deterministic actor network.",
+            "Decode signed steering and longitudinal intent into steering, throttle, and brake.",
+            "Apply automatic gear selection and send the controls to TORCS.",
+        )
+        reward_title = "Sensor Stability Reward"
+        reward_formula = (
+            r"$r = \frac{v_x}{250}\cos(\theta)"
+            r" - \beta p^2 - \alpha(\Delta steer)^2"
+            r" + B_{lap} - P_{failure}$"
+        )
+        reward_explanation = (
+            "Forward velocity is useful only when aligned with the road. Small centring and "
+            "steering-rate terms improve stability without prescribing a racing line, while "
+            "lap completion and physical failure have clear terminal consequences."
+        )
+        input_signals = (
+            "Longitudinal, sideways, and vertical speed plus estimated acceleration.",
+            "Heading angle, track position, RPM, and four wheel-spin values.",
+            "All 19 TORCS road-range sensors.",
+            "Three recent observation frames and three previous two-value actions.",
+            "No racing-line target, curvature map, or teacher action.",
+        )
+        strengths = (
+            "Learns its own route from local sensors and long-term reward.",
+            "The 3-step return carries useful outcomes back through time faster than one-step TD3.",
+            "Twin critics and target smoothing reduce optimistic estimates of fragile actions.",
+            "Saved evaluation checkpoints separate reliable policies from occasional fast laps.",
+        )
+        failure_signs = (
+            "Repeated failure at one corner suggests a narrow policy rather than missing map data.",
+            "Steering saturation or oscillation can trade reliability for a rare fast lap.",
+            "A high single-run pace with poor completion rate is not a reliable champion.",
+            "Self-generated success replay can overfit if it overwhelms ordinary failure and recovery data.",
+        )
+        key_takeaways = (
+            "Agent 8 is the sensor-only neural comparison against engineered and map-aware drivers.",
+            "It does not receive a racing line, target speed, or teacher control.",
+            "Its 141 inputs include short-term memory, allowing the actor to infer motion trends.",
+            "Any optional imitation term uses only laps discovered by Agent 8 itself and is recorded in checkpoint metadata.",
+        )
+        agent_note = (
+            "Agent 8 preserves the same observation width as Agent 7, but its racing-line "
+            "difference and lookahead-curvature slots are fixed at zero."
+        )
+    else:
+        badge = "Racing-line-informed N-step TD3 policy"
+        headline = (
+            "Agent 7 learns continuous control with N-step TD3 while using racing-line "
+            "geometry as context, never as a copied teacher action."
+        )
+        overview = (
+            "It combines live TORCS telemetry with the target-line offset and upcoming curvature.",
+            (
+                "The racing line tells the network where the planned route lies and how the "
+                "road bends ahead. It does not supply steering, throttle, brake, or target-speed actions."
+            ),
+            (
+                "Three recent observations and three recent actions give the policy short-term "
+                "memory of acceleration, steering changes, and developing slides."
+            ),
+            (
+                "During training, replayed transitions update two value networks and then a "
+                "delayed actor. During evaluation, the actor runs deterministically without exploration noise."
+            ),
+        )
+        decision_steps = (
+            "Read vehicle motion, track position, wheel spin, and all 19 road sensors.",
+            "Look up racing-line offset and curvature ahead at the current lap distance.",
+            "Normalise 45 features and append recent observations and actions into 141 values.",
+            "Pass that state through the actor to produce signed steering and longitudinal intent.",
+            "Decode the action, select the gear automatically, and send controls to TORCS.",
+        )
+        reward_title = "Racing-Line Velocity Reward"
+        reward_formula = (
+            r"$r = \frac{v_x}{250}"
+            r"[\cos(\theta)-|\sin(\theta)|-|p-p_{line}|]"
+            r" - \alpha(\Delta steer)^2$"
+        )
+        reward_explanation = (
+            "The reward favours speed that is aligned with the road and close to the saved "
+            "line. It scores the result of the neural action; it does not tell the actor which action to copy."
+        )
+        input_signals = (
+            "Longitudinal, sideways, and vertical speed plus estimated acceleration.",
+            "Heading angle, track position, RPM, and four wheel-spin values.",
+            "All 19 TORCS road-range sensors.",
+            "Racing-line position difference and lookahead curvature samples.",
+            "Three recent observation frames and three previous two-value actions.",
+        )
+        strengths = (
+            "Preview curvature gives the neural policy advance warning of corners.",
+            "The 3-step return carries useful outcomes back through time faster than one-step TD3.",
+            "Twin critics and target smoothing reduce optimistic estimates of fragile actions.",
+            "The network still discovers steering, acceleration, and braking from reward feedback.",
+        )
+        failure_signs = (
+            "A missing or mismatched racing-line file invalidates the observation context.",
+            "Strong line adherence can favour consistency over a faster route discovered elsewhere.",
+            "Steering saturation or oscillation can waste speed even when laps complete.",
+            "A fast isolated lap is not evidence of robust performance across repeated evaluations.",
+        )
+        key_takeaways = (
+            "Agent 7 is neural DRL with privileged track geometry, not behaviour cloning.",
+            "The racing line contributes observations and reward context, but never control labels.",
+            "Its 141 inputs include short-term history as well as current telemetry.",
+            "Passive evaluation saves strong policies without rolling weights back into training.",
+        )
+        agent_note = (
+            "Agent 7 adds racing-line position error and lookahead curvature to the same "
+            "vehicle and road signals used by the sensor-only variant."
+        )
+
+    return {
+        "badge": badge,
+        "headline": headline,
+        "overview": overview,
+        "decision_steps": decision_steps,
+        "algorithm_summary": (
+            "N-step TD3 is a deterministic actor-critic algorithm for continuous control.",
+            (
+                "The actor maps the 141-value state directly to two continuous outputs: "
+                "steering and signed longitudinal intent."
+            ),
+            (
+                "The replay buffer stores experience from both successful and failed driving. "
+                "A sampled transition uses up to three rewards before bootstrapping from the target critics."
+            ),
+            (
+                "Two critics estimate long-term return. The smaller target estimate is used, "
+                "which limits the overestimation that can destabilise deterministic policies."
+            ),
+            (
+                "Clipped noise is added only to target actions during critic learning. The actor "
+                "updates less often, then slowly updates its target network."
+            ),
+            agent_note,
+        ),
+        "pseudocode": (
+            "Reset TORCS and initialise the three-frame observation/action history.",
+            "Read and normalise the current telemetry into 45 base features.",
+            "Append three base observations and three prior actions to form 141 inputs.",
+            "Ask the actor for signed steering and longitudinal intent; add exploration noise only in training.",
+            "Send decoded controls to TORCS and observe reward, next state, and termination.",
+            "Accumulate a discounted 3-step return and store the transition in replay memory.",
+            "Sample replay and update both critics toward the smaller smoothed target value.",
+            "On delayed update steps, improve the actor using critic Q1's gradient.",
+            "Soft-update target networks and periodically save passive evaluation checkpoints.",
+        ),
+        "formula_notes": (
+            FormulaNote(
+                title="History Observation",
+                formula=r"$s_t=[o_{t-2},o_{t-1},o_t,a_{t-3},a_{t-2},a_{t-1}]\in\mathbb{R}^{141}$",
+                explanation=(
+                    "Three 45-feature telemetry frames and three previous two-value actions "
+                    "give the feed-forward actor a compact view of recent motion."
+                ),
+            ),
+            FormulaNote(
+                title="Three-Step Critic Target",
+                formula=(
+                    r"$y_t=\sum_{k=0}^{2}\gamma^k r_{t+k}"
+                    r"+\gamma^3(1-d)\min_{i\in\{1,2\}}Q'_{i}(s_{t+3},\tilde a)$"
+                ),
+                explanation=(
+                    "The target includes three observed rewards before asking the target critics "
+                    "to estimate what happens later. Terminal transitions do not bootstrap."
+                ),
+            ),
+            FormulaNote(
+                title="Target Policy Smoothing",
+                formula=r"$\tilde a=\mathrm{clip}(\mu'(s')+\mathrm{clip}(\epsilon,-c,c),-1,1)$",
+                explanation=(
+                    "Clipped Gaussian noise makes the critic value actions that remain useful "
+                    "under small neighbouring control changes, rather than narrow action spikes."
+                ),
+            ),
+            FormulaNote(
+                title=reward_title,
+                formula=reward_formula,
+                explanation=reward_explanation,
+            ),
+            FormulaNote(
+                title="Delayed Actor Objective",
+                formula=r"$L_{actor}=-\mathbb{E}[Q_1(s,\mu(s))]$",
+                explanation=(
+                    "The actor follows the first critic's gradient only on delayed update steps. "
+                    "Selected Agent 8 stability experiments may add a decaying loss on actions "
+                    "from its own completed laps; checkpoint metadata records that choice."
+                ),
+            ),
+        ),
+        "code_snippets": (
+            CodeSnippet(
+                title="Telemetry and history state",
+                source="src/n_step_td3/contracts.py - build_base_observation / HistoryEncoder",
+                explanation=(
+                    "The shared contract creates 45 base inputs and combines three frames with "
+                    "three previous actions. Sensor-only mode zeroes all racing-line values."
+                ),
+                code=(
+                    "base = build_base_observation(\n"
+                    "    telemetry, previous_telemetry=previous,\n"
+                    "    racing_line=racing_line,\n"
+                    "    include_racing_line_features=use_racing_line,\n"
+                    ")\n"
+                    "state = history.observe(base)  # shape: (141,)"
+                ),
+            ),
+            CodeSnippet(
+                title="Twin-critic learning target",
+                source="src/n_step_td3/learner.py - NstepTd3Learner._gradient_step",
+                explanation=(
+                    "Target smoothing and the smaller critic value implement the two central TD3 protections."
+                ),
+                code=(
+                    "target_noise = normal_noise(actions.shape).mul(policy_noise)\n"
+                    "target_noise = target_noise.clamp(-noise_clip, noise_clip)\n"
+                    "next_actions = (actor_target(next_obs) + target_noise).clamp(-1, 1)\n"
+                    "target_q1, target_q2 = critic_target(next_obs, next_actions)\n"
+                    "target_q = returns + gamma_n * torch.minimum(target_q1, target_q2)"
+                ),
+            ),
+            CodeSnippet(
+                title="Delayed neural policy update",
+                source="src/n_step_td3/learner.py - NstepTd3Learner._gradient_step",
+                explanation=(
+                    "The actor is updated less frequently than the critics and is trained to "
+                    "select controls with a high predicted long-term return."
+                ),
+                code=(
+                    "if optimizer_steps % policy_delay == 0:\n"
+                    "    predicted_actions = actor(observations)\n"
+                    "    actor_loss = -critic.first(observations, predicted_actions).mean()\n"
+                    "    actor_loss.backward()\n"
+                    "    actor_optimizer.step()"
+                ),
+            ),
+        ),
+        "math_notes": (
+            "The actor is the neural driver; the critics are training-time judges of long-term return.",
+            "The 3-step target balances immediate evidence with a learned estimate of later outcomes.",
+            "Taking the smaller critic target reduces optimistic value errors.",
+            "Target policy noise regularises critic learning; evaluation itself remains deterministic.",
+            "Automatic gears are an engineered convenience, while steering and pedal intent remain neural outputs.",
+        ),
+        "key_takeaways": key_takeaways,
+        "input_signals": input_signals,
+        "strengths": strengths,
+        "failure_signs": failure_signs,
+    }
+
+
+def _metadata(
+    agent: AgentOption,
+    language: str = "en",
+) -> tuple[tuple[str, str], ...]:
+    if language == "cy":
+        return (
+            ("Math yr asiant", agent.agent_type),
+            ("Fersiwn", agent.version),
+            (
+                "Dull rheoli",
+                (
+                    "Rheolaeth lawn: llywio, cyflymu, brecio a gêr"
+                    if agent.uses_full_control
+                    else "Allbwn gweithred Gym"
+                ),
+            ),
+            (
+                "Dibyniaeth ar drac",
+                (
+                    "Mae angen ffeil llinell rasio"
+                    if agent.requires_racing_line
+                    else "Nid oes angen ffeil llinell rasio"
+                ),
+            ),
+            ("Lapiau targed", _format_optional_int(agent.target_laps)),
+            ("Uchafswm camau", _format_optional_int(agent.max_steps)),
+        )
+
     return (
         ("Agent type", agent.agent_type),
         ("Version", agent.version),
@@ -1111,21 +1731,40 @@ def _metadata(agent: AgentOption) -> tuple[tuple[str, str], ...]:
 def _track_context(
     agent: AgentOption,
     tracks: list[TrackOption],
+    language: str = "en",
 ) -> tuple[str, ...]:
     compatible_tracks = compatible_tracks_for_agent(agent, tracks)
     if not tracks:
-        return ("No TORCS tracks were discovered.",)
+        return (
+            "Ni ddarganfuwyd unrhyw draciau TORCS."
+            if language == "cy"
+            else "No TORCS tracks were discovered.",
+        )
 
     if agent.requires_racing_line:
         if not compatible_tracks:
+            if language == "cy":
+                return (
+                    "Mae angen ffeiliau llinell rasio ar yr asiant hwn, ond ni ddarganfuwyd yr un.",
+                    "Cynhyrchwch linell rasio cyn ei ddefnyddio ar fap newydd.",
+                )
             return (
                 "This agent needs racing-line files, but none were discovered.",
                 "Generate a racing line before using it on a new map.",
             )
+        if language == "cy":
+            return (
+                f"Traciau â llinell rasio: {_format_track_list(compatible_tracks, language)}.",
+                (
+                    f"Mae gan {len(compatible_tracks)} o'r {len(tracks)} trac a "
+                    "ddarganfuwyd ddata llinell rasio gyfatebol ar hyn o bryd."
+                ),
+                "Mae angen JSON llinell rasio ei hun ar drac newydd cyn bod yr asiant hwn yn ddewis teg.",
+            )
         return (
             (
                 "Racing-line tracks: "
-                f"{_format_track_list(compatible_tracks)}."
+                f"{_format_track_list(compatible_tracks, language)}."
             ),
             (
                 f"{len(compatible_tracks)} of {len(tracks)} discovered tracks "
@@ -1134,8 +1773,18 @@ def _track_context(
             "New tracks need their own racing-line JSON before this agent is a fair fit.",
         )
 
+    if language == "cy":
+        return (
+            f"Traciau cydnaws: {_format_track_list(compatible_tracks, language)}.",
+            (
+                f"Gellir dewis yr asiant hwn ar gyfer {len(compatible_tracks)} "
+                f"o'r {len(tracks)} trac a ddarganfuwyd."
+            ),
+            "Gall perfformiad amrywio yn ôl siâp y trac, hyd yn oed heb ddibynnu ar fap.",
+        )
+
     return (
-        f"Compatible tracks: {_format_track_list(compatible_tracks)}.",
+        f"Compatible tracks: {_format_track_list(compatible_tracks, language)}.",
         (
             f"This agent can be selected for {len(compatible_tracks)} of "
             f"{len(tracks)} discovered tracks."
@@ -1144,14 +1793,19 @@ def _track_context(
     )
 
 
-def _format_track_list(tracks: list[TrackOption]) -> str:
+def _format_track_list(
+    tracks: list[TrackOption],
+    language: str = "en",
+) -> str:
     if not tracks:
-        return "none"
+        return "dim" if language == "cy" else "none"
 
     labels = [track.label for track in tracks[:6]]
     remaining = len(tracks) - len(labels)
     if remaining > 0:
-        labels.append(f"{remaining} more")
+        labels.append(
+            f"{remaining} arall" if language == "cy" else f"{remaining} more"
+        )
     return ", ".join(labels)
 
 

@@ -5,6 +5,7 @@ from typing import Any, Mapping
 
 import numpy as np
 import torch
+from project_paths import PROJECT_ROOT
 
 from n_step_td3.contracts import (
     ACTION_SIZE,
@@ -28,7 +29,6 @@ from n_step_td3.networks import Actor
 from n_step_td3.racing_line import RacingLineFeatureMap, default_racing_line_path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = PROJECT_ROOT / "models" / "agent7_n_step_td3_v3"
 LEGACY_MODEL_DIR = PROJECT_ROOT / "models" / "agent7_n_step_td3"
 DEFAULT_RACING_LINE_PATH = default_racing_line_path("g-track-3")
