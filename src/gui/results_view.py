@@ -37,7 +37,12 @@ try:
         load_results_dataset,
         representative_evaluations,
     )
-    from .theme import LIGHT_THEME
+    from .theme import (
+        ChartPalette,
+        LIGHT_THEME,
+        ThemePalette,
+        chart_palette_for_preferences,
+    )
 except ImportError:
     from results_model import (
         EvaluationBatch,
@@ -49,17 +54,14 @@ except ImportError:
         load_results_dataset,
         representative_evaluations,
     )
-    from theme import LIGHT_THEME
+    from theme import (
+        ChartPalette,
+        LIGHT_THEME,
+        ThemePalette,
+        chart_palette_for_preferences,
+    )
 
 
-AGENT_COLORS = {
-    "agent6": "#A86008",
-    "agent7": "#2F80ED",
-    "agent8": "#087F73",
-    "other": "#6B7280",
-}
-COMPLETE_COLOR = "#18864B"
-FAILURE_COLOR = "#B42318"
 PACE_TARGET_SECONDS = 90.0
 
 
@@ -69,6 +71,11 @@ class ResultsView(QWidget):
     def __init__(self, project_root: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.project_root = project_root
+        self.theme_palette = LIGHT_THEME
+        self.chart_palette = chart_palette_for_preferences(
+            "standard",
+            dark=False,
+        )
         self.dataset = ResultsDataset((), (), (), (), ())
         self._evaluation_rows: list[EvaluationBatch] = []
         self._training_rows: list[TrainingRun] = []
@@ -138,6 +145,28 @@ class ResultsView(QWidget):
         self._connect_signals()
         self.reload()
 
+    def set_visual_theme(
+        self,
+        palette: ThemePalette,
+        chart_palette: ChartPalette,
+    ) -> None:
+        self.theme_palette = palette
+        self.chart_palette = chart_palette
+        for plot in (
+            self.pace_reliability_plot,
+            self.trial_distance_plot,
+            self.training_distance_plot,
+            self.training_lap_plot,
+            self.race_pace_plot,
+            self.race_reliability_plot,
+        ):
+            plot.setBackground(palette.surface)
+            for axis_name in ("left", "bottom"):
+                axis = plot.getAxis(axis_name)
+                axis.setTextPen(palette.muted)
+                axis.setPen(palette.border_strong)
+        self.reload()
+
     def reload(self) -> None:
         evaluation_id = self.evaluation_batch_combo.currentData()
         training_id = self.training_run_combo.currentData()
@@ -154,6 +183,15 @@ class ResultsView(QWidget):
         )
         self.warning_label.setVisible(bool(self.dataset.warnings))
         self.warning_label.setText("  |  ".join(self.dataset.warnings[:3]))
+
+    def take_technical_evidence_page(self) -> QWidget | None:
+        page = self.technical_evidence_page
+        if page is None:
+            return None
+        self.technical_evidence_page = None
+        page.setParent(None)
+        page.show()
+        return page
 
     def _refresh_overview(self) -> None:
         track_batches = [
@@ -697,17 +735,24 @@ class ResultsView(QWidget):
                 pen=None,
                 symbol="o",
                 symbolSize=9,
-                symbolBrush=COMPLETE_COLOR,
-                symbolPen=COMPLETE_COLOR,
+                symbolBrush=self.chart_palette.complete,
+                symbolPen=self.chart_palette.complete,
             )
             finish_distance = _median(completed_y)
             self.trial_distance_plot.addItem(
                 pg.InfiniteLine(
                     pos=finish_distance,
                     angle=0,
-                    pen=pg.mkPen(COMPLETE_COLOR, width=1, style=Qt.DashLine),
+                    pen=pg.mkPen(
+                        self.chart_palette.complete,
+                        width=1,
+                        style=Qt.DashLine,
+                    ),
                     label="lap",
-                    labelOpts={"color": COMPLETE_COLOR, "position": 0.92},
+                    labelOpts={
+                        "color": self.chart_palette.complete,
+                        "position": 0.92,
+                    },
                 )
             )
         if failed_x:
@@ -717,7 +762,7 @@ class ResultsView(QWidget):
                 pen=None,
                 symbol="x",
                 symbolSize=10,
-                symbolPen=pg.mkPen(FAILURE_COLOR, width=2),
+                symbolPen=pg.mkPen(self.chart_palette.failure, width=2),
             )
         self.trial_distance_plot.enableAutoRange()
 
@@ -736,19 +781,34 @@ class ResultsView(QWidget):
                 [batch.median_lap_time_seconds for batch in batches],
                 [batch.completion_rate * 100.0 for batch in batches],
                 pen=None,
-                symbol="o",
+                symbol={
+                    "agent6": "t",
+                    "agent7": "s",
+                    "agent8": "o",
+                    "other": "d",
+                }[family],
                 symbolSize=[max(7, min(14, 6 + math.sqrt(batch.trials))) for batch in batches],
-                symbolBrush=AGENT_COLORS[family],
-                symbolPen=pg.mkPen("#FFFFFF", width=1),
+                symbolBrush=self._agent_colour(family),
+                symbolPen=pg.mkPen(
+                    self.chart_palette.marker_outline,
+                    width=1,
+                ),
                 name=batches[0].agent_label,
             )
         self.pace_reliability_plot.addItem(
             pg.InfiniteLine(
                 pos=PACE_TARGET_SECONDS,
                 angle=90,
-                pen=pg.mkPen("#A86008", width=1, style=Qt.DashLine),
+                pen=pg.mkPen(
+                    self.chart_palette.target,
+                    width=1,
+                    style=Qt.DashLine,
+                ),
                 label="90 s",
-                labelOpts={"color": "#A86008", "position": 0.88},
+                labelOpts={
+                    "color": self.chart_palette.target,
+                    "position": 0.88,
+                },
             )
         )
         self.pace_reliability_plot.setYRange(0.0, 105.0, padding=0.02)
@@ -858,16 +918,16 @@ class ResultsView(QWidget):
         self.training_distance_plot.plot(
             x_values,
             distances,
-            pen=pg.mkPen("#9AA6AD", width=1),
+            pen=pg.mkPen(self.chart_palette.neutral, width=1),
             symbol="o" if len(episodes) < 80 else None,
             symbolSize=4,
-            symbolBrush="#9AA6AD",
+            symbolBrush=self.chart_palette.neutral,
             name="Episode distance",
         )
         self.training_distance_plot.plot(
             x_values,
             running_best,
-            pen=pg.mkPen(LIGHT_THEME.accent, width=2),
+            pen=pg.mkPen(self.theme_palette.accent, width=2),
             name="Running best",
         )
         completed = [
@@ -882,16 +942,23 @@ class ResultsView(QWidget):
                 pen=None,
                 symbol="o",
                 symbolSize=8,
-                symbolBrush=COMPLETE_COLOR,
-                symbolPen=COMPLETE_COLOR,
+                symbolBrush=self.chart_palette.complete,
+                symbolPen=self.chart_palette.complete,
             )
         self.training_lap_plot.addItem(
             pg.InfiniteLine(
                 pos=PACE_TARGET_SECONDS,
                 angle=0,
-                pen=pg.mkPen("#A86008", width=1, style=Qt.DashLine),
+                pen=pg.mkPen(
+                    self.chart_palette.target,
+                    width=1,
+                    style=Qt.DashLine,
+                ),
                 label="90 s",
-                labelOpts={"color": "#A86008", "position": 0.92},
+                labelOpts={
+                    "color": self.chart_palette.target,
+                    "position": 0.92,
+                },
             )
         )
         self.training_distance_plot.enableAutoRange()
@@ -966,8 +1033,8 @@ class ResultsView(QWidget):
                     y=pace_positions,
                     height=0.62,
                     width=pace_values,
-                    brush=QColor(LIGHT_THEME.accent),
-                    pen=pg.mkPen(LIGHT_THEME.accent),
+                    brush=QColor(self.theme_palette.accent),
+                    pen=pg.mkPen(self.theme_palette.accent),
                 )
             )
         if rows:
@@ -977,8 +1044,8 @@ class ResultsView(QWidget):
                     y=positions,
                     height=0.62,
                     width=[row.completion_rate * 100.0 for row in rows],
-                    brush=QColor("#2F80ED"),
-                    pen=pg.mkPen("#2F80ED"),
+                    brush=QColor(self.chart_palette.comparison_a),
+                    pen=pg.mkPen(self.chart_palette.comparison_a),
                 )
             )
         self.race_pace_plot.enableAutoRange()
@@ -1008,10 +1075,9 @@ class ResultsView(QWidget):
                 self.race_table.setItem(row_index, column, QTableWidgetItem(value))
         self.race_table.resizeRowsToContents()
 
-    @staticmethod
-    def _make_plot(x_label: str, y_label: str) -> pg.PlotWidget:
+    def _make_plot(self, x_label: str, y_label: str) -> pg.PlotWidget:
         plot = pg.PlotWidget()
-        plot.setBackground(LIGHT_THEME.surface)
+        plot.setBackground(self.theme_palette.surface)
         plot.showGrid(x=True, y=True, alpha=0.18)
         plot.setLabel("bottom", x_label)
         plot.setLabel("left", y_label)
@@ -1020,9 +1086,17 @@ class ResultsView(QWidget):
         plot.getPlotItem().setClipToView(True)
         for axis_name in ("left", "bottom"):
             axis = plot.getAxis(axis_name)
-            axis.setTextPen(LIGHT_THEME.muted)
-            axis.setPen(LIGHT_THEME.border_strong)
+            axis.setTextPen(self.theme_palette.muted)
+            axis.setPen(self.theme_palette.border_strong)
         return plot
+
+    def _agent_colour(self, family: str) -> str:
+        return {
+            "agent6": self.chart_palette.agent6,
+            "agent7": self.chart_palette.agent7,
+            "agent8": self.chart_palette.agent8,
+            "other": self.chart_palette.neutral,
+        }.get(family, self.chart_palette.neutral)
 
     @staticmethod
     def _plot_panel(title_text: str, subtitle_text: str, plot: pg.PlotWidget) -> QWidget:

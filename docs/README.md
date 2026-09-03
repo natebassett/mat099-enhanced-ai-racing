@@ -9,6 +9,9 @@ the MAT099 Enhanced AI Racing dissertation project.
 | --- | --- |
 | `MAT099_Project_Handbook.docx` | Polished Word handbook for dissertation review and wiki-style reading. |
 | `project-handbook.md` | Lightweight Markdown source summary for version control. |
+| `gui_learning_visualizer.md` | Evidence boundary and research basis for the learning animation. |
+| `gui_results_workspace.md` | Reporting rules used by the novice and technical results views. |
+| `gui_settings_and_sources.md` | Preference behavior and the location of detailed research evidence. |
 | `assets/architecture-overview.png` | Architecture diagram used by the handbook. |
 
 ## Screenshot Placeholders

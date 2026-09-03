@@ -25,6 +25,7 @@ try:
         default_checkpoint_for_agent,
         inspect_td3_checkpoint,
     )
+    from .theme import ChartPalette, ThemePalette
 except ImportError:
     from learning_visualizer_model import (
         CheckpointStatistics,
@@ -33,6 +34,7 @@ except ImportError:
         default_checkpoint_for_agent,
         inspect_td3_checkpoint,
     )
+    from theme import ChartPalette, ThemePalette
 
 
 ACCENT = QColor("#087F73")
@@ -45,6 +47,7 @@ MUTED = QColor("#5D6973")
 BORDER = QColor("#DCE2E6")
 SURFACE = QColor("#FFFFFF")
 SURFACE_ALT = QColor("#F8FAFB")
+SELECTION = QColor("#CDEDE8")
 
 
 class LearningVisualizerPanel(QWidget):
@@ -57,6 +60,7 @@ class LearningVisualizerPanel(QWidget):
         self.step_index = 0
         self.phase = 0.0
         self._speed = 1.0
+        self._reduce_motion = False
         self._statistics_cache: dict[Path, CheckpointStatistics] = {}
 
         self.title_label = QLabel(self.profile.title)
@@ -91,7 +95,11 @@ class LearningVisualizerPanel(QWidget):
         self.play_button.setIcon(
             self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
         )
-        self.play_button.setToolTip("Play learning animation")
+        self.play_button.setToolTip(
+            "Show the next learning step"
+            if self._reduce_motion
+            else "Play learning animation"
+        )
         self.play_button.setAccessibleName("Play learning animation")
         self.next_button = QPushButton()
         self.next_button.setIcon(
@@ -217,6 +225,9 @@ class LearningVisualizerPanel(QWidget):
         if self.timer.isActive():
             self.pause()
             return
+        if self._reduce_motion:
+            self.next_step()
+            return
         if self.step_index >= len(self.profile.steps) - 1 and self.phase >= 1.0:
             self.reset()
         self.timer.start()
@@ -230,7 +241,43 @@ class LearningVisualizerPanel(QWidget):
         self.play_button.setIcon(
             self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
         )
-        self.play_button.setToolTip("Play learning animation")
+        self.play_button.setToolTip(
+            "Show the next learning step"
+            if self._reduce_motion
+            else "Play learning animation"
+        )
+
+    def set_reduce_motion(self, enabled: bool) -> None:
+        self._reduce_motion = bool(enabled)
+        if self._reduce_motion:
+            self.pause()
+            self.play_button.setAccessibleName("Show next learning step")
+        else:
+            self.play_button.setToolTip("Play learning animation")
+            self.play_button.setAccessibleName("Play learning animation")
+
+    def clear_statistics_cache(self) -> None:
+        self._statistics_cache.clear()
+
+    def set_visual_theme(
+        self,
+        palette: ThemePalette,
+        chart_palette: ChartPalette,
+    ) -> None:
+        global ACCENT, POSITIVE, NEGATIVE, VALUE_BLUE, DANGER
+        global TEXT, MUTED, BORDER, SURFACE, SURFACE_ALT, SELECTION
+        ACCENT = QColor(palette.accent)
+        POSITIVE = QColor(palette.positive)
+        NEGATIVE = QColor(chart_palette.brake)
+        VALUE_BLUE = QColor(chart_palette.speed)
+        DANGER = QColor(palette.danger)
+        TEXT = QColor(palette.text)
+        MUTED = QColor(palette.muted)
+        BORDER = QColor(palette.border)
+        SURFACE = QColor(palette.surface)
+        SURFACE_ALT = QColor(palette.surface_alt)
+        SELECTION = QColor(palette.selection)
+        self.update()
 
     def reset(self) -> None:
         self.pause()
@@ -498,7 +545,11 @@ class LearningDiagramWidget(QWidget):
                     cell_height,
                 )
                 selected = row == 1 and column == 2
-                fill = QColor("#CDEDE8") if selected and active in {"q_update", "planning"} else SURFACE_ALT
+                fill = (
+                    SELECTION
+                    if selected and active in {"q_update", "planning"}
+                    else SURFACE_ALT
+                )
                 painter.setBrush(fill)
                 painter.setPen(QPen(BORDER, 1.0))
                 painter.drawRect(cell)

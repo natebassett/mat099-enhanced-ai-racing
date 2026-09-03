@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -9,6 +9,8 @@ import pyqtgraph as pg
 from PySide6.QtCore import QEvent, Qt, QThread, QTimer
 from PySide6.QtGui import QFont, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFrame,
@@ -34,6 +36,10 @@ from PySide6.QtWidgets import (
 )
 
 try:
+    from .application_maintenance import (
+        clear_application_cache,
+        inspect_application_cache,
+    )
     from .agent_education_model import (
         AgentEducationProfile,
         build_agent_education_profile,
@@ -60,8 +66,11 @@ try:
     )
     from .navigation import PrimaryNavigation
     from .learning_visualizer import LearningVisualizerPanel
+    from .i18n import tr, translate_widget_tree
     from .race_worker import RaceWorker
     from .results_view import ResultsView
+    from .settings_model import GuiSettings, SettingsStore
+    from .settings_view import SettingsView
     from .racing_line_model import (
         RacingLineProfile,
         RacingLineVisualProfile,
@@ -82,8 +91,16 @@ try:
         summarize_run_explanation,
     )
     from .track_view import RoadSensorWidget, TrackPositionWidget
-    from .theme import LIGHT_THEME
+    from .theme import (
+        apply_application_theme,
+        chart_palette_for_preferences,
+        palette_for_preferences,
+    )
 except ImportError:
+    from application_maintenance import (
+        clear_application_cache,
+        inspect_application_cache,
+    )
     from agent_education_model import (
         AgentEducationProfile,
         build_agent_education_profile,
@@ -110,8 +127,11 @@ except ImportError:
     )
     from navigation import PrimaryNavigation
     from learning_visualizer import LearningVisualizerPanel
+    from i18n import tr, translate_widget_tree
     from race_worker import RaceWorker
     from results_view import ResultsView
+    from settings_model import GuiSettings, SettingsStore
+    from settings_view import SettingsView
     from racing_line_model import (
         RacingLineProfile,
         RacingLineVisualProfile,
@@ -132,7 +152,11 @@ except ImportError:
         summarize_run_explanation,
     )
     from track_view import RoadSensorWidget, TrackPositionWidget
-    from theme import LIGHT_THEME
+    from theme import (
+        apply_application_theme,
+        chart_palette_for_preferences,
+        palette_for_preferences,
+    )
 
 
 @dataclass(frozen=True)
@@ -152,7 +176,21 @@ class MainWindow(QMainWindow):
         self.resize(1440, 860)
         self.setMinimumSize(1120, 700)
 
-        self.project_options: ProjectOptions = load_project_options()
+        self.project_root = Path(__file__).resolve().parents[2]
+        self.project_options: ProjectOptions = load_project_options(self.project_root)
+        self.settings_store = SettingsStore(
+            self.project_root / "data" / "generated" / "gui_settings.json"
+        )
+        self.app_settings: GuiSettings = self.settings_store.load()
+        self.visual_palette = palette_for_preferences(
+            self.app_settings.appearance_mode,
+            self.app_settings.colour_mode,
+            QApplication.instance(),
+        )
+        self.chart_palette = chart_palette_for_preferences(
+            self.app_settings.colour_mode,
+            dark=self.visual_palette.is_dark,
+        )
 
         self.agent_combo = QComboBox()
         self.track_combo = QComboBox()
@@ -181,6 +219,7 @@ class MainWindow(QMainWindow):
         self.run_history_source_label = QLabel()
         self.tabs: PrimaryNavigation | None = None
         self.results_tab_index = 0
+        self.settings_tab_index = 0
         self.review_tab_index = 0
         self.compare_tab_index = 0
         self.agents_tab_index = 0
@@ -229,7 +268,15 @@ class MainWindow(QMainWindow):
         self.agent_education_failure_box = QTextEdit()
         self.agent_education_tracks_box = QTextEdit()
         self.learning_visualizer = LearningVisualizerPanel()
-        self.results_view = ResultsView(Path(__file__).resolve().parents[2])
+        self.results_view = ResultsView(self.project_root)
+        self.settings_view = SettingsView(
+            agents=self.project_options.agents,
+            tracks=self.project_options.tracks,
+            settings=self.app_settings,
+            store=self.settings_store,
+            project_root=self.project_root,
+            research_evidence_page=self.results_view.take_technical_evidence_page(),
+        )
         self.agent_pipeline_labels: list[QLabel] = []
         self.racing_line_track_combo = QComboBox()
         self.racing_line_play_button = QPushButton("Play")
@@ -266,7 +313,7 @@ class MainWindow(QMainWindow):
         self.racing_line_distance = 0.0
         self.telemetry_history = TelemetryHistory()
         self.metric_value_labels: dict[str, QLabel] = {}
-        self.chart_window_seconds = 90.0
+        self.chart_window_seconds = float(self.app_settings.chart_window_seconds)
         self.speed_plot: pg.PlotWidget | None = None
         self.steer_plot: pg.PlotWidget | None = None
         self.pedal_plot: pg.PlotWidget | None = None
@@ -301,6 +348,9 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._update_selection_details()
         self._update_dyna_q_panel_visibility()
+        self._apply_plot_theme(self.visual_palette)
+        self._apply_language(self.app_settings.language)
+        self._refresh_settings_storage_summary()
 
     def _configure_controls(self) -> None:
         for combo in (
@@ -319,9 +369,17 @@ class MainWindow(QMainWindow):
             combo.setMinimumContentsLength(16)
 
         self._populate_combo(self.agent_combo, self.project_options.agents)
+        if self.app_settings.default_agent_type:
+            self._select_combo_item(
+                self.agent_combo,
+                "agent_type",
+                self.app_settings.default_agent_type,
+            )
         self._populate_combo(self.agent_education_combo, self.project_options.agents)
         self._populate_racing_line_tracks()
-        self._refresh_track_options(preferred_track_id="g-track-3")
+        self._refresh_track_options(
+            preferred_track_id=self.app_settings.default_track_id
+        )
         self._populate_combo(self.car_combo, self.project_options.cars)
         self._select_combo_item(self.car_combo, "car_id", "car1-ow1")
 
@@ -467,8 +525,15 @@ class MainWindow(QMainWindow):
             "Agent Lab",
             "Explore the available driving agents",
         )
+        self.settings_tab_index = self.tabs.addTab(
+            self.settings_view,
+            "Settings",
+            "Choose application preferences and review research evidence",
+        )
 
         self.setCentralWidget(self.tabs)
+        self.learning_visualizer.set_reduce_motion(self.app_settings.reduce_motion)
+        self._select_start_page(self.app_settings.start_page)
         self.statusBar().showMessage(self._discovery_summary())
 
     def _build_dashboard_tab(self) -> QWidget:
@@ -1279,6 +1344,7 @@ class MainWindow(QMainWindow):
         for label, color in items:
             swatch = QLabel()
             swatch.setFixedSize(10, 10)
+            swatch.setProperty("chartSeries", label)
             swatch.setStyleSheet(
                 f"background-color: {color}; border: 1px solid #202020;"
             )
@@ -1328,14 +1394,14 @@ class MainWindow(QMainWindow):
         plot = pg.PlotWidget()
         if title:
             plot.setTitle(title)
-        plot.setBackground(LIGHT_THEME.plot_background())
+        plot.setBackground(self.visual_palette.plot_background())
         plot.setLabel("left", left_axis_label)
         plot.setLabel("bottom", "lap time", units="s")
         plot.showGrid(x=True, y=True, alpha=0.25)
         for axis_name in ("left", "bottom"):
             axis = plot.getAxis(axis_name)
-            axis.setTextPen(LIGHT_THEME.muted)
-            axis.setPen(LIGHT_THEME.border_strong)
+            axis.setTextPen(self.visual_palette.muted)
+            axis.setPen(self.visual_palette.border_strong)
         plot.hideButtons()
         plot.setMenuEnabled(False)
         plot.setMouseEnabled(x=False, y=False)
@@ -1376,6 +1442,254 @@ class MainWindow(QMainWindow):
         self.racing_line_reset_button.clicked.connect(self._reset_racing_line_animation)
         self.racing_line_map_button.clicked.connect(self._open_racing_line_map_dialog)
         self.racing_line_timer.timeout.connect(self._advance_racing_line_animation)
+        self.settings_view.settings_saved.connect(self._apply_gui_settings)
+        self.settings_view.clear_cache_requested.connect(
+            self._handle_clear_application_cache
+        )
+        self.settings_view.reset_run_history_requested.connect(
+            self._handle_reset_run_history
+        )
+
+    def _apply_gui_settings(self, settings: GuiSettings) -> None:
+        self.app_settings = settings
+        self.chart_window_seconds = float(settings.chart_window_seconds)
+        self.learning_visualizer.set_reduce_motion(settings.reduce_motion)
+        application = QApplication.instance()
+        if application is not None:
+            palette = palette_for_preferences(
+                settings.appearance_mode,
+                settings.colour_mode,
+                application,
+            )
+            apply_application_theme(application, palette)
+            self._apply_plot_theme(palette)
+        self._apply_language(settings.language)
+        self.statusBar().showMessage(
+            tr("Settings saved", settings.language),
+            4_000,
+        )
+
+    def _apply_language(self, language: str) -> None:
+        self.setWindowTitle(
+            tr("Enhanced AI Racing Telemetry Dashboard", language)
+        )
+        translate_widget_tree(self, language)
+        self.settings_view.set_language(language)
+
+    def _apply_plot_theme(self, palette) -> None:
+        self.visual_palette = palette
+        self.chart_palette = chart_palette_for_preferences(
+            self.app_settings.colour_mode,
+            dark=palette.is_dark,
+        )
+        for plot in (
+            self.speed_plot,
+            self.steer_plot,
+            self.pedal_plot,
+            self.review_speed_plot,
+            self.review_steer_plot,
+            self.review_pedal_plot,
+            self.compare_speed_plot,
+        ):
+            if plot is None:
+                continue
+            plot.setBackground(palette.plot_background())
+            for axis_name in ("left", "bottom"):
+                axis = plot.getAxis(axis_name)
+                axis.setTextPen(palette.muted)
+                axis.setPen(palette.border_strong)
+
+        curve_pens = (
+            (self.speed_curve, self.chart_palette.speed, Qt.SolidLine),
+            (self.steer_curve, self.chart_palette.steering, Qt.SolidLine),
+            (self.throttle_curve, self.chart_palette.throttle, Qt.SolidLine),
+            (self.brake_curve, self.chart_palette.brake, Qt.DashLine),
+            (self.review_speed_curve, self.chart_palette.speed, Qt.SolidLine),
+            (self.review_steer_curve, self.chart_palette.steering, Qt.SolidLine),
+            (
+                self.review_throttle_curve,
+                self.chart_palette.throttle,
+                Qt.SolidLine,
+            ),
+            (self.review_brake_curve, self.chart_palette.brake, Qt.DashLine),
+            (
+                self.compare_speed_curve_a,
+                self.chart_palette.comparison_a,
+                Qt.SolidLine,
+            ),
+            (
+                self.compare_speed_curve_b,
+                self.chart_palette.comparison_b,
+                Qt.DashLine,
+            ),
+        )
+        for curve, colour, style in curve_pens:
+            if curve is not None:
+                curve.setPen(pg.mkPen(colour, width=2, style=style))
+
+        for marker in (
+            self.review_speed_marker,
+            self.review_steer_marker,
+            self.review_pedal_marker,
+            self.compare_speed_marker,
+        ):
+            if marker is not None:
+                marker.setPen(pg.mkPen(self.chart_palette.neutral, width=1))
+
+        legend_colours = {
+            "Speed": self.chart_palette.speed,
+            "Steering": self.chart_palette.steering,
+            "Throttle": self.chart_palette.throttle,
+            "Brake": self.chart_palette.brake,
+            "Run A": self.chart_palette.comparison_a,
+            "Run B": self.chart_palette.comparison_b,
+            "Accelerate": self.chart_palette.throttle,
+            "Full throttle": self.chart_palette.throttle,
+            "Turn": self.chart_palette.steering,
+            "Settle": self.chart_palette.speed,
+        }
+        for swatch in self.findChildren(QLabel):
+            series = str(swatch.property("chartSeries") or "")
+            if series in legend_colours:
+                swatch.setStyleSheet(
+                    f"background-color: {legend_colours[series]}; "
+                    f"border: 1px solid {palette.border_strong};"
+                )
+
+        self.learning_visualizer.set_visual_theme(
+            palette,
+            self.chart_palette,
+        )
+        self.results_view.set_visual_theme(palette, self.chart_palette)
+
+    def _refresh_settings_storage_summary(self) -> None:
+        cache = inspect_application_cache(self.project_root)
+        self.settings_view.refresh_storage_summary(
+            run_count=self._saved_run_count(),
+            cache_bytes=cache.bytes_used,
+            cache_directories=cache.directories,
+        )
+
+    def _saved_run_count(self) -> int:
+        database_path = self.project_root / "data" / "generated" / "race_results.db"
+        if not database_path.is_file():
+            return len(self.project_options.runs)
+        try:
+            from storage import RaceRepository
+
+            return RaceRepository(database_path).count_runs()
+        except (OSError, RuntimeError):
+            return len(self.project_options.runs)
+
+    def _handle_clear_application_cache(self) -> None:
+        if self.race_thread is not None:
+            return
+        try:
+            removed = clear_application_cache(self.project_root)
+            self.learning_visualizer.clear_statistics_cache()
+        except OSError as error:
+            QMessageBox.warning(
+                self,
+                tr("Cache Could Not Be Cleared", self.app_settings.language),
+                (
+                    f"Ni newidiwyd y storfa dros dro.\n\n{error}"
+                    if self.app_settings.language == "cy"
+                    else f"The temporary cache was left unchanged.\n\n{error}"
+                ),
+            )
+            return
+        self._refresh_settings_storage_summary()
+        QMessageBox.information(
+            self,
+            tr("Temporary Cache Cleared", self.app_settings.language),
+            _cache_cleared_text(
+                removed.bytes_used,
+                removed.directories,
+                self.app_settings.language,
+            ),
+        )
+
+    def _handle_reset_run_history(self) -> None:
+        if self.race_thread is not None:
+            return
+        run_count = self._saved_run_count()
+        if run_count <= 1:
+            QMessageBox.information(
+                self,
+                tr("Run History Already Clear", self.app_settings.language),
+                tr("There are no older race runs to remove.", self.app_settings.language),
+            )
+            return
+
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle(tr("Reset Run History?", self.app_settings.language))
+        dialog.setText(tr("Delete older GUI race runs?", self.app_settings.language))
+        dialog.setInformativeText(_run_reset_warning_text(
+            run_count,
+            self.app_settings.default_track_id,
+            self.app_settings.language,
+        ))
+        delete_button = dialog.addButton(
+            tr("Delete older runs", self.app_settings.language),
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
+        dialog.addButton(
+            tr("Cancel", self.app_settings.language),
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        dialog.exec()
+        if dialog.clickedButton() is not delete_button:
+            return
+
+        try:
+            from storage import RaceRepository
+
+            result = RaceRepository().prune_runs_to_representatives(
+                preferred_track=self.app_settings.default_track_id
+            )
+        except Exception as error:
+            QMessageBox.critical(
+                self,
+                tr("Run History Could Not Be Reset", self.app_settings.language),
+                (
+                    f"Ni ddilëwyd unrhyw ras yn fwriadol.\n\n{error}"
+                    if self.app_settings.language == "cy"
+                    else f"No runs were intentionally removed.\n\n{error}"
+                ),
+            )
+            return
+
+        self._clear_review_after_history_reset()
+        self._reload_run_history()
+        self.results_view.reload()
+        self._refresh_settings_storage_summary()
+        QMessageBox.information(
+            self,
+            tr("Run History Reset", self.app_settings.language),
+            _run_reset_result_text(
+                result.deleted_count,
+                result.retained_count,
+                self.app_settings.language,
+            ),
+        )
+
+    def _clear_review_after_history_reset(self) -> None:
+        self.review_timer.stop()
+        self.review_run = None
+        self.review_snapshots = []
+        self.review_title_label.setText("No run selected")
+        self.review_summary_box.setText("Select a saved run from Run History.")
+        self._clear_review_snapshot()
+        self._clear_compare_view("Select two saved runs to compare.")
+
+    def _select_start_page(self, page_name: str) -> None:
+        if self.tabs is None:
+            return
+        for index in range(self.tabs.count()):
+            if self.tabs.tabText(index) == page_name:
+                self.tabs.setCurrentIndex(index)
+                return
 
     def _handle_start_clicked(self) -> None:
         if self.race_thread is not None:
@@ -1386,6 +1700,8 @@ class MainWindow(QMainWindow):
         car = self.selected_car()
         if agent is None or track is None or car is None:
             self.status_label.setText("No compatible race setup selected.")
+            return
+        if not self._confirm_td3_start(agent):
             return
 
         self._set_race_controls_enabled(False)
@@ -1416,6 +1732,40 @@ class MainWindow(QMainWindow):
         self.race_thread.finished.connect(self.race_thread.deleteLater)
         self.race_thread.finished.connect(self._clear_race_thread)
         self.race_thread.start()
+
+    def _confirm_td3_start(self, agent: AgentOption) -> bool:
+        if (
+            not self.app_settings.show_td3_advisory
+            or agent.agent_type
+            not in {"td3_scratch", "n_step_td3", "sensor_n_step_td3"}
+        ):
+            return True
+
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Information)
+        language = self.app_settings.language
+        dialog.setWindowTitle(tr("Before You Start", language))
+        dialog.setText(tr("Learned drivers can vary between races.", language))
+        dialog.setInformativeText(_td3_advisory_text(agent.agent_type, language))
+        never_again = QCheckBox(tr("Do not show this note again", language))
+        dialog.setCheckBox(never_again)
+        start_button = dialog.addButton(
+            tr("Start race", language),
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        dialog.addButton(tr("Not now", language), QMessageBox.ButtonRole.RejectRole)
+        dialog.exec()
+
+        if never_again.isChecked():
+            updated = replace(self.app_settings, show_td3_advisory=False)
+            try:
+                self.settings_store.save(updated)
+            except OSError:
+                pass
+            else:
+                self.app_settings = updated
+                self.settings_view.set_settings(updated)
+        return dialog.clickedButton() is start_button
 
     def _handle_stop_clicked(self) -> None:
         if self.race_worker is None:
@@ -2739,6 +3089,7 @@ class MainWindow(QMainWindow):
         self.car_combo.setEnabled(enabled)
         self.start_button.setEnabled(enabled and self.track_combo.count() > 0)
         self.stop_button.setEnabled(not enabled)
+        self.settings_view.set_maintenance_enabled(enabled)
 
     def _reset_race_controls(self) -> None:
         self._set_race_controls_enabled(True)
@@ -3392,6 +3743,91 @@ def _format_speed(value: float | None) -> str:
 
 def _format_path(value: object) -> str:
     return "not generated" if value is None else str(value)
+
+
+def _format_bytes(value: int) -> str:
+    size = float(max(0, value))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024.0 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return "0 B"
+
+
+def _td3_advisory_text(agent_type: str, language: str = "en") -> str:
+    if language == "cy":
+        if agent_type == "sensor_n_step_td3":
+            return (
+                "Yn ystod gwerthusiad ailadroddus y prosiect, cwblhaodd Asiant 8 "
+                "19 o 20 ras. Ni orffennodd un ras. Mae amrywiadau bach yn arferol "
+                "i bolisi niwral dysgedig, felly nid oes sicrwydd y bydd y ras hon "
+                "yn cael ei chwblhau."
+            )
+        if agent_type == "n_step_td3":
+            return (
+                "Polisi niwral dysgedig yw Asiant 7. Gall gwblhau'r gylched, ond "
+                "gall rasys ailadroddus amrywio ac nid oes sicrwydd o gwblhau."
+            )
+        return (
+            "Polisi niwral arbrofol o'r dechrau yw Asiant 6. Mae'n bosibl na fydd "
+            "yn cwblhau'r gylched yn ystod arddangosiad."
+        )
+    if agent_type == "sensor_n_step_td3":
+        return (
+            "In the project's repeated evaluation, Agent 8 completed 19 of 20 "
+            "runs. One run did not finish. Small variations are normal for a "
+            "learned neural policy, so this race is not guaranteed to complete."
+        )
+    if agent_type == "n_step_td3":
+        return (
+            "Agent 7 is a learned neural policy. It can complete the circuit, "
+            "but repeated runs may differ and completion is not guaranteed."
+        )
+    return (
+        "Agent 6 is an experimental from-scratch neural policy. It may fail to "
+        "complete the circuit during a demonstration."
+    )
+
+
+def _cache_cleared_text(bytes_used: int, directories: int, language: str) -> str:
+    if language == "cy":
+        return (
+            f"Dilëwyd {_format_bytes(bytes_used)} o {directories} ffolder dros dro.\n\n"
+            "Ni newidiwyd modelau, rasys na thystiolaeth ymchwil."
+        )
+    folder = "folder" if directories == 1 else "folders"
+    return (
+        f"Removed {_format_bytes(bytes_used)} from {directories} temporary {folder}.\n\n"
+        "Models, race runs, and research evidence were not changed."
+    )
+
+
+def _run_reset_warning_text(run_count: int, track_id: str, language: str) -> str:
+    if language == "cy":
+        return (
+            f"Mae gan y rhaglen {run_count:,} ras wedi'u cadw ar hyn o bryd. Cedwir "
+            "un ailchwarae defnyddiol ar gyfer pob asiant, gan roi blaenoriaeth i "
+            f"lapiau cyflawn ar {track_id}.\n\nNi chyffyrddir â phwyntiau gwirio "
+            "hyfforddi, gwerthusiadau, logiau na llinellau rasio. Ni ellir dadwneud hyn."
+        )
+    return (
+        f"The application currently has {run_count:,} saved runs. One useful "
+        "replay per agent will be preserved, preferring completed laps on "
+        f"{track_id}.\n\nTraining checkpoints, evaluations, logs, and racing "
+        "lines will not be touched. This cannot be undone."
+    )
+
+
+def _run_reset_result_text(deleted: int, retained: int, language: str) -> str:
+    if language == "cy":
+        return (
+            f"Dilëwyd {deleted:,} ras hŷn a chadwyd {retained:,} "
+            "ailchwarae cynrychioliadol."
+        )
+    return (
+        f"Deleted {deleted:,} older runs and kept {retained:,} "
+        "representative replays."
+    )
 
 
 def _track_label(track: TrackOption) -> str:

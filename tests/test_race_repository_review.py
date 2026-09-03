@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -83,6 +84,88 @@ class RaceRepositoryReviewTests(unittest.TestCase):
             self.assertIsNotNone(best_run)
             assert best_run is not None
             self.assertEqual(best_run["id"], faster_run_id)
+
+    def test_prune_keeps_one_useful_run_per_agent_type_and_cascades(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = Path(directory) / "results.db"
+            repository = RaceRepository(database_path)
+            td3_v1 = repository.register_agent(
+                name="Sensor TD3 v1",
+                agent_type="sensor_n_step_td3",
+                version="1.0",
+            )
+            td3_v2 = repository.register_agent(
+                name="Sensor TD3 v2",
+                agent_type="sensor_n_step_td3",
+                version="2.0",
+            )
+            map_agent = repository.register_agent(
+                name="Map-Aware",
+                agent_type="map_aware",
+                version="4.2",
+            )
+
+            old_td3 = repository.record_run(
+                agent_id=td3_v1,
+                track="g-track-3",
+                seed=1,
+                results=_results(best_lap=96.0),
+                metrics={"distance": 2_500.0},
+            )
+            best_td3 = repository.record_run(
+                agent_id=td3_v2,
+                track="g-track-3",
+                seed=2,
+                results=_results(best_lap=88.0),
+            )
+            other_track_td3 = repository.record_run(
+                agent_id=td3_v2,
+                track="road-1",
+                seed=3,
+                results=_results(best_lap=70.0),
+            )
+            map_run = repository.record_run(
+                agent_id=map_agent,
+                track="g-track-3",
+                seed=4,
+                results=_results(best_lap=91.0),
+            )
+            repository.record_run_telemetry(
+                old_td3,
+                [{"step": 1, "speed_x": 10.0}],
+            )
+
+            result = repository.prune_runs_to_representatives(
+                preferred_track="g-track-3"
+            )
+
+            self.assertEqual(result.original_count, 4)
+            self.assertEqual(result.deleted_count, 2)
+            self.assertEqual(repository.count_runs(), 2)
+            self.assertEqual(
+                result.retained_run_ids,
+                tuple(sorted((best_td3, map_run))),
+            )
+            connection = sqlite3.connect(database_path)
+            try:
+                run_ids = {
+                    row[0] for row in connection.execute("SELECT id FROM race_runs")
+                }
+                telemetry_count = connection.execute(
+                    "SELECT COUNT(*) FROM run_telemetry WHERE run_id = ?",
+                    (old_td3,),
+                ).fetchone()[0]
+                metric_count = connection.execute(
+                    "SELECT COUNT(*) FROM run_metrics WHERE run_id = ?",
+                    (old_td3,),
+                ).fetchone()[0]
+            finally:
+                connection.close()
+
+            self.assertEqual(run_ids, {best_td3, map_run})
+            self.assertEqual(telemetry_count, 0)
+            self.assertEqual(metric_count, 0)
+            self.assertNotIn(other_track_td3, run_ids)
 
 
 def _results(best_lap: float) -> dict[str, object]:

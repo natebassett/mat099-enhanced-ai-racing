@@ -122,6 +122,22 @@ class LearningVisualizerPanelTests(unittest.TestCase):
         self.assertFalse(panel.timer.isActive())
         panel.close()
 
+    def test_reduced_motion_advances_without_starting_animation(self) -> None:
+        panel = LearningVisualizerPanel()
+        panel.set_agent("sensor_n_step_td3", "Agent 8")
+        panel.set_reduce_motion(True)
+
+        panel.toggle_playback()
+
+        self.assertEqual(panel.step_index, 1)
+        self.assertFalse(panel.timer.isActive())
+        self.assertIn("next learning step", panel.play_button.toolTip().lower())
+        self.assertEqual(
+            panel.play_button.accessibleName(),
+            "Show next learning step",
+        )
+        panel.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 import json
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -8,6 +9,17 @@ from typing import Any, Mapping, Optional
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATABASE_PATH = PROJECT_ROOT / "data" / "generated" / "race_results.db"
 MIGRATIONS_PATH = Path(__file__).resolve().parent / "migrations"
+
+
+@dataclass(frozen=True)
+class RunCleanupResult:
+    original_count: int
+    deleted_count: int
+    retained_run_ids: tuple[int, ...]
+
+    @property
+    def retained_count(self) -> int:
+        return len(self.retained_run_ids)
 
 
 class RaceRepository:
@@ -368,6 +380,62 @@ class RaceRepository:
         with self._connect() as connection:
             return [dict(row) for row in connection.execute(query, parameters)]
 
+    def count_runs(self) -> int:
+        with self._connect() as connection:
+            row = connection.execute("SELECT COUNT(*) AS total FROM race_runs").fetchone()
+        return 0 if row is None else int(row["total"])
+
+    def prune_runs_to_representatives(
+        self,
+        *,
+        preferred_track: Optional[str] = None,
+    ) -> RunCleanupResult:
+        """Keep one useful replay per agent type and delete the remaining runs."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT
+                    race_runs.id,
+                    race_runs.track,
+                    race_runs.laps_completed,
+                    race_runs.best_lap_time_seconds,
+                    race_runs.steps,
+                    agents.agent_type
+                FROM race_runs
+                JOIN agents ON agents.id = race_runs.agent_id
+                """
+            ).fetchall()
+            if not rows:
+                return RunCleanupResult(0, 0, ())
+
+            representatives: dict[str, sqlite3.Row] = {}
+            for row in rows:
+                agent_type = str(row["agent_type"] or "unknown")
+                current = representatives.get(agent_type)
+                if current is None or _representative_rank(
+                    row,
+                    preferred_track=preferred_track,
+                ) < _representative_rank(
+                    current,
+                    preferred_track=preferred_track,
+                ):
+                    representatives[agent_type] = row
+
+            retained_ids = tuple(
+                sorted(int(row["id"]) for row in representatives.values())
+            )
+            placeholders = ", ".join("?" for _ in retained_ids)
+            cursor = connection.execute(
+                f"DELETE FROM race_runs WHERE id NOT IN ({placeholders})",
+                retained_ids,
+            )
+            return RunCleanupResult(
+                original_count=len(rows),
+                deleted_count=max(0, int(cursor.rowcount)),
+                retained_run_ids=retained_ids,
+            )
+
 
 def _track_sensors_json(sample: Mapping[str, Any]) -> str | None:
     values = sample.get("track_sensors")
@@ -396,3 +464,36 @@ def _decode_track_sensors(value: Any) -> list[float]:
         except (TypeError, ValueError):
             continue
     return sensors
+
+
+def _representative_rank(
+    row: Mapping[str, Any],
+    *,
+    preferred_track: Optional[str],
+) -> tuple[int, float, int, int]:
+    completed = bool(
+        int(row["laps_completed"] or 0) > 0
+        and row["best_lap_time_seconds"] is not None
+    )
+    on_preferred_track = bool(
+        preferred_track and str(row["track"] or "") == preferred_track
+    )
+    if completed and on_preferred_track:
+        category = 0
+    elif completed:
+        category = 1
+    elif on_preferred_track:
+        category = 2
+    else:
+        category = 3
+    lap_time = (
+        float(row["best_lap_time_seconds"])
+        if completed
+        else float("inf")
+    )
+    return (
+        category,
+        lap_time,
+        -int(row["steps"] or 0),
+        -int(row["id"] or 0),
+    )
