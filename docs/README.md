@@ -26,9 +26,12 @@ application and understanding the overall project.
 
 ## Supporting Assets
 
-`assets/architecture-overview.png` is a reusable system overview. The three SVG
-files are layout placeholders only; replace them with final application
-screenshots before using them as dissertation figures.
+| Asset | Purpose |
+| --- | --- |
+| `assets/architecture-overview.png` | Reusable system overview. |
+| `assets/gui-main-window.png` | Final live-telemetry dashboard screenshot. |
+| `assets/racing-line.png` | Final racing-line inspection screenshot. |
+| `assets/telemetry-review.png` | Final saved Agent 8 replay screenshot. |
 
 ## Evidence Rule
 
