@@ -27,9 +27,7 @@ There are two supported ways to use the project:
 | Build your own Windows application folder | Run the reproducible PowerShell build command below. |
 
 The generated executable and its `_internal` folder are intentionally excluded
-from Git. They are release artefacts, not source code. Publish the complete
-`dist\Enhanced AI Racing` folder as a GitHub Release ZIP rather than committing
-the `.exe` to the repository.
+from Git. They are release artefacts, not source code. 
 
 ## Project Aim
 
