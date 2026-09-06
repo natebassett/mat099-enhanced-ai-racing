@@ -1,0 +1,108 @@
+{
+  "agents": [
+    {
+      "assets": [],
+      "class": "agents.rule_based_agent.RuleBasedAgent",
+      "id": "rule_based",
+      "label": "Rule-based",
+      "seeded": false
+    },
+    {
+      "assets": [
+        "data/racing_lines/g-track-3.json"
+      ],
+      "class": "agents.map_aware_agent.MapAwareAgent",
+      "constructor": {
+        "racing_line_path": "data/racing_lines/g-track-3.json"
+      },
+      "id": "map_aware",
+      "label": "Map-aware",
+      "seeded": false
+    },
+    {
+      "assets": [
+        "data/policies/dyna_q_g_track_3_final.json"
+      ],
+      "class": "agents.dyna_q_agent.DynaQFinalisedAgent",
+      "constructor": {
+        "policy_path": "data/policies/dyna_q_g_track_3_final.json"
+      },
+      "id": "dyna_q_final",
+      "label": "Dyna-Q final",
+      "seeded": true
+    },
+    {
+      "assets": [
+        "models/agent7_n_step_td3_v4/best_evaluation.pt",
+        "data/racing_lines/g-track-3-agent7-smooth-v1.json"
+      ],
+      "class": "agents.n_step_td3_agent.NstepTd3Agent",
+      "constructor": {
+        "device": "cpu",
+        "policy_path": "models/agent7_n_step_td3_v4/best_evaluation.pt",
+        "racing_line_path": "data/racing_lines/g-track-3-agent7-smooth-v1.json",
+        "require_policy": true
+      },
+      "id": "agent7_v4",
+      "label": "Agent 7 v4 (race-line TD3)",
+      "seeded": true
+    },
+    {
+      "assets": [
+        "models/agent8_sensor_n_step_td3_self_imitation_stability/champion_83_038s_36of40_clean.pt"
+      ],
+      "class": "agents.sensor_n_step_td3_agent.SensorNstepTd3Agent",
+      "constructor": {
+        "device": "cpu",
+        "policy_path": "models/agent8_sensor_n_step_td3_self_imitation_stability/champion_83_038s_36of40_clean.pt",
+        "require_policy": true
+      },
+      "id": "agent8_final",
+      "label": "Agent 8 final (sensor-only TD3)",
+      "seeded": true
+    }
+  ],
+  "design": {
+    "base_agent_seed": 731920,
+    "blocked_randomisation": true,
+    "bootstrap_resamples": 10000,
+    "confidence_level": 0.95,
+    "order_seed": 20260906,
+    "repeats_per_agent": 20,
+    "reverse_speed_threshold_kmh": -1.0
+  },
+  "environment": {
+    "car_id": "car1-ow1",
+    "cold_restart_between_attempts": true,
+    "exploration_noise": false,
+    "max_steps": 25000,
+    "online_learning": false,
+    "simulator": "TORCS",
+    "target_laps": 1,
+    "telemetry_interval_steps": 1,
+    "track_category": "road",
+    "track_id": "g-track-3"
+  },
+  "outcomes": {
+    "clean_completion_rule": "At least one timed lap, target_laps_completed termination, zero off-track samples, zero reverse samples below the threshold, and no stall termination.",
+    "inference": "Wilson intervals describe completion uncertainty. Pairwise Fisher exact tests with Holm correction are exploratory. Pace is conditional on clean completion and is not interpreted independently of reliability.",
+    "primary": "Clean lap completion rate",
+    "secondary": [
+      "Lap time among clean completions",
+      "Distance raced",
+      "Mean and maximum longitudinal speed",
+      "Off-track and reverse event incidence",
+      "Damage increase",
+      "Termination reason"
+    ]
+  },
+  "protocol_id": "mat099-controlled-agent-evaluation-v1",
+  "protocol_version": "1.0",
+  "research_question": "Under one fixed TORCS protocol, how do the final implemented driving agents differ in clean-lap reliability, pace and failure behaviour?",
+  "scope": "Final-policy evaluation only; this protocol does not compare training efficiency or cross-track generalisation.",
+  "session": {
+    "prepared_at": "2026-09-06T21:46:15.166330+00:00",
+    "purpose": "final",
+    "session_id": "final-agent-evaluation"
+  }
+}

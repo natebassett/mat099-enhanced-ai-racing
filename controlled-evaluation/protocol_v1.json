@@ -1,0 +1,103 @@
+{
+  "protocol_id": "mat099-controlled-agent-evaluation-v1",
+  "protocol_version": "1.0",
+  "research_question": "Under one fixed TORCS protocol, how do the final implemented driving agents differ in clean-lap reliability, pace and failure behaviour?",
+  "scope": "Final-policy evaluation only; this protocol does not compare training efficiency or cross-track generalisation.",
+  "environment": {
+    "simulator": "TORCS",
+    "track_id": "g-track-3",
+    "track_category": "road",
+    "car_id": "car1-ow1",
+    "target_laps": 1,
+    "max_steps": 25000,
+    "cold_restart_between_attempts": true,
+    "online_learning": false,
+    "exploration_noise": false,
+    "telemetry_interval_steps": 1
+  },
+  "design": {
+    "repeats_per_agent": 20,
+    "blocked_randomisation": true,
+    "order_seed": 20260906,
+    "base_agent_seed": 731920,
+    "reverse_speed_threshold_kmh": -1.0,
+    "confidence_level": 0.95,
+    "bootstrap_resamples": 10000
+  },
+  "outcomes": {
+    "primary": "Clean lap completion rate",
+    "clean_completion_rule": "At least one timed lap, target_laps_completed termination, zero off-track samples, zero reverse samples below the threshold, and no stall termination.",
+    "secondary": [
+      "Lap time among clean completions",
+      "Distance raced",
+      "Mean and maximum longitudinal speed",
+      "Off-track and reverse event incidence",
+      "Damage increase",
+      "Termination reason"
+    ],
+    "inference": "Wilson intervals describe completion uncertainty. Pairwise Fisher exact tests with Holm correction are exploratory. Pace is conditional on clean completion and is not interpreted independently of reliability."
+  },
+  "agents": [
+    {
+      "id": "rule_based",
+      "label": "Rule-based",
+      "class": "agents.rule_based_agent.RuleBasedAgent",
+      "seeded": false,
+      "assets": []
+    },
+    {
+      "id": "map_aware",
+      "label": "Map-aware",
+      "class": "agents.map_aware_agent.MapAwareAgent",
+      "seeded": false,
+      "constructor": {
+        "racing_line_path": "data/racing_lines/g-track-3.json"
+      },
+      "assets": [
+        "data/racing_lines/g-track-3.json"
+      ]
+    },
+    {
+      "id": "dyna_q_final",
+      "label": "Dyna-Q final",
+      "class": "agents.dyna_q_agent.DynaQFinalisedAgent",
+      "seeded": true,
+      "constructor": {
+        "policy_path": "data/policies/dyna_q_g_track_3_final.json"
+      },
+      "assets": [
+        "data/policies/dyna_q_g_track_3_final.json"
+      ]
+    },
+    {
+      "id": "agent7_v4",
+      "label": "Agent 7 v4 (race-line TD3)",
+      "class": "agents.n_step_td3_agent.NstepTd3Agent",
+      "seeded": true,
+      "constructor": {
+        "policy_path": "models/agent7_n_step_td3_v4/best_evaluation.pt",
+        "racing_line_path": "data/racing_lines/g-track-3-agent7-smooth-v1.json",
+        "require_policy": true,
+        "device": "cpu"
+      },
+      "assets": [
+        "models/agent7_n_step_td3_v4/best_evaluation.pt",
+        "data/racing_lines/g-track-3-agent7-smooth-v1.json"
+      ]
+    },
+    {
+      "id": "agent8_final",
+      "label": "Agent 8 final (sensor-only TD3)",
+      "class": "agents.sensor_n_step_td3_agent.SensorNstepTd3Agent",
+      "seeded": true,
+      "constructor": {
+        "policy_path": "models/agent8_sensor_n_step_td3_self_imitation_stability/champion_83_038s_36of40_clean.pt",
+        "require_policy": true,
+        "device": "cpu"
+      },
+      "assets": [
+        "models/agent8_sensor_n_step_td3_self_imitation_stability/champion_83_038s_36of40_clean.pt"
+      ]
+    }
+  ]
+}

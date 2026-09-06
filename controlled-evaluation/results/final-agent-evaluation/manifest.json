@@ -1,0 +1,95 @@
+{
+  "artifacts": {
+    "controlled-evaluation/protocol_v1.json": {
+      "bytes": 3538,
+      "sha256": "709ca3e093241bbf788a18057733485e24a454cb44c4dcb14556eb3edddb10ae"
+    },
+    "controlled-evaluation/run_evaluation.py": {
+      "bytes": 30979,
+      "sha256": "f7b8502410de3f0e9d4dab2a9f7f277687ab6c9af438a4b63ce1e8eca1268648"
+    },
+    "data/policies/dyna_q_g_track_3_final.json": {
+      "bytes": 25348382,
+      "sha256": "847148fa3a8bf8c6345d45d48e2fabcdf0c5e8e256eb22520486db634442e062"
+    },
+    "data/racing_lines/g-track-3-agent7-smooth-v1.json": {
+      "bytes": 267329,
+      "sha256": "a72159b6f2fb61c1f9406bf243a11e6e68a6665f1ee42b80634c01df3e9c27f3"
+    },
+    "data/racing_lines/g-track-3.json": {
+      "bytes": 263087,
+      "sha256": "bf673e7512275d17f80284ac9ae55a1900b81f58b1768ba25e9627b2a9774cbb"
+    },
+    "models/agent7_n_step_td3_v4/best_evaluation.pt": {
+      "bytes": 4971005,
+      "sha256": "7552a47b6b1523e9eaf217619f6576635da70ec1da70159b8e4651bcd1ef3cf3"
+    },
+    "models/agent8_sensor_n_step_td3_self_imitation_stability/champion_83_038s_36of40_clean.pt": {
+      "bytes": 4971389,
+      "sha256": "0b05c762d12698f57fa0981970618225d5a49c25f2469c2132d096766b88ac33"
+    },
+    "src/agents/dyna_q_agent.py": {
+      "bytes": 38797,
+      "sha256": "95d96979f19c222b12a30fda75f75e0083b0ab30d8c17d54123e1b2ae2b7e052"
+    },
+    "src/agents/map_aware_agent.py": {
+      "bytes": 80564,
+      "sha256": "127ccefb83e50176d99cb98aa1aebb6dcee761038d982397e8e1f6f19c4f6d4d"
+    },
+    "src/agents/n_step_td3_agent.py": {
+      "bytes": 11921,
+      "sha256": "b93d969e47e091a5f004f7e15035c2f6b4134c13a4f5371624e3447a70c15988"
+    },
+    "src/agents/rule_based_agent.py": {
+      "bytes": 23958,
+      "sha256": "a3be590c7f392eb11f79470592c2a8866f5da9adde50fd252a923e448b7842c0"
+    },
+    "src/agents/sensor_n_step_td3_agent.py": {
+      "bytes": 1147,
+      "sha256": "9141a51620f86da638be63a6f780f8b2392a7db796f7d624c58103a8c7c61ce3"
+    },
+    "src/gui/torcs_config.py": {
+      "bytes": 4955,
+      "sha256": "c551ee7da12ca3df8207d2d9bce0590439905ef2733fc4393ddcbcd74a95d85f"
+    },
+    "src/runner/torcs_runner.py": {
+      "bytes": 25453,
+      "sha256": "e82ea995005b7e209e6a381a02c981482aecb7a0da090b8714590f38796a3742"
+    },
+    "torcs-wrapper/gym_torcs/gym_torcs.py": {
+      "bytes": 11835,
+      "sha256": "e814990aa1105827589ff47be0332f430ee695f69369d3b43928592be4312a80"
+    },
+    "torcs-wrapper/gym_torcs/snakeoil3_gym.py": {
+      "bytes": 24295,
+      "sha256": "5bbab8c525efd54f509bf207a2e83af4a82a1813700a7bccc25e7f6436e2b5d4"
+    },
+    "torcs/wtorcs.exe": {
+      "bytes": 80896,
+      "sha256": "efcaec2c0c872b381af1b75fbaf68a0e2f942afc98a80651d3e3b5c7ffa1b3b4"
+    }
+  },
+  "created_at": "2026-09-06T21:46:15.201209+00:00",
+  "git": {
+    "branch": "feature/controlled-evaluation",
+    "nested_revision": "73b6619311f52678df8695cc65a51c16a055c1b6",
+    "nested_status_porcelain": "M __pycache__/snakeoil3_gym.cpython-312.pyc\n M snakeoil3_gym.py",
+    "revision": "23707240e4f33f37bd6590a01fb92156268fab97",
+    "status_porcelain": "M torcs-wrapper/gym_torcs\n M torcs/config/raceman/practice.xml\n?? controlled-evaluation/\n?? tests/test_controlled_evaluation.py"
+  },
+  "protocol_snapshot_sha256": "98e50525903aa892e20685ee1c7673c7650fa96c322bde2c29367ee5ac92f602",
+  "runtime": {
+    "dependencies": {
+      "gym": "0.26.2",
+      "matplotlib": "3.10.9",
+      "numpy": "2.4.6",
+      "scipy": "1.17.1",
+      "torch": "2.12.0"
+    },
+    "machine": "AMD64",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "Intel64 Family 6 Model 141 Stepping 1, GenuineIntel",
+    "python": "3.12.3 (tags/v3.12.3:f6650f9, Apr  9 2024, 14:05:25) [MSC v.1938 64 bit (AMD64)]",
+    "python_executable": "C:\\Users\\natha\\OneDrive\\Desktop\\MAT099\\mat099-enhanced-ai-racing\\torcs-env\\Scripts\\python.exe"
+  }
+}
