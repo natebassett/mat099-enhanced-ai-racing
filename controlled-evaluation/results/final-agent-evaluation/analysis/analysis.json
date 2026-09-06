@@ -1,0 +1,248 @@
+{
+  "session_id": "final-agent-evaluation",
+  "complete": true,
+  "valid_attempts": 100,
+  "scheduled_attempts": 100,
+  "infrastructure_failure_records": 0,
+  "summary": [
+    {
+      "agent_id": "rule_based",
+      "agent_label": "Rule-based",
+      "attempts": 20,
+      "clean_completions": 17,
+      "completion_rate": 0.85,
+      "completion_ci_low": 0.639581135264171,
+      "completion_ci_high": 0.9476312541027224,
+      "clean_lap_median_s": 98.398,
+      "clean_lap_q1_s": 98.398,
+      "clean_lap_q3_s": 98.398,
+      "clean_lap_bootstrap_ci_low_s": 98.398,
+      "clean_lap_bootstrap_ci_high_s": 98.398,
+      "distance_median_m": 2943.98,
+      "failed_distance_median_m": 2177.16,
+      "mean_speed_median_kmh": 107.11125436546476,
+      "damage_delta_median": 0.0
+    },
+    {
+      "agent_id": "map_aware",
+      "agent_label": "Map-aware",
+      "attempts": 20,
+      "clean_completions": 17,
+      "completion_rate": 0.85,
+      "completion_ci_low": 0.639581135264171,
+      "completion_ci_high": 0.9476312541027224,
+      "clean_lap_median_s": 90.97,
+      "clean_lap_q1_s": 90.97,
+      "clean_lap_q3_s": 90.97,
+      "clean_lap_bootstrap_ci_low_s": 90.97,
+      "clean_lap_bootstrap_ci_high_s": 90.97,
+      "distance_median_m": 2943.59,
+      "failed_distance_median_m": 2078.76,
+      "mean_speed_median_kmh": 114.92551587105625,
+      "damage_delta_median": 0.0
+    },
+    {
+      "agent_id": "dyna_q_final",
+      "agent_label": "Dyna-Q final",
+      "attempts": 20,
+      "clean_completions": 0,
+      "completion_rate": 0.0,
+      "completion_ci_low": 0.0,
+      "completion_ci_high": 0.16112515804729494,
+      "clean_lap_median_s": null,
+      "clean_lap_q1_s": null,
+      "clean_lap_q3_s": null,
+      "clean_lap_bootstrap_ci_low_s": null,
+      "clean_lap_bootstrap_ci_high_s": null,
+      "distance_median_m": 1599.85,
+      "failed_distance_median_m": 1599.85,
+      "mean_speed_median_kmh": 37.40117929161437,
+      "damage_delta_median": 0.0
+    },
+    {
+      "agent_id": "agent7_v4",
+      "agent_label": "Agent 7 v4 (race-line TD3)",
+      "attempts": 20,
+      "clean_completions": 14,
+      "completion_rate": 0.7,
+      "completion_ci_low": 0.4810271816508782,
+      "completion_ci_high": 0.8545227551302037,
+      "clean_lap_median_s": 103.553,
+      "clean_lap_q1_s": 103.366,
+      "clean_lap_q3_s": 106.4305,
+      "clean_lap_bootstrap_ci_low_s": 103.366,
+      "clean_lap_bootstrap_ci_high_s": 106.04042499999991,
+      "distance_median_m": 2943.1,
+      "failed_distance_median_m": 514.2525,
+      "mean_speed_median_kmh": 98.09179414059037,
+      "damage_delta_median": 0.0
+    },
+    {
+      "agent_id": "agent8_final",
+      "agent_label": "Agent 8 final (sensor-only TD3)",
+      "attempts": 20,
+      "clean_completions": 9,
+      "completion_rate": 0.45,
+      "completion_ci_low": 0.2581978582587799,
+      "completion_ci_high": 0.6579146575459498,
+      "clean_lap_median_s": 83.038,
+      "clean_lap_q1_s": 83.038,
+      "clean_lap_q3_s": 83.038,
+      "clean_lap_bootstrap_ci_low_s": 83.038,
+      "clean_lap_bootstrap_ci_high_s": 83.038,
+      "distance_median_m": 2058.3599999999997,
+      "failed_distance_median_m": 2038.14,
+      "mean_speed_median_kmh": 117.56534624799335,
+      "damage_delta_median": 0.0
+    }
+  ],
+  "event_incidence": [
+    {
+      "agent_id": "rule_based",
+      "agent_label": "Rule-based",
+      "attempts": 20,
+      "attempts_with_off_track": 1,
+      "attempts_with_reverse": 2,
+      "attempts_with_stall": 0,
+      "attempts_with_unsafe_heading": 0,
+      "attempts_with_damage_increase": 0,
+      "completed_unclean": 0
+    },
+    {
+      "agent_id": "map_aware",
+      "agent_label": "Map-aware",
+      "attempts": 20,
+      "attempts_with_off_track": 2,
+      "attempts_with_reverse": 0,
+      "attempts_with_stall": 1,
+      "attempts_with_unsafe_heading": 0,
+      "attempts_with_damage_increase": 1,
+      "completed_unclean": 0
+    },
+    {
+      "agent_id": "dyna_q_final",
+      "agent_label": "Dyna-Q final",
+      "attempts": 20,
+      "attempts_with_off_track": 20,
+      "attempts_with_reverse": 0,
+      "attempts_with_stall": 0,
+      "attempts_with_unsafe_heading": 0,
+      "attempts_with_damage_increase": 3,
+      "completed_unclean": 7
+    },
+    {
+      "agent_id": "agent7_v4",
+      "agent_label": "Agent 7 v4 (race-line TD3)",
+      "attempts": 20,
+      "attempts_with_off_track": 4,
+      "attempts_with_reverse": 0,
+      "attempts_with_stall": 2,
+      "attempts_with_unsafe_heading": 0,
+      "attempts_with_damage_increase": 0,
+      "completed_unclean": 1
+    },
+    {
+      "agent_id": "agent8_final",
+      "agent_label": "Agent 8 final (sensor-only TD3)",
+      "attempts": 20,
+      "attempts_with_off_track": 9,
+      "attempts_with_reverse": 0,
+      "attempts_with_stall": 0,
+      "attempts_with_unsafe_heading": 2,
+      "attempts_with_damage_increase": 0,
+      "completed_unclean": 0
+    }
+  ],
+  "pairwise_reliability": [
+    {
+      "agent_a": "Rule-based",
+      "agent_b": "Map-aware",
+      "completion_rate_difference": 0.0,
+      "odds_ratio": 1.0,
+      "fisher_exact_p": 1.0,
+      "holm_adjusted_p": 1.0,
+      "interpretation": "no exploratory difference after Holm correction"
+    },
+    {
+      "agent_a": "Rule-based",
+      "agent_b": "Dyna-Q final",
+      "completion_rate_difference": 0.85,
+      "odds_ratio": "inf",
+      "fisher_exact_p": 2.5695242602917798e-08,
+      "holm_adjusted_p": 2.56952426029178e-07,
+      "interpretation": "exploratory difference after Holm correction"
+    },
+    {
+      "agent_a": "Rule-based",
+      "agent_b": "Agent 7 v4 (race-line TD3)",
+      "completion_rate_difference": 0.15000000000000002,
+      "odds_ratio": 2.4285714285714284,
+      "fisher_exact_p": 0.45057645057645057,
+      "holm_adjusted_p": 1.0,
+      "interpretation": "no exploratory difference after Holm correction"
+    },
+    {
+      "agent_a": "Rule-based",
+      "agent_b": "Agent 8 final (sensor-only TD3)",
+      "completion_rate_difference": 0.39999999999999997,
+      "odds_ratio": 6.925925925925926,
+      "fisher_exact_p": 0.018701126042616586,
+      "holm_adjusted_p": 0.11220675625569951,
+      "interpretation": "no exploratory difference after Holm correction"
+    },
+    {
+      "agent_a": "Map-aware",
+      "agent_b": "Dyna-Q final",
+      "completion_rate_difference": 0.85,
+      "odds_ratio": "inf",
+      "fisher_exact_p": 2.5695242602917798e-08,
+      "holm_adjusted_p": 2.56952426029178e-07,
+      "interpretation": "exploratory difference after Holm correction"
+    },
+    {
+      "agent_a": "Map-aware",
+      "agent_b": "Agent 7 v4 (race-line TD3)",
+      "completion_rate_difference": 0.15000000000000002,
+      "odds_ratio": 2.4285714285714284,
+      "fisher_exact_p": 0.45057645057645057,
+      "holm_adjusted_p": 1.0,
+      "interpretation": "no exploratory difference after Holm correction"
+    },
+    {
+      "agent_a": "Map-aware",
+      "agent_b": "Agent 8 final (sensor-only TD3)",
+      "completion_rate_difference": 0.39999999999999997,
+      "odds_ratio": 6.925925925925926,
+      "fisher_exact_p": 0.018701126042616586,
+      "holm_adjusted_p": 0.11220675625569951,
+      "interpretation": "no exploratory difference after Holm correction"
+    },
+    {
+      "agent_a": "Dyna-Q final",
+      "agent_b": "Agent 7 v4 (race-line TD3)",
+      "completion_rate_difference": -0.7,
+      "odds_ratio": 0.0,
+      "fisher_exact_p": 3.3403815383793136e-06,
+      "holm_adjusted_p": 2.672305230703451e-05,
+      "interpretation": "exploratory difference after Holm correction"
+    },
+    {
+      "agent_a": "Dyna-Q final",
+      "agent_b": "Agent 8 final (sensor-only TD3)",
+      "completion_rate_difference": -0.45,
+      "odds_ratio": 0.0,
+      "fisher_exact_p": 0.0012285012285012285,
+      "holm_adjusted_p": 0.0085995085995086,
+      "interpretation": "exploratory difference after Holm correction"
+    },
+    {
+      "agent_a": "Agent 7 v4 (race-line TD3)",
+      "agent_b": "Agent 8 final (sensor-only TD3)",
+      "completion_rate_difference": 0.24999999999999994,
+      "odds_ratio": 2.8518518518518516,
+      "fisher_exact_p": 0.2002872728123006,
+      "holm_adjusted_p": 0.8011490912492024,
+      "interpretation": "no exploratory difference after Holm correction"
+    }
+  ]
+}

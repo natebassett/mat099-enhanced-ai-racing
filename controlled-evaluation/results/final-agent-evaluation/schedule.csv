@@ -1,0 +1,101 @@
+attempt_id,block,position,agent_trial,agent_id,agent_label,seed
+b001-p01-agent7_v4,1,1,1,agent7_v4,Agent 7 v4 (race-line TD3),732023
+b001-p02-rule_based,1,2,1,rule_based,Rule-based,732020
+b001-p03-map_aware,1,3,1,map_aware,Map-aware,732021
+b001-p04-agent8_final,1,4,1,agent8_final,Agent 8 final (sensor-only TD3),732024
+b001-p05-dyna_q_final,1,5,1,dyna_q_final,Dyna-Q final,732022
+b002-p01-map_aware,2,1,2,map_aware,Map-aware,732121
+b002-p02-agent8_final,2,2,2,agent8_final,Agent 8 final (sensor-only TD3),732124
+b002-p03-agent7_v4,2,3,2,agent7_v4,Agent 7 v4 (race-line TD3),732123
+b002-p04-dyna_q_final,2,4,2,dyna_q_final,Dyna-Q final,732122
+b002-p05-rule_based,2,5,2,rule_based,Rule-based,732120
+b003-p01-agent8_final,3,1,3,agent8_final,Agent 8 final (sensor-only TD3),732224
+b003-p02-dyna_q_final,3,2,3,dyna_q_final,Dyna-Q final,732222
+b003-p03-agent7_v4,3,3,3,agent7_v4,Agent 7 v4 (race-line TD3),732223
+b003-p04-map_aware,3,4,3,map_aware,Map-aware,732221
+b003-p05-rule_based,3,5,3,rule_based,Rule-based,732220
+b004-p01-agent8_final,4,1,4,agent8_final,Agent 8 final (sensor-only TD3),732324
+b004-p02-dyna_q_final,4,2,4,dyna_q_final,Dyna-Q final,732322
+b004-p03-agent7_v4,4,3,4,agent7_v4,Agent 7 v4 (race-line TD3),732323
+b004-p04-rule_based,4,4,4,rule_based,Rule-based,732320
+b004-p05-map_aware,4,5,4,map_aware,Map-aware,732321
+b005-p01-rule_based,5,1,5,rule_based,Rule-based,732420
+b005-p02-dyna_q_final,5,2,5,dyna_q_final,Dyna-Q final,732422
+b005-p03-agent7_v4,5,3,5,agent7_v4,Agent 7 v4 (race-line TD3),732423
+b005-p04-agent8_final,5,4,5,agent8_final,Agent 8 final (sensor-only TD3),732424
+b005-p05-map_aware,5,5,5,map_aware,Map-aware,732421
+b006-p01-agent7_v4,6,1,6,agent7_v4,Agent 7 v4 (race-line TD3),732523
+b006-p02-dyna_q_final,6,2,6,dyna_q_final,Dyna-Q final,732522
+b006-p03-agent8_final,6,3,6,agent8_final,Agent 8 final (sensor-only TD3),732524
+b006-p04-rule_based,6,4,6,rule_based,Rule-based,732520
+b006-p05-map_aware,6,5,6,map_aware,Map-aware,732521
+b007-p01-dyna_q_final,7,1,7,dyna_q_final,Dyna-Q final,732622
+b007-p02-agent8_final,7,2,7,agent8_final,Agent 8 final (sensor-only TD3),732624
+b007-p03-map_aware,7,3,7,map_aware,Map-aware,732621
+b007-p04-agent7_v4,7,4,7,agent7_v4,Agent 7 v4 (race-line TD3),732623
+b007-p05-rule_based,7,5,7,rule_based,Rule-based,732620
+b008-p01-dyna_q_final,8,1,8,dyna_q_final,Dyna-Q final,732722
+b008-p02-rule_based,8,2,8,rule_based,Rule-based,732720
+b008-p03-map_aware,8,3,8,map_aware,Map-aware,732721
+b008-p04-agent7_v4,8,4,8,agent7_v4,Agent 7 v4 (race-line TD3),732723
+b008-p05-agent8_final,8,5,8,agent8_final,Agent 8 final (sensor-only TD3),732724
+b009-p01-agent7_v4,9,1,9,agent7_v4,Agent 7 v4 (race-line TD3),732823
+b009-p02-agent8_final,9,2,9,agent8_final,Agent 8 final (sensor-only TD3),732824
+b009-p03-rule_based,9,3,9,rule_based,Rule-based,732820
+b009-p04-map_aware,9,4,9,map_aware,Map-aware,732821
+b009-p05-dyna_q_final,9,5,9,dyna_q_final,Dyna-Q final,732822
+b010-p01-map_aware,10,1,10,map_aware,Map-aware,732921
+b010-p02-agent7_v4,10,2,10,agent7_v4,Agent 7 v4 (race-line TD3),732923
+b010-p03-dyna_q_final,10,3,10,dyna_q_final,Dyna-Q final,732922
+b010-p04-agent8_final,10,4,10,agent8_final,Agent 8 final (sensor-only TD3),732924
+b010-p05-rule_based,10,5,10,rule_based,Rule-based,732920
+b011-p01-dyna_q_final,11,1,11,dyna_q_final,Dyna-Q final,733022
+b011-p02-rule_based,11,2,11,rule_based,Rule-based,733020
+b011-p03-map_aware,11,3,11,map_aware,Map-aware,733021
+b011-p04-agent7_v4,11,4,11,agent7_v4,Agent 7 v4 (race-line TD3),733023
+b011-p05-agent8_final,11,5,11,agent8_final,Agent 8 final (sensor-only TD3),733024
+b012-p01-dyna_q_final,12,1,12,dyna_q_final,Dyna-Q final,733122
+b012-p02-rule_based,12,2,12,rule_based,Rule-based,733120
+b012-p03-map_aware,12,3,12,map_aware,Map-aware,733121
+b012-p04-agent8_final,12,4,12,agent8_final,Agent 8 final (sensor-only TD3),733124
+b012-p05-agent7_v4,12,5,12,agent7_v4,Agent 7 v4 (race-line TD3),733123
+b013-p01-dyna_q_final,13,1,13,dyna_q_final,Dyna-Q final,733222
+b013-p02-agent8_final,13,2,13,agent8_final,Agent 8 final (sensor-only TD3),733224
+b013-p03-agent7_v4,13,3,13,agent7_v4,Agent 7 v4 (race-line TD3),733223
+b013-p04-rule_based,13,4,13,rule_based,Rule-based,733220
+b013-p05-map_aware,13,5,13,map_aware,Map-aware,733221
+b014-p01-rule_based,14,1,14,rule_based,Rule-based,733320
+b014-p02-map_aware,14,2,14,map_aware,Map-aware,733321
+b014-p03-agent7_v4,14,3,14,agent7_v4,Agent 7 v4 (race-line TD3),733323
+b014-p04-dyna_q_final,14,4,14,dyna_q_final,Dyna-Q final,733322
+b014-p05-agent8_final,14,5,14,agent8_final,Agent 8 final (sensor-only TD3),733324
+b015-p01-agent7_v4,15,1,15,agent7_v4,Agent 7 v4 (race-line TD3),733423
+b015-p02-rule_based,15,2,15,rule_based,Rule-based,733420
+b015-p03-dyna_q_final,15,3,15,dyna_q_final,Dyna-Q final,733422
+b015-p04-map_aware,15,4,15,map_aware,Map-aware,733421
+b015-p05-agent8_final,15,5,15,agent8_final,Agent 8 final (sensor-only TD3),733424
+b016-p01-dyna_q_final,16,1,16,dyna_q_final,Dyna-Q final,733522
+b016-p02-agent8_final,16,2,16,agent8_final,Agent 8 final (sensor-only TD3),733524
+b016-p03-agent7_v4,16,3,16,agent7_v4,Agent 7 v4 (race-line TD3),733523
+b016-p04-map_aware,16,4,16,map_aware,Map-aware,733521
+b016-p05-rule_based,16,5,16,rule_based,Rule-based,733520
+b017-p01-map_aware,17,1,17,map_aware,Map-aware,733621
+b017-p02-agent7_v4,17,2,17,agent7_v4,Agent 7 v4 (race-line TD3),733623
+b017-p03-rule_based,17,3,17,rule_based,Rule-based,733620
+b017-p04-dyna_q_final,17,4,17,dyna_q_final,Dyna-Q final,733622
+b017-p05-agent8_final,17,5,17,agent8_final,Agent 8 final (sensor-only TD3),733624
+b018-p01-agent7_v4,18,1,18,agent7_v4,Agent 7 v4 (race-line TD3),733723
+b018-p02-agent8_final,18,2,18,agent8_final,Agent 8 final (sensor-only TD3),733724
+b018-p03-rule_based,18,3,18,rule_based,Rule-based,733720
+b018-p04-map_aware,18,4,18,map_aware,Map-aware,733721
+b018-p05-dyna_q_final,18,5,18,dyna_q_final,Dyna-Q final,733722
+b019-p01-rule_based,19,1,19,rule_based,Rule-based,733820
+b019-p02-dyna_q_final,19,2,19,dyna_q_final,Dyna-Q final,733822
+b019-p03-agent8_final,19,3,19,agent8_final,Agent 8 final (sensor-only TD3),733824
+b019-p04-map_aware,19,4,19,map_aware,Map-aware,733821
+b019-p05-agent7_v4,19,5,19,agent7_v4,Agent 7 v4 (race-line TD3),733823
+b020-p01-rule_based,20,1,20,rule_based,Rule-based,733920
+b020-p02-dyna_q_final,20,2,20,dyna_q_final,Dyna-Q final,733922
+b020-p03-agent7_v4,20,3,20,agent7_v4,Agent 7 v4 (race-line TD3),733923
+b020-p04-agent8_final,20,4,20,agent8_final,Agent 8 final (sensor-only TD3),733924
+b020-p05-map_aware,20,5,20,map_aware,Map-aware,733921

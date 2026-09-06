@@ -1,0 +1,6 @@
+agent_id,agent_label,attempts,attempts_with_off_track,attempts_with_reverse,attempts_with_stall,attempts_with_unsafe_heading,attempts_with_damage_increase,completed_unclean
+rule_based,Rule-based,20,1,2,0,0,0,0
+map_aware,Map-aware,20,2,0,1,0,1,0
+dyna_q_final,Dyna-Q final,20,20,0,0,0,3,7
+agent7_v4,Agent 7 v4 (race-line TD3),20,4,0,2,0,0,1
+agent8_final,Agent 8 final (sensor-only TD3),20,9,0,0,2,0,0

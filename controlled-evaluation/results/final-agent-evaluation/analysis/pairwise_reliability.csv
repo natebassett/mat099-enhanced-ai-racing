@@ -1,0 +1,11 @@
+agent_a,agent_b,completion_rate_difference,odds_ratio,fisher_exact_p,holm_adjusted_p,interpretation
+Rule-based,Map-aware,0.0,1.0,1.0,1.0,no exploratory difference after Holm correction
+Rule-based,Dyna-Q final,0.85,inf,2.5695242602917798e-08,2.56952426029178e-07,exploratory difference after Holm correction
+Rule-based,Agent 7 v4 (race-line TD3),0.15000000000000002,2.4285714285714284,0.45057645057645057,1.0,no exploratory difference after Holm correction
+Rule-based,Agent 8 final (sensor-only TD3),0.39999999999999997,6.925925925925926,0.018701126042616586,0.11220675625569951,no exploratory difference after Holm correction
+Map-aware,Dyna-Q final,0.85,inf,2.5695242602917798e-08,2.56952426029178e-07,exploratory difference after Holm correction
+Map-aware,Agent 7 v4 (race-line TD3),0.15000000000000002,2.4285714285714284,0.45057645057645057,1.0,no exploratory difference after Holm correction
+Map-aware,Agent 8 final (sensor-only TD3),0.39999999999999997,6.925925925925926,0.018701126042616586,0.11220675625569951,no exploratory difference after Holm correction
+Dyna-Q final,Agent 7 v4 (race-line TD3),-0.7,0.0,3.3403815383793136e-06,2.672305230703451e-05,exploratory difference after Holm correction
+Dyna-Q final,Agent 8 final (sensor-only TD3),-0.45,0.0,0.0012285012285012285,0.0085995085995086,exploratory difference after Holm correction
+Agent 7 v4 (race-line TD3),Agent 8 final (sensor-only TD3),0.24999999999999994,2.8518518518518516,0.2002872728123006,0.8011490912492024,no exploratory difference after Holm correction
