@@ -1,0 +1,23 @@
+\section{Research Context and Technical Background}
+\label{ch:research-context}
+
+\subsection{Autonomous control in TORCS}
+
+An intelligent agent observes its environment, selects actions and pursues an objective through the consequences of those actions \parencite{russellnorvig2021}. In this project, TORCS is the environment and a Python driver is the agent. At each simulation step the driver receives observations such as speed, heading angle, track position and range-sensor readings. It returns a control action comprising steering, longitudinal control and gear selection. A racing episode is therefore a closed loop rather than a set of independent predictions.
+
+The quality of that loop cannot be represented by speed alone. A high speed on a straight may coexist with poor heading control, repeated excursions beyond the track boundary or an incomplete lap. Conversely, a conservative controller can be slower but provide a more robust and interpretable baseline. This motivates the use of completion rate, completed-lap time, termination reason and telemetry traces as complementary measures rather than collapsing performance into a single score.
+
+The same reasoning applies to the relationship between training and evaluation. During training, an agent may use exploratory action noise, update its parameters and occasionally encounter an unusually favourable trajectory. Evaluation must instead freeze the policy and report whether the observed behaviour can be reproduced. This distinction is particularly important in deep reinforcement learning, where a successful training episode is useful evidence of capability but not sufficient evidence of a stable deployable policy. The project preserves both forms of evidence, but uses them for different claims.
+
+\subsection{Control approaches}
+
+The project spans three broad approaches. Rule-based control encodes human decisions explicitly, for example reducing throttle when heading error rises or applying recovery logic during a spin. It is transparent and cheap to evaluate, but cannot react well to cases not anticipated by its rules. Map-aware control adds a representation of the route ahead. A racing line turns track knowledge into target position and curvature information, allowing a controller to prepare for a corner instead of only responding once it is already misaligned.
+
+Reinforcement learning takes a different route. It learns a policy from interaction and a reward signal rather than specifying each driving decision directly \parencite{suttonbarto2018}. Dyna-Q combines value learning with model-based planning \parencite{sutton1990}, making it a useful bridge between tabular reinforcement learning and the simulator. TD3 is a deep actor-critic method designed for continuous control and uses twin critics, delayed policy updates and target-policy smoothing to reduce overestimation error \parencite{fujimoto2018}. Its action space is a natural fit for steering and longitudinal control, but its performance depends strongly on the observation design, reward, training experience and evaluation process.
+
+\subsection{Explainability and novice access}
+
+Explainability in this project does not mean claiming that a neural network can fully explain each internal feature interaction. It means giving a user sufficient evidence to form an appropriate understanding of what happened and why. Telemetry can show speed, position, control outputs and failures; comparison views can show that a fast lap is not necessarily a reliable policy; and agent descriptions can link visible behaviour to the relevant control method. This approach is consistent with human-AI interaction guidance that emphasises communicating system capability, state and limitations to users \parencite{amershi2019}.
+
+The installation path is part of that access. A novice cannot inspect an AI system that they cannot start. The project consequently packages the dashboard, runtime dependencies, TORCS, final policies and evidence files into a Windows application folder. Users extract the release folder and run \texttt{EnhancedAIRacing.exe} rather than constructing a development environment. This is evidence of reduced deployment friction; it is not, by itself, proof that every novice understands reinforcement learning. That stronger educational claim is considered as a limitation later in the dissertation.
+

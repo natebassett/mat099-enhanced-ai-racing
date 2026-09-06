@@ -1,0 +1,60 @@
+\section{Literature Review and Design Rationale}
+\label{ch:literature-review}
+
+This chapter does not treat prior work as a catalogue of algorithms. It identifies what existing research establishes, the assumptions it makes, and how those assumptions informed the design of Enhanced AI Racing. The review consequently links controller literature to the agent progression, reinforcement-learning literature to the evaluation protocol, and human-AI interaction literature to the novice-facing application.
+
+\subsection{TORCS as a comparative research environment}
+
+The Simulated Car Racing Championship showed that TORCS can provide a common interface through which controllers with different internal methods are evaluated \parencite{loiacono2010}. \textcite{cardamone2010} further demonstrated that learning-based controllers can operate in the environment. These studies establish TORCS as a useful setting for repeatable autonomous-racing experiments; they do not establish that a controller is easy to train, robust across tracks or suitable for real vehicles. Competition-style reporting can also overemphasise a best score when a research report needs to state trial conditions, failures and uncertainty.
+
+The present project adopts TORCS for controlled comparison rather than road-autonomy validation. Its vehicle dynamics make the task meaningfully sequential: a poor action can cause later instability, not merely a local prediction error. However, one simulator and one circuit cannot represent changing weather, traffic, sensor degradation or safety-critical consequences. This limitation motivates a deliberately narrow claim: the results concern implemented policies on \texttt{g-track-3}, not real-world driving capability.
+
+\subsection{Engineered control, planning and their assumptions}
+
+\textcite{onieva2009} describe a modular TORCS controller in which driving behaviour is divided into steering, speed and recovery components. This supports the rule-based anti-spin agent as a substantive baseline rather than a deliberately weak comparison. Explicit rules make the cause of an action inspectable and permit targeted recovery behaviour, but they depend on cases anticipated by the developer. Good performance therefore demonstrates effective engineering under known conditions, not automatic adaptation to unplanned circumstances.
+
+\textcite{quadflieg2010} show why learning the track and planning ahead can improve racing control. A driver that knows the route can prepare its position and speed before a corner instead of reacting only after heading error occurs. The limitation is equally important: the value of such planning depends on a reliable track representation and may not transfer to an unseen circuit without new mapping work. This trade-off directly motivates the Map-Aware Racing-Line Agent and Agent~7, which use racing-line geometry, and Agent~8, which intentionally receives no route information.
+
+\subsection{From Dyna-Q to continuous deep reinforcement learning}
+
+Q-learning estimates the value of taking an action in a state and provides a principled basis for learning through reward \parencite{watkinsdayan1992}. Dyna extends that idea by combining direct experience with planning updates from a learned model \parencite{sutton1990}. Dyna-Q was consequently appropriate as a bounded learning experiment: it tests whether planning can improve sample efficiency when live TORCS interaction is slow. Its likely weakness is structural rather than incidental. Continuous driving state must be discretised into bins, and a finite action set cannot express every small steering or throttle correction. The Dyna-Q agent therefore tests a useful research question without being expected to match a continuous high-performance policy.
+
+Continuous control provides the rationale for deep actor-critic methods. Deep Deterministic Policy Gradient (DDPG) demonstrated deterministic policy learning for continuous actions \parencite{lillicrap2016}, while TD3 addresses a known weakness of actor-critic value estimation through twin critics, delayed policy updates and target-policy smoothing \parencite{fujimoto2018}. These features justify N-step TD3 for steering and longitudinal control, but they do not guarantee reliable racing. The final outcome depends on the observation contract, reward, training distribution, checkpoint selection and evaluation procedure. A policy can exploit an incomplete reward or produce a rare fast lap that is unsuitable for deployment.
+
+This literature informed two design decisions. First, Agent~7 and Agent~8 share the TD3 foundation but retain distinct, documented observation and reward contracts. Agent~7 receives racing-line geometry as context; Agent~8 receives vehicle state, 19 track-edge sensors and short-term history, with geometry slots fixed to zero. Secondly, the final Agent~8 selection process prioritised completion rate before median completed-lap time. Its self-imitation stage used trajectories generated by Agent~8 itself, not teacher actions from an engineered driver. This is an evidence-led response to rare successful laps, but it also means that Agent~7 versus Agent~8 is not a pure one-variable ablation of racing-line information.
+
+\subsection{Reliable evidence for learned control}
+
+\textcite{henderson2018} show that deep-reinforcement-learning results are sensitive to implementation and evaluation choices, while \textcite{agarwal2021} argue against conclusions based only on unstable point estimates. For this project, the methodological consequence is that fastest lap is a capability measure, not a reliability measure. Completion rate must retain failed attempts in the denominator, and completed-lap pace must be reported with trial count and source.
+
+The application therefore distinguishes integrated GUI race records from fixed-policy repeated evaluations. Both use the same core \texttt{g-track-3}, car and one-lap scenario, but their sample sizes and provenance differ. Database records demonstrate the integrated system and its stored evidence; repeated evaluation batches are stronger support for claims about final learned-policy reliability. This distinction is not a weakness to conceal. It is the information required for a reader to decide how much weight each result deserves.
+
+\subsection{Explainability, novice access and the research gap}
+
+Post-hoc explanation research commonly examines how to make a model prediction understandable \parencite{ribeiro2016,guidotti2019}. In a sequential control task, users also need temporal evidence: what the car observed, which action it issued, what happened next and whether it completed the lap. Visual-analytics research supports the use of interactive views for interrogating learning systems, provided that the presentation does not conceal instability or uncertainty \parencite{hohman2019}.
+
+AI-literacy research adds a broader educational rationale. \textcite{long2020} identify competencies and design considerations that help non-specialists reason about what an AI system can do, how it operates and where its limits lie. The relevant aim here is not to teach a learner to derive TD3 or implement a neural network from first principles. It is to make the relationship between information, action, outcome and uncertainty available for inspection. Autonomous racing offers a useful setting because those relationships have immediate visible consequences: a poor steering action, an unsafe trajectory or a completed lap can be connected to recorded evidence.
+
+The GUI applies this principle through live telemetry, stored-run review, side-by-side comparison, sample counts, failure outcomes and plain-language agent descriptions. \textcite{nielsen1994}'s visibility-of-system-status principle and \textcite{amershi2019}'s human-AI interaction guidance support this approach, particularly the choice to separate a simple novice overview from a detailed research-evidence view. The packaged executable addresses a related but distinct barrier: a learner should not need to configure Python, TORCS and policy paths before seeing an agent drive.
+
+The resulting research gap is therefore precise. Prior work establishes that controllers can race in TORCS and that learning methods can produce continuous policies. It does not generally combine contrasting controller designs, transparent evidence provenance, a distributable novice workflow and explanation of reliability rather than only peak performance. Enhanced AI Racing addresses that gap through one artefact designed to support initial AI literacy. It does not claim to prove educational outcomes without participant testing, or to establish a universal ranking of racing algorithms.
+
+\subsection{Literature synthesis}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Literature synthesis and its design implications.}
+  \label{tab:literature-synthesis}
+  \small
+  \begin{tabularx}{\textwidth}{p{0.19\textwidth}YYY}
+    \toprule
+    Literature area & What it establishes & Important limitation & Design response in this project \\
+    \midrule
+    TORCS competition research & A common simulator can compare autonomous controllers & Strong lap results do not establish road validity or reliability & One-track claims are explicitly scoped; failures and trial counts are retained \\
+    Modular and map-aware control & Explicit rules and route information can improve control & Rules depend on anticipated cases; racing lines are track-specific & Rule-Based and Map-Aware agents provide interpretable baselines \\
+    Dyna-Q and TD3 & Learning can improve control; TD3 suits continuous actions & Representation, reward and evaluation can dominate the result & Dyna-Q is treated as a bounded experiment; TD3 contracts and checkpoints are preserved \\
+    Human-AI interaction and XAI & Users need visible state, capability and limitations & Explanations can hide uncertainty or overwhelm novices & Progressive disclosure, telemetry, provenance and packaged access \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+

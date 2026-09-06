@@ -1,0 +1,41 @@
+\section{Discussion}
+\label{ch:discussion}
+
+\subsection{Interpreting the result, rather than selecting a winner}
+
+The numerical results do not support a simple story in which increasingly sophisticated algorithms necessarily produce increasingly better drivers. The Rule-Based and Map-Aware agents completed their stored application runs reliably, while the Dyna-Q and scratch-TD3 stages did not. This progression is an important finding. It shows that autonomous racing success depends on the relationship between representation, control resolution, reward design and evaluation, rather than on attaching a reinforcement-learning label to a controller.
+
+The Map-Aware Racing-Line Agent is consequently a substantive result, not merely a preliminary baseline surpassed by a neural policy. It combined 15 completions from 15 stored attempts with a 92.056-second median completed lap and no recorded off-track events. Its design makes lateral error, target path and curvature interpretable. Where the circuit is known and explanation is valuable, that transparency is a practical advantage. The cost is that performance relies on track-specific route information, precisely the limitation anticipated by planning-ahead research \parencite{quadflieg2010}.
+
+Agent~8 achieved the strongest observed final learned result: 36 completions from 40 repeated attempts and an 83.038-second median completed lap. This evidence supports a carefully bounded claim: under the fixed \texttt{g-track-3} scenario and final deployment contract, a sensor-only N-step TD3 policy achieved the best observed balance of pace and repeated completion. It does not show that sensor-only learning is intrinsically superior to racing-line information, or that the policy would transfer to an unfamiliar circuit. Treating the result as conditional is not a weakness; it is the appropriate interpretation of one-track simulator evidence.
+
+\subsection{What the Agent 7 and Agent 8 comparison means}
+
+Agent~7 and Agent~8 were designed to make a meaningful question visible. Agent~7 receives racing-line geometry as context, whereas Agent~8 receives only vehicle and road-sensor observations plus short-term history. The success of Agent~8 shows that explicit route information was not necessary for a fast policy to emerge in this setting. It also makes the application more educational: users can compare a policy guided by an explicit target route with one that must infer a useful response from local sensor readings.
+
+However, this comparison is not a controlled ablation of one variable. Agent~8's final policy differs from Agent~7 not only in geometry inputs but also in its reward and stability-focused training history. The self-imitation stage was a reasoned response to the early rare-fast-lap problem, but it remains a change to the training contract. The correct conclusion is therefore that the final implemented Agent~8 was stronger on the observed metrics, not that removing a racing line caused the improvement. A follow-up experiment should freeze the network, reward, training budget and checkpoint-selection rule, then vary only the geometry features.
+
+This distinction is academically valuable. It identifies the next experiment that would convert an interesting applied comparison into a stronger causal claim. It also prevents the dissertation from overstating what its data show, a problem highlighted by deep-RL reproducibility research \parencite{henderson2018,agarwal2021}.
+
+\subsection{Pace, reliability and evidence strength}
+
+The results reinforce the decision to evaluate pace and reliability together. A 10/10 completion rate from Agent~7 v4 is encouraging, but it comes from a smaller batch than Agent~8's 36/40 result. Similarly, the Rule-Based agent's two completions demonstrate functional stability but are not a precise estimate of future reliability. The Map-Aware result has more evidential weight because it contains 15 attempts, while Agent~8's repeated 40-attempt evaluation provides the strongest final learned-policy evidence.
+
+Median completed-lap time has a specific interpretation. It describes typical performance among laps that finished; it does not capture the cost of failed attempts. This is why Agent~8's 83.038-second median must always be read beside its 90\% completion rate, and why the Dyna-Q result cannot be described as merely \enquote{slow}. It was both slow when successful and unreliable across attempts. The GUI's decision to display trial count, completion percentage and termination information is therefore part of the research contribution, not a secondary presentation feature.
+
+The use of two evidence streams is a further limitation and strength. Database records show that the deployed application can execute agents, store runs and make outcomes reviewable. Formal repeated evaluations more strongly support claims about fixed learned policies. These streams should not be collapsed into an unexplained aggregate, but neither should the database be dismissed: it verifies the end-to-end product behaviour required by the brief. Clear provenance allows the reader to assign appropriate weight to each result.
+
+\subsection{The novice-facing contribution}
+
+The application satisfies the core practical aim of the brief by reducing the work required before an AI newcomer can observe an agent. The complete release folder contains the executable, TORCS, policies and runtime data. The functional workflow is explicit: launch the package, select a named driver, observe its behaviour, review the stored outcome and compare its evidence with another agent. This removes cloning the repository, creating a virtual environment and locating a model checkpoint from the first encounter with the system. It is therefore a meaningful deployment and learning-design contribution, rather than a polished interface added after the experiment.
+
+The interface also supports a more responsible explanation of machine learning. It does not present Agent~8 as a magic high score. It can show a learner that an agent may be fast but fail, that explicit rules can be stable, and that a racing line is a form of additional information rather than a guaranteed solution. This supports the initial AI-literacy aim described by \textcite{long2020}: users can connect an AI system's inputs, actions, capability and limitation to evidence from a visible task. It also aligns with human-AI interaction guidance that systems should communicate capability and limitation together \parencite{amershi2019}.
+
+The limitation is equally clear. Functional accessibility is not the same as measured usability or learning. The project has shown that the workflow exists, that its acceptance conditions can be checked and that the packaged release can be smoke-tested, but it has not measured whether novice adults or students can correctly interpret a completion-rate comparison or explain the difference between the agents. A small task-based user study is therefore the most direct next step for validating the educational claim.
+
+\subsection{Overall contribution and limitations}
+
+The project contributes an integrated artefact rather than a single algorithmic score. It joins autonomous control, telemetry storage, evaluation provenance, visual explanation and novice deployment in one system. It also preserves unsuccessful learning stages, making the final Agent~8 result more credible because the path to it is visible rather than rewritten as a sequence of inevitable successes.
+
+The remaining limitations bound the contribution. All primary evidence comes from one simulated circuit and one car. The final agents have unequal sample sizes and differ in more than one training variable. No formal user study has evaluated the explanatory interface. These constraints prevent claims of road-vehicle performance, general algorithmic superiority or proven educational impact. They do not negate the work; they define the appropriate scope of a well-evidenced MSc software and machine-learning dissertation.
+

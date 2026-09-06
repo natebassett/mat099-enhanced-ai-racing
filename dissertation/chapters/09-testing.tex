@@ -1,0 +1,75 @@
+\section{Testing and Experimental Setup}
+\label{ch:testing}
+
+\subsection{Verification strategy}
+
+Verification was layered because a defect in one component can corrupt later experimental evidence. Unit tests cover behaviour that does not require a live simulator, including Dyna-Q state encoding and value updates, map-aware steering calculations, lap timing, telemetry conversion, repository persistence and GUI explanation models. Integration tests then exercise the full agent-environment loop: TORCS supplies observations, the selected driver returns actions, the runner maintains the race session and the storage layer records the resulting evidence. The GUI path is tested by starting a race, receiving live updates and confirming that a stored outcome can be reviewed afterwards.
+
+This division matters methodologically. A successful live lap is not proof that the result repository recorded the correct time, and a correct database record is not proof that the agent received valid observations. Lap timing, completion checks and repository retrieval were therefore verified separately from live TORCS integration. The result is a more credible chain from simulator state to the numbers reported in \cref{ch:results}.
+
+The Windows build adds a deployment-focused smoke test. It checks the packaged TORCS path, project discovery, racing-line assets and the final Agent~7 and Agent~8 policies before a release folder is produced. The release check then confirms that the dashboard opens without a development console, expected agents are visible, a selected policy loads, TORCS starts from the interface and a completed run appears in the results workspace. This verifies the novice-facing runtime rather than only the author's development configuration.
+
+\subsection{Functional evaluation of the novice workflow}
+
+The learning-platform claim was evaluated as a set of observable workflow conditions, rather than by assuming that the presence of a GUI proves usability. \Cref{tab:novice-acceptance} identifies the required tasks and their functional evidence. These conditions test whether the delivered application provides a coherent route from launching a selected agent to interpreting its recorded outcome. They do not test whether an intended user completes the route efficiently, enjoys it or learns a specified concept; those questions require participant-based methods.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Functional acceptance evidence for the novice-facing workflow.}
+  \label{tab:novice-acceptance}
+  \small
+  \begin{tabularx}{\textwidth}{p{0.11\textwidth}p{0.30\textwidth}YY}
+    \toprule
+    ID & Acceptance task & Expected outcome & Evidence in the delivered system \\
+    \midrule
+    NF1 & Open the packaged application. & Dashboard opens without a terminal or Python environment. & Release smoke test and the dashboard shown in \cref{fig:live-dashboard}. \\
+    NF2 & Select a named agent and start a race. & TORCS launches through the GUI with the selected controller. & Agent, track and car controls; runtime and runner integration checks. \\
+    NF3 & Review a saved outcome. & Summary, termination information and telemetry are retrievable after a run. & SQLite-backed run history and the Review workspace in \cref{fig:run-review}. \\
+    NF4 & Compare outcomes. & Pace, completion count, failure and provenance remain visible together. & Results and Compare workspaces; stored application and repeated-evaluation records. \\
+    NF5 & Read an agent explanation. & Plain-language guide identifies information source, decision approach and failure signals. & Agent Lab explanation models and automated content checks. \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\subsection{Controlled race scenario}
+
+The core evaluation scenario was fixed: the \texttt{g-track-3} circuit, the same car and one circuit per attempt. The same runner semantics were used across agents. A completed lap required the timing system to record a full circuit within the configured episode limit. The runner also recorded off-track behaviour, reverse driving, stalling, damage and termination reason. These events were retained as evidence of stability or failure; a terminated or timed-out attempt was not recoded as a completed lap.
+
+This common scenario makes agent outcomes comparable at the level intended by the project. It removes simple environmental explanations for a difference in lap time, such as changing vehicle or circuit. It does not remove every difference between agents: the agents use different information, control methods and, for learning agents, different training histories. That distinction is deliberate. The experiment compares implemented controllers, not an abstract algorithm with every other variable held constant.
+
+For a frozen-policy evaluation, the checkpoint was selected before the repeated batch began. Exploration and learning were disabled, and TORCS was restarted between attempts. This prevents evaluation from benefiting from online learning, persistent simulator state or an undisclosed later checkpoint. Stored GUI database runs followed the same track, car, one-lap and outcome semantics, but interactive application records and formal repeated batches remain separately labelled because their sample sizes and provenance differ.
+
+\subsection{Measures and interpretation rules}
+
+The principal reliability measure was completion rate:
+\begin{equation*}
+  CR = \frac{N_{\text{completed}}}{N_{\text{attempted}}}.
+\end{equation*}
+Failures remain in the denominator. This is important because a policy that records one fast successful lap but fails most attempts is not an effective racing controller. Completed-lap time was reported only for attempts that actually completed. The median completed-lap time describes typical pace conditional on success; it is not an all-run average and does not hide failure behind an arbitrarily large time. Best lap is retained as a capability indicator, while off-track, reverse, stall and termination data provide additional evidence about how a policy reached or failed to reach the finish.
+
+The evaluation follows the reporting concerns raised by \textcite{henderson2018} and \textcite{agarwal2021}. Every result table reports attempt count with the completion proportion, and the application distinguishes a visually demonstrated run from a repeated fixed-policy evaluation. Formal confidence intervals are not manufactured from small heterogeneous batches. Instead, the dissertation reports the raw denominator, completion count, median and provenance needed for a reader to judge the evidence.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Evaluation measures and their role in interpretation.}
+  \label{tab:evaluation-measures}
+  \small
+  \begin{tabularx}{\textwidth}{p{0.27\textwidth}YY}
+    \toprule
+    Measure & Interpretation & Reason for inclusion \\
+    \midrule
+    Completed laps / attempts & Reliability across the observed batch & Prevents failures being omitted \\
+    Median completed-lap time & Typical pace when the policy succeeds & Less sensitive than a mean to a slow recovery lap \\
+    Fastest completed lap & Demonstrated capability & Not used alone to claim reliability \\
+    Off-track, reverse, stall and termination events & Failure mechanism and stability context & Explains why a lap was not completed \\
+    Telemetry trace & Time-series evidence of state and action & Supports diagnosis and novice explanation \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\subsection{Validity and residual limits}
+
+The strongest remaining internal threat is training and selection sensitivity. Reward definitions, observation contracts, training distributions, candidate selection and tuning effort all influence a learned policy. The project reduces ambiguity by preserving policy paths and documenting Agent~7 and Agent~8 contracts, but this does not turn their comparison into a pure ablation of racing-line input. The next controlled study would hold reward, training budget and selection procedure fixed while changing only the geometry features.
+
+The principal external threat is track dependence. A map-aware controller may need a new racing line on a new circuit, while the sensor-only policy has not demonstrated transfer beyond \texttt{g-track-3}. The study also has unequal sample sizes: two application runs support a weaker reliability claim than forty repeated evaluations, even if both occur under the common scenario. These limits are disclosed rather than treated as reasons to discard the results. Finally, the interface is functionally tested but not assessed through a novice participant study. The project therefore demonstrates accessible deployment and inspectable evidence, not verified learning outcomes.
+

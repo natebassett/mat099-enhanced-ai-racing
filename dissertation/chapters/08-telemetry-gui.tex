@@ -1,0 +1,64 @@
+\section{Novice-Facing Learning Platform and Explainability}
+\label{ch:telemetry-gui}
+
+\subsection{Design objective and intended learner}
+
+The application is a second research contribution alongside the agent comparison. It is designed as a learning platform through which an adult or university-level newcomer can launch, observe and discuss autonomous driving without prior knowledge of TORCS, Python environments, reinforcement learning or model checkpoints. This is an intended user profile, not a claim that every non-specialist will find the software equally easy to use. The design addresses two barriers that commonly prevent a novice from engaging with an AI system: deployment friction before any behaviour can be observed, and opaque output once it is running.
+
+The aim is therefore not to replace a formal machine-learning course or to promise that a user will understand every neural-network parameter. It is to support initial AI-literacy questions in an observable setting: What information does an agent receive? What action did it take? What happened next? Why can a fast attempt still be a poor result? Long and Magerko's framework treats understanding AI capabilities, limitations and operation as core parts of AI literacy \parencite{long2020}. Enhanced AI Racing translates these questions into the concrete consequences of steering, throttle, braking, track position and lap completion.
+
+The design also follows human-AI interaction guidance that users should be able to understand system status, capability and limitation \parencite{amershi2019}. In this context, that means a learner should not see Agent~8 presented as an unexplained high score. The interface instead makes visible the distinction between an explicit rule, a route-informed controller and a learned policy; between a completed lap and a failure; and between an exceptional fastest lap and behaviour that repeats across attempts. These are pedagogical design choices, not claims of direct access to every internal neural-network decision.
+
+\subsection{Staged learner workflow}
+
+The platform uses a staged workflow so that a learner can begin with familiar actions before encountering specialist terminology. The first screen presents agent, track and car selection beside a Start control. The release package supplies TORCS, runtime files and fixed policies, so this first step does not require installation of Python packages, manual configuration of a simulator path or discovery of a checkpoint. Figure~\ref{fig:live-dashboard} shows the Live Telemetry dashboard before a race begins. The Dyna-Q selection is deliberate: the visible Observe, Act, Reward, Update and Replay stages provide an approachable bridge from what the car is doing to the idea of reinforcement learning.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{figure_8_1_live_dashboard.png}
+  \caption{Live Telemetry dashboard with agent, track and car selection, live controls, readable road-position indicators and the Dyna-Q learning-loop explanation. Source: Enhanced AI Racing application.}
+  \label{fig:live-dashboard}
+\end{figure}
+
+The intended learning sequence is summarised in \cref{tab:novice-workflow}. It is not a linear tutorial that forces a user through every screen. Rather, it gives a useful first route through the system and a structure for an instructor-led demonstration. The random, rule-based and map-aware agents are important at the start of this route: they make the observable relationship between information, control and outcome clearer before a learner encounters the more complex TD3 policies.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Research-informed workflow through the novice-facing learning platform.}
+  \label{tab:novice-workflow}
+  \small
+  \begin{tabularx}{\textwidth}{p{0.18\textwidth}p{0.25\textwidth}YY}
+    \toprule
+    Stage & Learner question & Interface evidence & Intended AI-literacy outcome \\
+    \midrule
+    Launch and select & Can I run an AI driver without development setup? & Packaged executable, agent selector and Start control & Distinguish running a fixed policy from writing or training one \\
+    Observe & What is the car sensing and doing now? & Live speed, controls, road position, road-ahead indicators and state labels & Relate observations to sequential driving actions \\
+    Review & Why did this individual run succeed or fail? & Saved-run summary, termination information, replay timeline and telemetry traces & Treat behaviour as evidence rather than as a single score \\
+    Compare & Is the fastest displayed lap also the most reliable result? & Trial count, completion rate, median completed-lap time and visible failures & Interpret capability, repeatability and uncertainty together \\
+    Explain & How do the agents differ? & Agent Lab descriptions of signals, decision process, strengths and failure signs & Compare rules, route information and learned policies without assuming equivalence \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+\subsection{Telemetry, progressive disclosure and evidence literacy}
+
+Telemetry is the bridge between technical evaluation and novice explanation. Each stored run preserves speed, position, heading, steering, throttle, braking, progress, lap timing and termination information. Those values answer different questions at different levels of detail. A learner can begin with an outcome label such as \enquote{completed} or \enquote{off track}, while a more advanced user can inspect the corresponding steering or throttle trace. This progressive disclosure reduces initial cognitive load without removing the evidence needed for technical audit.
+
+Figure~\ref{fig:run-review} illustrates this relationship in the Review workspace. A completed Agent~8 run is shown with a summary, a time-based replay, direct state values, road-position and road-ahead indicators, telemetry charts, and plain-language \enquote{What the Car Is Doing} and \enquote{Why} panels. The explanation does not assert a complete causal account of the neural policy. It connects observable state and action to the current driving situation, which is a more honest and useful form of explanation for a sequential deep-learning system.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\textwidth]{figure_8_2_run_review.png}
+  \caption{Review workspace for a saved Agent~8 run. Summary, replay controls, current telemetry and plain-language state explanations allow a learner to connect an outcome to the underlying trace. Source: Enhanced AI Racing application.}
+  \label{fig:run-review}
+\end{figure}
+
+The Results and Compare workspaces apply the same principle to aggregate evidence. Completion is shown with its denominator; median completed-lap time describes typical pace only among finished attempts; fastest time is presented as capability, not reliability; and failures remain visible. These reporting choices implement the reliability concerns discussed by \textcite{henderson2018} and \textcite{agarwal2021} in a form that a novice can inspect. The detailed research view retains policy and evaluation provenance, so simplified presentation does not collapse different batches into a misleading single ranking.
+
+Agent Lab provides the conceptual bridge between these screens. It explains what each agent observes, how it selects actions, its strengths and common failure signals. The presentation order is intentional: a user can observe random behaviour, then explicit rules, then route-aware control, before considering policies that learn from reward. This grounds abstract terms such as exploration, reward and policy in visible differences in driving behaviour. Language support, readable labels and visual signals that do not rely on colour alone further support access, in line with the accessibility considerations of \textcite{wcag22}.
+
+\subsection{Functional evidence and boundary of the claim}
+
+The novice-facing claim is evaluated through functional evidence rather than a participant study. The release smoke test checks the concrete workflow represented in \cref{tab:novice-workflow}: the dashboard opens from the packaged folder; expected agents and policies are available; TORCS starts from the interface; a user can initiate a run; and a completed outcome is retained for later review. Together with automated checks of the GUI models, results storage and explanation content, this demonstrates that the designed learning route exists in the delivered software rather than only in a prototype mock-up.
+
+This is meaningful but bounded evidence. It supports the claim that the platform reduces setup barriers and is designed to help a novice inspect how agents drive, fail and differ. It does not establish effectiveness, efficiency or satisfaction for a defined population of adults or students, nor does it measure whether a learner can accurately explain reinforcement learning after use. Those stronger claims require a small task-based study with intended users, for example asking participants to launch an agent, identify why a run failed and interpret a completion-rate comparison. The current contribution is consequently a research-informed, evidence-aware learning platform with functional accessibility, not a validated educational intervention.

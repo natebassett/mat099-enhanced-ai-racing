@@ -1,0 +1,101 @@
+\section{Agent Design and Implementation}
+\label{ch:agent-design}
+
+\subsection{Shared action interface and control formulation}
+
+All drivers are evaluated through the same closed-loop TORCS interface. At interaction $t$, a controller maps an observation $s_t$ to
+\begin{equation*}
+  a_t=(\delta_t,u_t,b_t,g_t),
+\end{equation*}
+where $\delta_t\in[-1,1]$ is steering, $u_t,b_t\in[0,1]$ are throttle and brake, and $g_t\in\{1,\ldots,6\}$ is gear. The runner applies the action, observes the next state, and records the transition $(s_t,a_t,r_t,s_{t+1})$. This common action contract prevents apparent performance differences from being caused by incompatible simulator adapters or outcome semantics.
+
+For the learned drivers, the network action is a two-dimensional bounded vector, $z_t\in[-1,1]^2$, decoded into steering and signed longitudinal intent before throttle, brake and automatic gear selection. This retains a continuous learning action space while every agent produces lap outcomes through the same runner, database and GUI pathway.
+
+\subsection{Baselines and engineered control}
+
+The random agent samples bounded steering and longitudinal commands and is not expected to finish reliably. Its purpose is diagnostic: it verifies the full control path and establishes that a completed lap is not a consequence of permissive runner logic.
+
+The rule-based anti-spin driver applies an explicit feedback law to heading $\theta_t$, normalised lateral position $p_t$, lateral speed $v_{y,t}$ and the direction $\varphi_t$ of the most open forward sensor. In its nominal mode, the implemented steering logic can be expressed as
+\begin{equation*}
+  \hat{\delta}_t = \frac{k_\theta\theta_t}{\pi}
+  - k_p p_t + k_s\varphi_t - k_yv_{y,t},
+\end{equation*}
+followed by saturation, exponential smoothing and a rate limit:
+\begin{equation*}
+  \delta_t=\operatorname{clip}\!\left(\delta_{t-1}+
+  \operatorname{clip}\!\left(\rho\delta_{t-1}+(1-\rho)\hat{\delta}_t-\delta_{t-1},
+  -\Delta_t,\Delta_t\right),-\delta_{\max},\delta_{\max}\right).
+\end{equation*}
+The engineering problem was not merely centring the car. At speed, a reactive correction can become too large after lateral motion has accumulated, producing alternating steering, lost traction or an edge excursion. Gains and limits therefore vary with speed, edge proximity and stability state; target-speed control similarly suppresses throttle during braking or recovery. The deliberate trade-off is pace for a recoverable vehicle state.
+
+Without the rate limit, small changes in sensor evidence can reverse a large steering command between simulator steps. Thus $\Delta_t$ imposes a discrete-time smoothness constraint: correct cross-track and heading error quickly enough to recover, but not so abruptly that the correction causes instability.
+
+The Map-Aware Racing-Line Agent adds target track position $p_t^*$, heading offset $\theta_t^*$ and local curvature $\kappa_t$ from the stored route. Its cross-track error is
+\begin{equation*}
+  e_t=p_t-p_t^*, \qquad
+  c_t=-\arctan\!\left(\frac{k_e e_t}{\max(v_t/3.6,4)+6}\right).
+\end{equation*}
+The steering command combines heading, cross-track, curvature and lateral-motion terms:
+\begin{equation*}
+  \hat{\delta}_t=k_\psi(\theta_t+\theta_t^*)+k_cc_t+k_\kappa\kappa_t-k_vv_{y,t}.
+\end{equation*}
+It is then smoothed and rate-limited using the same control constraints as the rule-based agent. The racing line addresses the reactive baseline's lack of an explicit target position through a bend. Its cost is track dependence: it is interpretable on \texttt{g-track-3}, but needs a new route representation on an unseen circuit. This implements the anticipatory planning principle noted by \textcite{quadflieg2010}.
+
+\subsection{Dyna-Q learning agent}
+
+Dyna-Q converts the continuous simulator state into a discrete tuple
+\begin{equation*}
+  \bar{s}_t=(q_t,b_v,b_p,b_\theta,b_{v_y},b_f,b_d,b_o,b_b),
+\end{equation*}
+where $q_t$ is lap section and the remaining bins encode vehicle and sensor conditions. The policy chooses from 26 fixed steering, throttle, brake and recovery actions. This was a pragmatic response to expensive live simulation: the tabular learner was inexpensive to inspect, save and replay. Its limitation was structural: states needing different small continuous corrections can share a bin, while a finite action table cannot express every cornering adjustment.
+
+Action selection is $\epsilon$-greedy, with the implemented linear schedule
+\begin{equation*}
+  \epsilon_t=\epsilon_{\min}+(\epsilon_0-\epsilon_{\min})
+  \left(1-\min\!\left(\frac{t}{T},1\right)\right),
+  \quad (\epsilon_0,\epsilon_{\min},T)=(0.24,0.035,80000).
+\end{equation*}
+For each real transition, the temporal-difference error and update are
+\begin{equation*}
+  \Delta_t=r_t+\gamma(1-d_t)\max_a Q(\bar{s}_{t+1},a)-Q(\bar{s}_t,a_t),
+  \qquad Q\leftarrow Q+\alpha\Delta_t.
+\end{equation*}
+with $\alpha=0.18$ and $\gamma=0.96$. The learned transition model additionally supplies 16 sampled planning updates per real step. The shaped reward favours progress and aligned speed while penalising unsafe states, making completion preferable to locally fast instability. Planning can reuse remembered transitions but cannot recover detail discarded by binning or create an absent action. The finalised driver sets $\epsilon=0$ and disables planning, so evaluation cannot change the table measured.
+
+\subsection{N-step TD3: Agent 7 and Agent 8}
+
+The TD3 observation begins with 45 normalised features: three velocities, three derived accelerations, RPM, heading, track position, 19 track-edge sensors, four wheel speeds, and racing-line difference plus look-ahead curvature slots. Three observation frames and three preceding two-dimensional actions are stacked, giving
+\begin{equation*}
+  \dim(s_t)=3(45)+3(2)=141.
+\end{equation*}
+Agent~7 populates the five route-geometry slots from the racing line. Agent~8 receives the same vehicle and sensor information but fixes those slots to zero and never loads a route file. This tests whether strong racing can be learned from local observations, although it is not a pure ablation because Agent~8 also changed reward and stability strategy.
+
+The actor $\pi_\theta(s)$ and twin critics $Q_{\phi_1},Q_{\phi_2}$ use an N-step return. With clipped target-policy noise $\varepsilon_t$, the target is
+\begin{equation*}
+  \tilde{a}_{t+n}=\operatorname{clip}\!\left(\pi_{\theta^-}(s_{t+n})+\varepsilon_t,-1,1\right),
+  \qquad
+  y_t=\sum_{i=0}^{n-1}\gamma^ir_{t+i}+\gamma^n(1-d_{t+n})
+  \min_{j\in\{1,2\}}Q_{\phi_j^-}(s_{t+n},\tilde{a}_{t+n}).
+\end{equation*}
+where $n=3$, $\gamma=0.992$ and $\varepsilon_t\sim\operatorname{clip}(\mathcal{N}(0,\sigma^2),-c,c)$. The critic and delayed actor objectives are
+\begin{equation*}
+  \mathcal{L}_Q=\mathbb{E}\!\left[(Q_{\phi_1}-y_t)^2+(Q_{\phi_2}-y_t)^2\right],
+  \qquad
+  \mathcal{L}_{\pi}^{\mathrm{RL}}=-\mathbb{E}\!\left[Q_{\phi_1}(s,\pi_\theta(s))\right].
+\end{equation*}
+Twin critics, target smoothing and policy delay reduce overestimation pressure \parencite{fujimoto2018}, but do not replace a defensible reward and evaluation protocol. Early TD3 work found locally fast behaviour without repeated completion, so selection shifted towards clean repeated laps.
+
+N-step return is useful because corner-entry actions may have consequences several interactions later. The terminal indicator prevents value beyond failure, while the critic minimum guards against promoting actions due to one optimistic estimator.
+
+Agent~8's stability profile adds self-imitation only from its own successful trajectories. For elite transitions $\mathcal{B}_E$, the delayed actor loss becomes
+\begin{equation*}
+  \mathcal{L}_{\pi}=\mathcal{L}_{\pi}^{\mathrm{RL}}+
+  \lambda_k\,\mathbb{E}_{(s,a)\sim\mathcal{B}_E}\!\left[\lVert\pi_\theta(s)-a\rVert_2^2\right].
+\end{equation*}
+where $\lambda_k$ decays across actor updates. This is neither external demonstration nor racing-line cloning: it regularises towards rare successful actions generated by the policy itself. It addressed the failure pattern where a fast lap was surrounded by terminated trajectories, retaining clean experience while the reinforcement objective stayed active. Candidate selection prioritised completion rate, then median completed-lap time and distance. Deployment filters only steering with a reset exponential moving average, a documented runtime contract rather than hidden assistance.
+
+Reward assigns immediate value to forward, centred and physically safe behaviour; self-imitation changes the actor only when successful actions are retained. Their separation makes the training history auditable and prevents Agent~8 being reduced to an algorithm label.
+
+\subsection{Design comparison}
+
+The agents encode distinct assumptions and risks. Rules trade adaptation for inspectability; racing-line control trades transfer for anticipatory reference information; Dyna-Q trades resolution for inexpensive planning; and TD3 trades training simplicity for continuous, high-dimensional capacity. These differences make the comparison explanatory rather than a list of interchangeable labels.

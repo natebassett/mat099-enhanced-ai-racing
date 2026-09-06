@@ -1,0 +1,35 @@
+\section{Introduction}
+\label{ch:introduction}
+
+\subsection{Context and problem}
+
+Autonomous racing is a compact but demanding control problem. A driver must translate changing observations into continuous steering, throttle and braking actions while balancing speed against the risk of leaving the circuit. The decision is sequential: an action that appears beneficial at one instant can create an unrecoverable position or heading several seconds later. Simulation makes this problem practical for a dissertation because repeated trials can be performed without the safety, cost and reproducibility constraints of real vehicles.
+
+TORCS provides a suitable environment because it exposes a driving task with vehicle dynamics, track geometry and sensor observations, while allowing controllers to be connected programmatically \parencite{torcs2026}. It has been used in autonomous-racing competitions and research as a repeatable testbed for computational-intelligence controllers \parencite{loiacono2010}. However, a simulator alone does not produce useful research. A project must make the chosen agents comparable, preserve the evidence from their runs and distinguish a genuinely reliable policy from an isolated successful lap.
+
+There is a second, practical problem. AI racing projects often require users to install a simulator, configure a Python environment, locate model files and interpret raw logs before they can observe any behaviour. That route is reasonable for developers but unsuitable for a novice learner. The MAT099 brief therefore requires not only a functioning AI driver, but a user-friendly launcher and beginner-facing wrapper that makes the system engaging and consumable. This dissertation treats that requirement as an engineering and research concern, rather than as a cosmetic interface layer.
+
+Enhanced AI Racing addresses both problems. It provides several controller families in one application, records their telemetry and outcomes, and presents the information through an interface designed for running, reviewing and comparing races. The work does not claim to solve real-world autonomous driving. Its scope is simulated autonomous racing in TORCS and the communication of that behaviour to users who do not need to read the implementation to begin learning from it.
+
+\subsection{Aim, questions and objectives}
+
+The aim was to design, implement and evaluate a TORCS-based AI racing platform that compares autonomous driving approaches and presents their behaviour through a research-informed desktop learning platform for adult and university-level newcomers to artificial intelligence.
+
+The dissertation answers four questions:
+\begin{enumerate}[label=\arabic*.]
+  \item How can rule-based, map-aware and reinforcement-learning agents be implemented within one shared TORCS application?
+  \item Under a common racing scenario, how do the agents differ in completion, pace and failure behaviour?
+  \item How can a packaged interface use telemetry, results provenance and explanation design to help an AI newcomer launch, observe and critically compare those differences without source-level setup?
+  \item What limitations arise from using one simulator, one principal circuit and a resource-constrained development process?
+\end{enumerate}
+
+The objectives were to build a reliable runner between Python and TORCS; implement a ladder of increasingly capable agents; store telemetry and race outcomes; create a graphical interface and distributable Windows package; and evaluate the agents with a protocol that reports failures as well as successful laps. The project is an individual dissertation. All implementation, agent design, experiments and application integration reported here were undertaken by the author.
+
+\subsection{Contributions and dissertation structure}
+
+The principal contribution is not a claim that one policy is a universal racing solution. It is a coherent research and learning artefact. Technically, it supplies multiple control paradigms behind a common action contract, including a final comparison between racing-line-informed and sensor-only N-step Twin Delayed Deep Deterministic Policy Gradient (TD3). As software, it couples simulation control to SQLite-backed telemetry, results review and a packaged executable. As a research-informed learning platform, it is designed to expose the distinction between a rule, a policy, a reward and an evaluation outcome through visible racing consequences; it does not claim validated learning outcomes without a participant study.
+
+The contribution also lies in the relationship between these parts. The graphical wrapper is not described as a separate demonstration added after the technical work. It consumes the same run records and evaluation summaries used in the analysis, so a chart seen by a novice and a claim made in the results chapter can be traced to the same underlying evidence. Likewise, the packaged executable is not merely a convenience for a marker; it is the route by which the project becomes usable outside the author's development environment. This integration is central to the brief's enterprise-AI and school-facing motivation.
+
+\Cref{ch:research-context} establishes the relevant technical background. \Cref{ch:literature-review} critically relates the design to prior racing, reinforcement-learning and human-AI interaction research. Sections~4 to~6 explain the research method, requirements and architecture. Sections~7 and~8 describe the agents and the novice-facing interface. Sections~9 and~10 present the evaluation protocol and results. Sections~11 and~12 interpret the evidence, identify limitations and conclude the work.
+

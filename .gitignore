@@ -13,6 +13,9 @@ __pycache__/
 build/
 dist/
 
+# Local temporary review files
+tmp/
+
 # Logs / models
 ppo_driver/logs/
 ppo_driver/models/

@@ -1,0 +1,140 @@
+% MAT099 dissertation manuscript
+% Compile with: pdflatex main && biber main && pdflatex main && pdflatex main
+\documentclass[12pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[a4paper,margin=25mm]{geometry}
+\usepackage{setspace}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{amsmath}
+\usepackage{enumitem}
+\usepackage{csquotes}
+\usepackage{titlesec}
+\usepackage{hyperref}
+\usepackage[nameinlink,noabbrev]{cleveref}
+\usepackage[backend=biber,style=authoryear,sorting=nyt,maxcitenames=3,mincitenames=1,giveninits=true]{biblatex}
+
+\addbibresource{references.bib}
+\graphicspath{{figures/}}
+\onehalfspacing
+\setlength{\emergencystretch}{3em}
+\setlist{nosep}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\setcounter{secnumdepth}{2}
+\setcounter{tocdepth}{2}
+\numberwithin{figure}{section}
+\numberwithin{table}{section}
+\titleformat{\section}
+  {\normalfont\Large\bfseries}
+  {\thesection}
+  {0.75em}
+  {}
+\titlespacing*{\section}{0pt}{3.25ex plus 1ex minus .2ex}{1.25ex plus .2ex}
+\titleformat{\subsection}
+  {\normalfont\large\bfseries}
+  {\thesubsection}
+  {0.75em}
+  {}
+\titlespacing*{\subsection}{0pt}{2.5ex plus .8ex minus .2ex}{0.9ex plus .2ex}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=black,
+  urlcolor=blue,
+  pdftitle={Enhanced AI Racing},
+  pdfauthor={[Your full name]}
+}
+
+\newcommand{\dissertationtitle}{Enhanced AI Racing: A Novice-Friendly Platform for Evaluating Autonomous Driving Agents in TORCS}
+\newcommand{\authorname}{[Your full name]}
+\newcommand{\studentnumber}{[Your student number]}
+\newcommand{\degreeprogramme}{[Your degree programme]}
+\newcommand{\supervisorname}{[Supervisor name]}
+
+\begin{document}
+
+\begin{titlepage}
+  \centering
+  {\Large Cardiff University\par}
+  \vspace{0.5cm}
+  {\large School of Mathematics\par}
+  \vfill
+  {\Huge\bfseries \dissertationtitle\par}
+  \vspace{1.5cm}
+  {\Large \authorname\par}
+  \vspace{0.4cm}
+  {\large \studentnumber\par}
+  \vfill
+  {\large A dissertation submitted in partial fulfilment of the requirements for the degree of \degreeprogramme\par}
+  \vspace{0.5cm}
+  {\large Supervisor: \supervisorname\par}
+  \vspace{0.5cm}
+  {\large September 2026\par}
+\end{titlepage}
+
+\pagenumbering{roman}
+
+\section*{Declaration}
+\addcontentsline{toc}{section}{Declaration}
+% Replace this text with the University-approved declaration from the MAT099 template.
+\noindent [Insert the University-approved declaration here.]
+
+\section*{Acknowledgements}
+\addcontentsline{toc}{section}{Acknowledgements}
+% Intentionally left for the author.
+\noindent [Acknowledgements to be completed by the author.]
+
+\section*{Executive Summary}
+\addcontentsline{toc}{section}{Executive Summary}
+
+Enhanced AI Racing is an individual MSc dissertation project that develops and evaluates autonomous racing agents in the TORCS simulator. Its purpose is not only to make an artificial intelligence driver complete a circuit. It is also to make the behaviour of different AI approaches understandable to people who are new to artificial intelligence, reinforcement learning and software development. The project responds directly to the brief's requirement for a novice-friendly launcher and wrapper around the TORCS racing environment.
+
+The problem has two sides. Autonomous racing is technically difficult because a driver must repeatedly decide how to steer, accelerate and brake while remaining on the track. A very fast action can cause the car to spin, leave the circuit or fail to complete a lap. A useful evaluation must therefore consider both pace and reliability. At the same time, many AI projects are difficult for beginners to access: they require installation of software packages, command-line setup and interpretation of technical logs before any behaviour can be observed. Enhanced AI Racing addresses these issues in one application by combining driving agents, telemetry capture, persistent results, visual comparison and a packaged Windows release.
+
+The project implements a progression of autonomous-control approaches: a random baseline, a rule-based anti-spin driver, a map-aware racing-line driver, a Dyna-Q learner and two deep reinforcement-learning agents based on N-step Twin Delayed Deep Deterministic Policy Gradients (TD3). The sequence makes it possible to compare explicit control logic, track knowledge and learned continuous control rather than treating one final neural policy as the only meaningful outcome.
+
+The TD3 agents provide the most informative learned comparison. Agent~7 uses racing-line geometry as context, while Agent~8 uses vehicle telemetry, track-edge sensors and short-term driving history without reading a racing-line file or receiving external teacher actions. Agent~8's final stability profile uses self-imitation from its own successful trajectories. This tests whether a sensor-only policy can learn competitive behaviour while retaining a transparent distinction between the agents' information sources and training histories.
+
+All reported races use the \texttt{g-track-3} circuit, the same car and a one-lap task. The system records completion, completed-lap time, off-track behaviour, stalling, reverse driving and timeouts as telemetry and persistent run data. Completion rate is always reported with its number of attempts; median completed-lap time represents typical successful pace; and failures remain visible.
+
+The hand-engineered map-aware controller is a strong benchmark: it completed all 15 stored application runs and achieved a 92.056-second median completed lap. The rule-based agent was slower but stable. Dyna-Q completed only one of three stored runs, and early scratch TD3 produced no completed stored lap. These outcomes show that reinforcement learning was not assumed to be successful simply because it was more technically advanced.
+
+The strongest final learned result came from Agent~8. Across two repeated 20-run evaluation batches, Agent~8 completed 36 of 40 attempts, a 90\% completion rate, with a median completed-lap time of 83.038 seconds. Agent~7 also achieved reliable learned behaviour: one final policy completed 18 of 20 attempts, while a later policy completed 10 of 10 in a smaller batch, but its completed laps were slower. The results therefore suggest that, for the implemented policies and the selected circuit, Agent~8 achieved the strongest observed combination of pace and repeated completion. They do not prove that sensor-only learning is always better than racing-line information, nor that the policy would transfer unchanged to other tracks or real vehicles.
+
+The application is a second major result. Users can extract the release folder and start \texttt{EnhancedAIRacing.exe} without creating a Python environment or configuring TORCS manually. The interface supports agent selection, live telemetry, saved-run review, comparison and plain-language agent explanations. A packaged-release smoke test verifies that the dashboard opens, policies load, TORCS starts from the application and completed runs are stored. This provides functional evidence that the project is easier to run and inspect than a source-only research prototype.
+
+The project is limited to simulated racing, one principal track and functional evaluation of the novice-facing interface. It does not claim road-safety performance or proven educational improvement without participant testing. Future work should evaluate final agents in equal-sized frozen-policy batches, test unseen tracks, isolate racing-line input in a controlled ablation and conduct a small novice-user study. Within scope, Enhanced AI Racing delivers a working, distributable and evidence-aware platform for studying how autonomous agents drive, fail, improve and can be explained.
+
+\section*{Software and Artefact Availability}
+\addcontentsline{toc}{section}{Software and Artefact Availability}
+
+The source code and implementation documentation for Enhanced AI Racing are available at \url{https://github.com/natebassett/mat099-enhanced-ai-racing} (Accessed: 6 September 2026). The repository supports reproducibility and technical audit; the packaged Windows release remains the intended route for novice users.
+
+\tableofcontents
+\listoffigures
+\listoftables
+
+\clearpage
+\pagenumbering{arabic}
+
+\input{chapters/01-introduction}
+\input{chapters/02-research-context}
+\input{chapters/03-literature-review}
+\input{chapters/04-methodology}
+\input{chapters/05-requirements}
+\input{chapters/06-architecture}
+\input{chapters/07-agent-design}
+\input{chapters/08-telemetry-gui}
+\input{chapters/09-testing}
+\input{chapters/10-results}
+\input{chapters/11-discussion}
+\input{chapters/12-conclusion}
+\printbibliography[heading=bibintoc,title={References}]
+
+\end{document}
