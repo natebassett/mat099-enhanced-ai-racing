@@ -84,6 +84,23 @@ class ProjectDiscoveryTests(unittest.TestCase):
             {"corkscrew", "g-track-3"},
         )
 
+    def test_td3_agents_only_offer_the_validated_track(self):
+        agents = discover_agents()
+        tracks = discover_tracks(PROJECT_ROOT)
+
+        for agent_type in ("n_step_td3", "sensor_n_step_td3"):
+            with self.subTest(agent_type=agent_type):
+                agent = next(
+                    item for item in agents if item.agent_type == agent_type
+                )
+                compatible = compatible_tracks_for_agent(agent, tracks)
+
+                self.assertEqual(agent.supported_track_ids, ("g-track-3",))
+                self.assertEqual(
+                    [track.track_id for track in compatible],
+                    ["g-track-3"],
+                )
+
     def test_discovers_torcs_cars_from_xml(self):
         cars = discover_cars(PROJECT_ROOT)
         alfa = next(car for car in cars if car.car_id == "155-DTM")

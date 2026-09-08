@@ -34,4 +34,5 @@ class SensorNstepTd3Agent(NstepTd3Agent):
     agent_type = "sensor_n_step_td3"
     version = "0.1"
     requires_racing_line = False
+    supported_track_ids = ("g-track-3",)
     default_model_candidates = DEFAULT_MODEL_CANDIDATES

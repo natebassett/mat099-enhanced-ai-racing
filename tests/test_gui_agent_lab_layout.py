@@ -88,6 +88,22 @@ class AgentLabLayoutTests(unittest.TestCase):
         self.assertIn("sensor_n_step_td3", agent_types)
         self.assertNotIn("agent8_recorded_elite_lap", agent_types)
 
+    def test_agent_lab_status_and_track_context_follow_its_driver(self) -> None:
+        for index in range(self.window.agent_education_combo.count()):
+            agent = self.window.agent_education_combo.itemData(index, Qt.UserRole)
+            if agent.agent_type == "sensor_n_step_td3":
+                self.window.agent_education_combo.setCurrentIndex(index)
+                break
+
+        status = self.window.statusBar().currentMessage()
+        self.assertIn("Agent Lab: sensor_n_step_td3", status)
+        self.assertIn("Compatible track: g-track-3", status)
+        self.assertNotIn("dyna_q_learning /", status)
+        self.assertIn(
+            "Supported track: CG track 3 (g-track-3)",
+            self.window.agent_education_tracks_box.toPlainText(),
+        )
+
     def test_algorithm_guide_tabs_use_the_themed_subwindow_navigation(self) -> None:
         dialog = AgentAlgorithmDialog(self.window.agent_education_profile, self.window)
         tabs = dialog.findChild(QTabWidget, "algorithmGuideTabs")

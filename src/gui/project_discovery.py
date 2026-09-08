@@ -27,6 +27,7 @@ class AgentOption:
     requires_racing_line: bool
     max_steps: int | None
     target_laps: int | None
+    supported_track_ids: tuple[str, ...] | None = None
 
     @property
     def label(self) -> str:
@@ -136,6 +137,7 @@ def discover_agents() -> list[AgentOption]:
             True,
             15000,
             1,
+            ("g-track-3",),
         ),
         AgentOption(
             "Sensor-Only N-Step TD3 Racer",
@@ -146,6 +148,7 @@ def discover_agents() -> list[AgentOption]:
             False,
             15000,
             1,
+            ("g-track-3",),
         ),
         AgentOption(
             "Map-Aware Racing-Line Agent",
@@ -251,6 +254,9 @@ def compatible_tracks_for_agent(
     agent: AgentOption,
     tracks: list[TrackOption],
 ) -> list[TrackOption]:
+    if agent.supported_track_ids is not None:
+        supported = set(agent.supported_track_ids)
+        tracks = [track for track in tracks if track.track_id in supported]
     if agent.requires_racing_line:
         return [track for track in tracks if track.has_racing_line]
     return tracks

@@ -1491,6 +1491,7 @@ class MainWindow(QMainWindow):
     def _handle_primary_page_changed(self, index: int) -> None:
         if index == self.agents_tab_index:
             self._ensure_agent_lab_loaded()
+            self._update_agent_lab_status()
         elif index == self.results_tab_index:
             self._schedule_results_load()
         elif (
@@ -1969,6 +1970,7 @@ class MainWindow(QMainWindow):
                 label.setText("--")
             self.learning_visualizer.set_agent(None)
             self._sync_racing_line_visualizer(None)
+            self._update_agent_lab_status()
             return
 
         profile = build_agent_education_profile(
@@ -2032,6 +2034,31 @@ class MainWindow(QMainWindow):
         if self.agent_lab_tabs is not None and self.agent_lab_tabs.currentIndex() == 2:
             self.learning_visualizer.load_checkpoint_statistics()
         self._sync_racing_line_visualizer(agent)
+        self._update_agent_lab_status(agent)
+
+    def _update_agent_lab_status(self, agent: AgentOption | None = None) -> None:
+        if self.tabs is None or self.tabs.currentIndex() != self.agents_tab_index:
+            return
+
+        agent = agent or self.selected_education_agent()
+        if agent is None:
+            self.statusBar().showMessage(
+                f"{self._discovery_summary()} Agent Lab: no driver selected."
+            )
+            return
+
+        compatible_tracks = compatible_tracks_for_agent(
+            agent,
+            self.project_options.tracks,
+        )
+        if len(compatible_tracks) == 1:
+            track_summary = f"Compatible track: {compatible_tracks[0].track_id}."
+        else:
+            track_summary = f"{len(compatible_tracks)} compatible tracks."
+        self.statusBar().showMessage(
+            f"{self._discovery_summary()} Agent Lab: {agent.agent_type}. "
+            f"{track_summary}"
+        )
 
     def _set_text_box(self, box: QTextEdit, lines: tuple[str, ...]) -> None:
         box.setPlainText(_format_bullet_lines(lines))

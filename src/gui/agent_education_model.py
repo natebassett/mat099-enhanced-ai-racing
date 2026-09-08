@@ -1692,14 +1692,7 @@ def _metadata(
                     else "Allbwn gweithred Gym"
                 ),
             ),
-            (
-                "Dibyniaeth ar drac",
-                (
-                    "Mae angen ffeil llinell rasio"
-                    if agent.requires_racing_line
-                    else "Nid oes angen ffeil llinell rasio"
-                ),
-            ),
+            ("Dibyniaeth ar drac", _track_dependency_text(agent, language)),
             ("Lapiau targed", _format_optional_int(agent.target_laps)),
             ("Uchafswm camau", _format_optional_int(agent.max_steps)),
         )
@@ -1715,14 +1708,7 @@ def _metadata(
                 else "Gym action output"
             ),
         ),
-        (
-            "Track dependency",
-            (
-                "Needs a racing-line file"
-                if agent.requires_racing_line
-                else "No racing-line file required"
-            ),
-        ),
+        ("Track dependency", _track_dependency_text(agent, language)),
         ("Target laps", _format_optional_int(agent.target_laps)),
         ("Maximum steps", _format_optional_int(agent.max_steps)),
     )
@@ -1739,6 +1725,31 @@ def _track_context(
             "Ni ddarganfuwyd unrhyw draciau TORCS."
             if language == "cy"
             else "No TORCS tracks were discovered.",
+        )
+
+    if agent.supported_track_ids is not None:
+        if not compatible_tracks:
+            supported_ids = ", ".join(agent.supported_track_ids)
+            if language == "cy":
+                return (
+                    f"Ni ddarganfuwyd y trac a gefnogir ({supported_ids}).",
+                    "Ni ellir rhedeg y polisi wedi'i becynnu nes bod y trac hwn ar gael.",
+                )
+            return (
+                f"The supported track was not discovered ({supported_ids}).",
+                "The packaged policy cannot be run until that track is available.",
+            )
+
+        if language == "cy":
+            return (
+                f"Trac a gefnogir: {_format_track_list(compatible_tracks, language)}.",
+                "Mae'r polisi wedi'i becynnu hwn wedi'i gyfyngu i'r trac y cafodd ei ddilysu arno.",
+                "Mae traciau eraill yn cael eu cuddio i atal rhediadau polisi heb eu cefnogi.",
+            )
+        return (
+            f"Supported track: {_format_track_list(compatible_tracks, language)}.",
+            "This packaged policy is restricted to the track on which it was validated.",
+            "Other discovered tracks are hidden to prevent unsupported policy runs.",
         )
 
     if agent.requires_racing_line:
@@ -1791,6 +1802,27 @@ def _track_context(
         ),
         "Performance can still vary by track shape, even without a map dependency.",
     )
+
+
+def _track_dependency_text(agent: AgentOption, language: str) -> str:
+    if language == "cy":
+        base = (
+            "Mae angen ffeil llinell rasio"
+            if agent.requires_racing_line
+            else "Nid oes angen ffeil llinell rasio"
+        )
+        if agent.supported_track_ids is not None:
+            return f"{base}; wedi'i gyfyngu i {', '.join(agent.supported_track_ids)}"
+        return base
+
+    base = (
+        "Needs a racing-line file"
+        if agent.requires_racing_line
+        else "No racing-line file required"
+    )
+    if agent.supported_track_ids is not None:
+        return f"{base}; restricted to {', '.join(agent.supported_track_ids)}"
+    return base
 
 
 def _format_track_list(

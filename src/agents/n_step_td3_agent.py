@@ -51,6 +51,7 @@ class NstepTd3Agent:
     version = "0.2"
     uses_full_control = True
     requires_racing_line = True
+    supported_track_ids = ("g-track-3",)
     track_length_m = 2843.0934
     max_steps = 15_000
     target_laps = 1

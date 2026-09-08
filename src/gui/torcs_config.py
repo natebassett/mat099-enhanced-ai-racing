@@ -6,7 +6,7 @@ from pathlib import Path
 
 from project_paths import PROJECT_ROOT
 
-BACKUP_SUFFIX = ".codex-runtime.bak"
+BACKUP_SUFFIX = ".enhanced-ai-racing-runtime.bak"
 
 
 @dataclass(frozen=True)

@@ -60,6 +60,21 @@ class DashboardLayoutTests(unittest.TestCase):
             Qt.ScrollBarAlwaysOff,
         )
 
+    def test_td3_race_control_only_lists_g_track_3(self) -> None:
+        for agent_type in ("n_step_td3", "sensor_n_step_td3"):
+            with self.subTest(agent_type=agent_type):
+                for index in range(self.window.agent_combo.count()):
+                    agent = self.window.agent_combo.itemData(index, Qt.UserRole)
+                    if agent.agent_type == agent_type:
+                        self.window.agent_combo.setCurrentIndex(index)
+                        break
+
+                self.assertEqual(self.window.track_combo.count(), 1)
+                self.assertEqual(
+                    self.window.track_combo.currentData(Qt.UserRole).track_id,
+                    "g-track-3",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
