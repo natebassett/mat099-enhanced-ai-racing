@@ -16,6 +16,11 @@ dist/
 # Local temporary review files
 tmp/
 
+# Vendored gym_torcs: retain only the lightweight Python wrapper sources.
+torcs-wrapper/gym_torcs/.git-vendored-backup/
+torcs-wrapper/gym_torcs/.idea/
+torcs-wrapper/gym_torcs/vtorcs-RL-color/
+
 # Logs / models
 ppo_driver/logs/
 ppo_driver/models/
